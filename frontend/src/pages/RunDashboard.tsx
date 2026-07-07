@@ -1,0 +1,1981 @@
+import { useEffect, useRef, useState, useCallback } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { useQuery, useMutation } from '@tanstack/react-query'
+import {
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Cell,
+} from 'recharts'
+import {
+  Play, RefreshCw, AlertTriangle, CheckCircle, Clock, ChevronRight, ChevronLeft,
+  TrendingUp, Zap, Activity, Target, AlertCircle, BarChart2, Settings,
+  CalendarDays, Layers, X, Lightbulb, Printer, Expand, Shrink,
+} from 'lucide-react'
+import { simulationsApi } from '@/api/simulations'
+import type { SimConfigOverride } from '@/api/simulations'
+import { useAppStore } from '@/store/useAppStore'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
+import { Progress } from '@/components/ui/progress'
+import type { RunDetail, StationStat } from '@/types'
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function StatusBadge({ status }: { status: string }) {
+  const map: Record<string, { variant: 'default' | 'success' | 'warning' | 'destructive' | 'secondary'; label: string }> = {
+    pending:   { variant: 'secondary', label: 'Pending' },
+    running:   { variant: 'warning',   label: 'Running…' },
+    completed: { variant: 'success',   label: 'Completed' },
+    failed:    { variant: 'destructive', label: 'Failed' },
+  }
+  const cfg = map[status] ?? { variant: 'secondary', label: status }
+  return <Badge variant={cfg.variant}>{cfg.label}</Badge>
+}
+
+function utilColor(u: number) {
+  if (u >= 85) return '#ef4444'
+  if (u >= 70) return '#f59e0b'
+  if (u >= 40) return '#22c55e'
+  return '#94a3b8'
+}
+
+function utilBg(u: number) {
+  if (u >= 85) return 'bg-red-50 border-red-200'
+  if (u >= 70) return 'bg-amber-50 border-amber-200'
+  if (u >= 40) return 'bg-green-50 border-green-200'
+  return 'bg-gray-50 border-gray-200'
+}
+
+function utilTextColor(u: number) {
+  if (u >= 85) return 'text-red-600'
+  if (u >= 70) return 'text-amber-600'
+  if (u >= 40) return 'text-green-600'
+  return 'text-gray-400'
+}
+
+// ─── Completed Jobs modal card ───────────────────────────────────────────────
+
+function CompletedJobsCard({ completed, inProgress, stats }: { completed: number; inProgress: number; stats: StationStat[] }) {
+  const [open, setOpen] = useState(false)
+  const sorted = [...stats].sort((a, b) => b.completed_jobs - a.completed_jobs)
+  const maxJobs = sorted[0]?.completed_jobs || 1
+
+  return (
+    <div className="relative h-full">
+      <Card className="border border-gray-200 cursor-pointer hover:border-blue-300 transition-colors h-full" onClick={() => setOpen(true)}>
+        <CardContent className="pt-5 pb-4 h-full">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Completed Jobs</p>
+              <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{completed}</p>
+              <p className="text-xs text-gray-400 mt-1">{inProgress > 0 ? `${inProgress} still in progress` : 'All jobs finished'}</p>
+            </div>
+            <div className="p-2 rounded-lg bg-blue-50"><CheckCircle className="h-4 w-4 text-blue-500" /></div>
+          </div>
+        </CardContent>
+      </Card>
+      {open && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => setOpen(false)} />
+          <div className="relative bg-white rounded-2xl shadow-2xl w-[640px] max-h-[80vh] flex flex-col overflow-hidden">
+            <div className="flex items-center justify-between px-6 py-5 border-b border-gray-100 bg-gradient-to-r from-blue-50 to-indigo-50">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-blue-100 flex items-center justify-center"><CheckCircle className="h-5 w-5 text-blue-600" /></div>
+                <div>
+                  <h2 className="text-base font-bold text-gray-900">Completed Jobs per Station</h2>
+                  <p className="text-xs text-gray-400 mt-0.5">Total jobs finished · sorted by highest</p>
+                </div>
+              </div>
+              <button onClick={() => setOpen(false)} className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors"><X className="h-4 w-4" /></button>
+            </div>
+            <div className="flex items-center gap-6 px-6 py-3 bg-gray-50 border-b border-gray-100">
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Total Completed</p><p className="text-sm font-bold text-blue-600">{completed}</p></div>
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Jobs In Progress</p><p className="text-sm font-bold text-gray-800">{inProgress}</p></div>
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Top Station</p><p className="text-sm font-bold text-gray-800">{sorted[0]?.station_name ?? '—'}</p></div>
+            </div>
+            <div className="flex items-center gap-3 px-6 py-2 border-b border-gray-100">
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-6">#</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase flex-1">Station</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-44 text-center">Jobs</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-20 text-right">Count</span>
+            </div>
+            <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-blue-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+              {sorted.map((s, i) => (
+                <div key={s.station_name} className={`flex items-center gap-3 px-6 py-3.5 border-b border-gray-50 last:border-0 ${i === 0 ? 'bg-blue-50/40' : 'hover:bg-gray-50'}`}>
+                  <span className="text-xs font-bold text-gray-300 w-6 tabular-nums shrink-0">{i + 1}</span>
+                  <span className="text-sm text-gray-800 font-medium flex-1">{s.station_name}</span>
+                  <div className="w-44 h-2.5 bg-gray-100 rounded-full overflow-hidden shrink-0">
+                    <div className="h-full rounded-full bg-blue-400" style={{ width: `${(s.completed_jobs / maxJobs) * 100}%` }} />
+                  </div>
+                  <span className="text-sm font-bold text-blue-700 tabular-nums w-20 text-right">{s.completed_jobs}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Peak Utilization modal card ─────────────────────────────────────────────
+
+function PeakUtilCard({ peakUtil, bottleneck, stats }: { peakUtil: number; bottleneck: StationStat | null; stats: StationStat[] }) {
+  const [open, setOpen] = useState(false)
+  const sorted = [...stats].sort((a, b) => b.station_utilization - a.station_utilization)
+
+  return (
+    <div className="relative h-full">
+      <Card
+        className={`border cursor-pointer transition-colors h-full ${peakUtil >= 85 ? 'border-red-200 hover:border-red-300' : peakUtil >= 70 ? 'border-amber-200 hover:border-amber-300' : 'border-gray-200 hover:border-blue-300'}`}
+        onClick={() => setOpen(true)}
+      >
+        <CardContent className="pt-5 pb-4 h-full">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Peak Utilization</p>
+              <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{peakUtil.toFixed(1)}%</p>
+              <p className="text-xs text-gray-400 mt-1">{bottleneck ? bottleneck.station_name : ''}</p>
+            </div>
+            <div className="p-2 rounded-lg bg-blue-50"><Activity className="h-4 w-4 text-blue-500" /></div>
+          </div>
+        </CardContent>
+      </Card>
+      {open && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => setOpen(false)} />
+          <div className="relative bg-white rounded-2xl shadow-2xl w-[640px] max-h-[80vh] flex flex-col overflow-hidden">
+            <div className="flex items-center justify-between px-6 py-5 border-b border-gray-100 bg-gradient-to-r from-red-50 to-orange-50">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-red-100 flex items-center justify-center"><Activity className="h-5 w-5 text-red-500" /></div>
+                <div>
+                  <h2 className="text-base font-bold text-gray-900">Station Utilization Ranking</h2>
+                  <p className="text-xs text-gray-400 mt-0.5">All stations sorted by utilization · highest first</p>
+                </div>
+              </div>
+              <button onClick={() => setOpen(false)} className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors"><X className="h-4 w-4" /></button>
+            </div>
+            <div className="flex items-center gap-6 px-6 py-3 bg-gray-50 border-b border-gray-100">
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Peak</p><p className="text-sm font-bold text-red-600">{peakUtil.toFixed(1)}%</p></div>
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Top Station</p><p className="text-sm font-bold text-gray-800">{bottleneck?.station_name ?? '—'}</p></div>
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Stations</p><p className="text-sm font-bold text-gray-800">{stats.length}</p></div>
+            </div>
+            <div className="flex items-center gap-3 px-6 py-2 border-b border-gray-100">
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-6">#</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase flex-1">Station</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-44 text-center">Utilization</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-20 text-right">%</span>
+            </div>
+            <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-red-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+              {sorted.map((s, i) => {
+                const color = s.station_utilization >= 85 ? '#ef4444' : s.station_utilization >= 70 ? '#f59e0b' : '#22c55e'
+                return (
+                  <div key={s.station_name} className={`flex items-center gap-3 px-6 py-3.5 border-b border-gray-50 last:border-0 ${i === 0 ? 'bg-red-50/40' : 'hover:bg-gray-50'}`}>
+                    <span className="text-xs font-bold text-gray-300 w-6 tabular-nums shrink-0">{i + 1}</span>
+                    <span className="text-sm text-gray-800 font-medium flex-1">{s.station_name}</span>
+                    <div className="w-44 h-2.5 bg-gray-100 rounded-full overflow-hidden shrink-0">
+                      <div className="h-full rounded-full" style={{ width: `${Math.min(s.station_utilization, 100)}%`, background: color }} />
+                    </div>
+                    <span className="text-sm font-bold tabular-nums w-20 text-right" style={{ color }}>{s.station_utilization.toFixed(1)}%</span>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Avg Utilization modal card ──────────────────────────────────────────────
+
+function AvgUtilCard({ avgUtil, stats }: { avgUtil: number; stats: StationStat[] }) {
+  const [open, setOpen] = useState(false)
+  const sorted = [...stats].sort((a, b) => b.operator_utilization - a.operator_utilization)
+
+  return (
+    <div className="relative h-full">
+      <Card className="border border-gray-200 cursor-pointer hover:border-blue-300 transition-colors h-full" onClick={() => setOpen(true)}>
+        <CardContent className="pt-5 pb-4 h-full">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Avg Station Util.</p>
+              <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{avgUtil.toFixed(1)}%</p>
+              <p className="text-xs text-gray-400 mt-1">average across stations</p>
+            </div>
+            <div className="p-2 rounded-lg bg-blue-50"><Target className="h-4 w-4 text-blue-500" /></div>
+          </div>
+        </CardContent>
+      </Card>
+      {open && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => setOpen(false)} />
+          <div className="relative bg-white rounded-2xl shadow-2xl w-[640px] max-h-[80vh] flex flex-col overflow-hidden">
+            <div className="flex items-center justify-between px-6 py-5 border-b border-gray-100 bg-gradient-to-r from-blue-50 to-indigo-50">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-blue-100 flex items-center justify-center"><Target className="h-5 w-5 text-blue-600" /></div>
+                <div>
+                  <h2 className="text-base font-bold text-gray-900">Station & Operator Utilization</h2>
+                  <p className="text-xs text-gray-400 mt-0.5">Per-station breakdown · sorted by operator utilization</p>
+                </div>
+              </div>
+              <button onClick={() => setOpen(false)} className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors"><X className="h-4 w-4" /></button>
+            </div>
+            <div className="flex items-center gap-6 px-6 py-3 bg-gray-50 border-b border-gray-100">
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Avg Station</p><p className="text-sm font-bold text-blue-600">{avgUtil.toFixed(1)}%</p></div>
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Stations</p><p className="text-sm font-bold text-gray-800">{stats.length}</p></div>
+            </div>
+            <div className="flex items-center gap-3 px-6 py-2 border-b border-gray-100">
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-6">#</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase flex-1">Station</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-24 text-right">Station%</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-24 text-right">Operator%</span>
+            </div>
+            <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-blue-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+              {sorted.map((s, i) => {
+                const sColor = s.station_utilization >= 85 ? '#ef4444' : s.station_utilization >= 70 ? '#f59e0b' : '#22c55e'
+                return (
+                  <div key={s.station_name} className={`flex items-center gap-3 px-6 py-3.5 border-b border-gray-50 last:border-0 ${i === 0 ? 'bg-blue-50/40' : 'hover:bg-gray-50'}`}>
+                    <span className="text-xs font-bold text-gray-300 w-6 tabular-nums shrink-0">{i + 1}</span>
+                    <span className="text-sm text-gray-800 font-medium flex-1">{s.station_name}</span>
+                    <span className="text-sm font-bold tabular-nums w-24 text-right" style={{ color: sColor }}>{s.station_utilization.toFixed(1)}%</span>
+                    <span className="text-sm font-bold text-blue-500 tabular-nums w-24 text-right">{s.operator_utilization.toFixed(1)}%</span>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Bottleneck modal card ────────────────────────────────────────────────────
+
+function BottleneckCard({ bottleneck, stats }: { bottleneck: StationStat | null; stats: StationStat[] }) {
+  const [open, setOpen] = useState(false)
+  const sorted = [...stats].sort((a, b) => b.station_utilization - a.station_utilization)
+
+  return (
+    <div className="relative h-full">
+      <Card
+        className={`border cursor-pointer transition-colors h-full ${bottleneck && bottleneck.station_utilization >= 85 ? 'border-red-200 hover:border-red-300' : 'border-gray-200 hover:border-blue-300'}`}
+        onClick={() => setOpen(true)}
+      >
+        <CardContent className="pt-5 pb-4 h-full">
+          <div className="flex items-start justify-between gap-2">
+            <div className="min-w-0 flex-1">
+              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Bottleneck Station</p>
+              <p
+                className={`font-bold text-gray-900 mt-1 leading-tight break-words ${
+                  (bottleneck?.station_name?.length ?? 0) > 14 ? 'text-lg' : 'text-2xl'
+                }`}
+              >
+                {bottleneck?.station_name ?? '—'}
+              </p>
+              <p className="text-xs text-gray-400 mt-1">{bottleneck ? `${bottleneck.station_utilization.toFixed(1)}% util.` : 'no bottleneck'}</p>
+            </div>
+            <div className="p-2 rounded-lg bg-blue-50 shrink-0"><Zap className="h-4 w-4 text-blue-500" /></div>
+          </div>
+        </CardContent>
+      </Card>
+      {open && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => setOpen(false)} />
+          <div className="relative bg-white rounded-2xl shadow-2xl w-[640px] max-h-[80vh] flex flex-col overflow-hidden">
+            <div className="flex items-center justify-between px-6 py-5 border-b border-gray-100 bg-gradient-to-r from-orange-50 to-red-50">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-orange-100 flex items-center justify-center"><Zap className="h-5 w-5 text-orange-500" /></div>
+                <div>
+                  <h2 className="text-base font-bold text-gray-900">All Stations by Utilization</h2>
+                  <p className="text-xs text-gray-400 mt-0.5">{sorted.length} stations · sorted highest to lowest</p>
+                </div>
+              </div>
+              <button onClick={() => setOpen(false)} className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors"><X className="h-4 w-4" /></button>
+            </div>
+            <div className="flex items-center gap-6 px-6 py-3 bg-gray-50 border-b border-gray-100">
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Bottleneck</p><p className="text-sm font-bold text-red-600">{bottleneck?.station_name ?? '—'}</p></div>
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Peak Util</p><p className="text-sm font-bold text-gray-800">{bottleneck?.station_utilization.toFixed(1)}%</p></div>
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Failures</p><p className="text-sm font-bold text-gray-800">{bottleneck?.failure_breakdowns ?? 0}</p></div>
+            </div>
+            <div className="flex items-center gap-3 px-6 py-2 border-b border-gray-100">
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-6">#</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase flex-1">Station</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-44 text-center">Utilization</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-16 text-right">Failures</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-16 text-right">Jobs</span>
+            </div>
+            <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-orange-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+              {sorted.map((s, i) => {
+                const color = s.station_utilization >= 85 ? '#ef4444' : s.station_utilization >= 70 ? '#f59e0b' : '#22c55e'
+                return (
+                  <div key={s.station_name} className={`flex items-center gap-3 px-6 py-3.5 border-b border-gray-50 last:border-0 ${i === 0 ? 'bg-orange-50/40' : 'hover:bg-gray-50'}`}>
+                    <span className="text-xs font-bold text-gray-300 w-6 tabular-nums shrink-0">{i + 1}</span>
+                    <span className="text-sm text-gray-800 font-medium flex-1">{s.station_name}</span>
+                    <div className="w-44 h-2.5 bg-gray-100 rounded-full overflow-hidden shrink-0">
+                      <div className="h-full rounded-full" style={{ width: `${Math.min(s.station_utilization, 100)}%`, background: color }} />
+                    </div>
+                    <span className="text-sm font-bold tabular-nums w-16 text-right" style={{ color }}>{s.station_utilization.toFixed(1)}%</span>
+                    <span className="text-sm text-gray-600 tabular-nums w-16 text-right">{s.failure_breakdowns}</span>
+                    <span className="text-sm text-gray-600 tabular-nums w-16 text-right">{s.completed_jobs}</span>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Throughput popup card ────────────────────────────────────────────────────
+
+function ThroughputCard({ value, sub, stats }: { value: string; sub: string; stats: StationStat[] }) {
+  const [open, setOpen] = useState(false)
+  const sorted = [...stats].sort((a, b) => b.throughput - a.throughput)
+  const maxTp = sorted[0]?.throughput || 1
+  const total = stats.reduce((s, x) => s + x.throughput, 0)
+
+  return (
+    <div className="relative h-full">
+      <Card className="border border-gray-200 cursor-pointer hover:border-blue-300 transition-colors h-full" onClick={() => setOpen(true)}>
+        <CardContent className="pt-5 pb-4 h-full">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Throughput</p>
+              <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{value}</p>
+              <p className="text-xs text-gray-400 mt-1">{sub}</p>
+            </div>
+            <div className="p-2 rounded-lg bg-blue-50">
+              <TrendingUp className="h-4 w-4 text-blue-500" />
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Full-page modal */}
+      {open && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center">
+          {/* Backdrop */}
+          <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => setOpen(false)} />
+
+          {/* Panel */}
+          <div className="relative bg-white rounded-2xl shadow-2xl w-[640px] max-h-[80vh] flex flex-col overflow-hidden">
+            {/* Header */}
+            <div className="flex items-center justify-between px-6 py-5 border-b border-gray-100 bg-gradient-to-r from-blue-50 to-indigo-50">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-blue-100 flex items-center justify-center">
+                  <TrendingUp className="h-5 w-5 text-blue-600" />
+                </div>
+                <div>
+                  <h2 className="text-base font-bold text-gray-900">Throughput per Station</h2>
+                  <p className="text-xs text-gray-400 mt-0.5">Jobs completed per hour · sorted by highest</p>
+                </div>
+              </div>
+              <button onClick={() => setOpen(false)} className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {/* Summary strip */}
+            <div className="flex items-center gap-6 px-6 py-3 bg-gray-50 border-b border-gray-100">
+              <div>
+                <p className="text-[10px] text-gray-400 uppercase tracking-widest">Total</p>
+                <p className="text-sm font-bold text-gray-800">{total.toFixed(2)} /hr</p>
+              </div>
+              <div>
+                <p className="text-[10px] text-gray-400 uppercase tracking-widest">Stations</p>
+                <p className="text-sm font-bold text-gray-800">{stats.length}</p>
+              </div>
+              <div>
+                <p className="text-[10px] text-gray-400 uppercase tracking-widest">Top Station</p>
+                <p className="text-sm font-bold text-blue-600">{sorted[0]?.station_name ?? '—'}</p>
+              </div>
+            </div>
+
+            {/* Column headers */}
+            <div className="flex items-center gap-3 px-6 py-2 border-b border-gray-100">
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-6">#</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase flex-1">Station</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-36 text-center">Rate vs Best</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-14 text-right">% of Max</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-20 text-right">Jobs/hr</span>
+            </div>
+
+            {/* Rows */}
+            <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-blue-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+              {sorted.map((s, i) => {
+                const pct = Math.min(100, (s.throughput / maxTp) * 100)
+                return (
+                  <div
+                    key={s.station_name}
+                    className={`flex items-center gap-3 px-6 py-3.5 border-b border-gray-50 last:border-0 ${i === 0 ? 'bg-blue-50/40' : 'hover:bg-gray-50'}`}
+                  >
+                    <span className="text-xs font-bold text-gray-300 w-6 tabular-nums shrink-0">{i + 1}</span>
+                    <span className="text-sm text-gray-800 font-medium flex-1">{s.station_name}</span>
+                    <div className="w-36 h-2.5 bg-gray-100 rounded-full overflow-hidden shrink-0">
+                      <div
+                        className="h-full rounded-full bg-blue-400 transition-all"
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                    <span className="text-xs font-semibold tabular-nums w-14 text-right text-gray-500">
+                      {pct.toFixed(0)}%
+                    </span>
+                    <span className="text-sm font-bold text-blue-700 tabular-nums w-20 text-right">
+                      {s.throughput.toFixed(2)}
+                    </span>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Stations at Risk popup card ─────────────────────────────────────────────
+
+function AtRiskCard({ count, stats }: { count: number; stats: StationStat[] }) {
+  const [open, setOpen] = useState(false)
+  const riskStations = stats
+    .filter(s => s.station_utilization >= 80)
+    .sort((a, b) => b.station_utilization - a.station_utilization)
+  const accent = count > 0 ? 'border-amber-200' : 'border-gray-200'
+
+  return (
+    <div className="relative h-full">
+      <Card
+        className={`border ${accent} h-full ${count > 0 ? 'cursor-pointer hover:border-amber-300' : ''} transition-colors`}
+        onClick={() => count > 0 && setOpen(true)}
+      >
+        <CardContent className="pt-5 pb-4 h-full">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Stations at Risk</p>
+              <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{count}</p>
+              <p className="text-xs text-gray-400 mt-1">≥ 80% utilization</p>
+            </div>
+            <div className={`p-2 rounded-lg ${count > 0 ? 'bg-amber-50' : 'bg-blue-50'}`}>
+              <AlertCircle className={`h-4 w-4 ${count > 0 ? 'text-amber-500' : 'text-blue-500'}`} />
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {open && riskStations.length > 0 && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => setOpen(false)} />
+          <div className="relative bg-white rounded-2xl shadow-2xl w-[640px] max-h-[80vh] flex flex-col overflow-hidden">
+            {/* Header */}
+            <div className="flex items-center justify-between px-6 py-5 border-b border-gray-100 bg-gradient-to-r from-amber-50 to-orange-50">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-amber-100 flex items-center justify-center">
+                  <AlertCircle className="h-5 w-5 text-amber-500" />
+                </div>
+                <div>
+                  <h2 className="text-base font-bold text-gray-900">Stations at Risk</h2>
+                  <p className="text-xs text-gray-400 mt-0.5">Stations with utilization ≥ 80% · sorted by highest</p>
+                </div>
+              </div>
+              <button onClick={() => setOpen(false)} className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            {/* Summary strip */}
+            <div className="flex items-center gap-6 px-6 py-3 bg-gray-50 border-b border-gray-100">
+              <div>
+                <p className="text-[10px] text-gray-400 uppercase tracking-widest">At Risk</p>
+                <p className="text-sm font-bold text-amber-600">{riskStations.length} stations</p>
+              </div>
+              <div>
+                <p className="text-[10px] text-gray-400 uppercase tracking-widest">Highest Util</p>
+                <p className="text-sm font-bold text-red-600">{riskStations[0]?.station_utilization.toFixed(1)}%</p>
+              </div>
+              <div>
+                <p className="text-[10px] text-gray-400 uppercase tracking-widest">Top Station</p>
+                <p className="text-sm font-bold text-gray-800">{riskStations[0]?.station_name ?? '—'}</p>
+              </div>
+            </div>
+            {/* Column headers */}
+            <div className="flex items-center gap-3 px-6 py-2 border-b border-gray-100">
+              <span className="text-[10px] font-bold text-gray-400 uppercase flex-1">Station</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-40 text-center">Utilization</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-16 text-right">Failures</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-16 text-right">Jobs</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-20 text-right">Rework%</span>
+            </div>
+            {/* Rows */}
+            <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-amber-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+              {riskStations.map((s, i) => {
+                const isBottleneck = s.station_utilization >= 85
+                const barColor = isBottleneck ? '#ef4444' : '#f59e0b'
+                return (
+                  <div key={s.station_name} className={`flex items-center gap-3 px-6 py-3.5 border-b border-gray-50 last:border-0 ${i === 0 ? 'bg-amber-50/40' : 'hover:bg-gray-50'}`}>
+                    <div className="flex items-center gap-2 flex-1 min-w-0">
+                      <div className="w-2 h-2 rounded-full shrink-0" style={{ background: barColor }} />
+                      <span className="text-sm text-gray-800 font-medium truncate">{s.station_name}</span>
+                    </div>
+                    <div className="flex items-center gap-2 w-40 shrink-0">
+                      <div className="flex-1 h-2.5 bg-gray-100 rounded-full overflow-hidden">
+                        <div className="h-full rounded-full" style={{ width: `${Math.min(s.station_utilization, 100)}%`, background: barColor }} />
+                      </div>
+                      <span className="text-sm font-bold tabular-nums w-12 text-right" style={{ color: barColor }}>{s.station_utilization.toFixed(1)}%</span>
+                    </div>
+                    <span className="text-sm text-gray-600 tabular-nums w-16 text-right">{s.failure_breakdowns}</span>
+                    <span className="text-sm text-gray-600 tabular-nums w-16 text-right">{s.completed_jobs}</span>
+                    <span className="text-sm text-gray-600 tabular-nums w-20 text-right">{s.rework_percentage.toFixed(1)}%</span>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Total Failures popup card ────────────────────────────────────────────────
+
+function TotalFailuresCard({ total, rework, stats }: { total: number; rework: number; stats: StationStat[] }) {
+  const [open, setOpen] = useState(false)
+  const failedStations = stats
+    .filter(s => s.failure_breakdowns > 0)
+    .sort((a, b) => b.failure_breakdowns - a.failure_breakdowns)
+  const maxFailures = failedStations[0]?.failure_breakdowns || 1
+
+  return (
+    <div className="relative h-full">
+      <Card
+        className={`border h-full transition-colors ${total > 0 ? 'border-red-100 cursor-pointer hover:border-red-300' : 'border-gray-200'}`}
+        onClick={() => total > 0 && setOpen(true)}
+      >
+        <CardContent className="pt-5 pb-4 h-full">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Total Failures</p>
+              <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{total}</p>
+              <p className="text-xs text-gray-400 mt-1">{rework.toFixed(1)}% avg rework</p>
+            </div>
+            <div className={`p-2 rounded-lg ${total > 0 ? 'bg-red-50' : 'bg-blue-50'}`}>
+              <AlertTriangle className={`h-4 w-4 ${total > 0 ? 'text-red-400' : 'text-blue-500'}`} />
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {open && failedStations.length > 0 && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => setOpen(false)} />
+          <div className="relative bg-white rounded-2xl shadow-2xl w-[640px] max-h-[80vh] flex flex-col overflow-hidden">
+            {/* Header */}
+            <div className="flex items-center justify-between px-6 py-5 border-b border-gray-100 bg-gradient-to-r from-red-50 to-rose-50">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-red-100 flex items-center justify-center">
+                  <AlertTriangle className="h-5 w-5 text-red-400" />
+                </div>
+                <div>
+                  <h2 className="text-base font-bold text-gray-900">Failure Breakdown</h2>
+                  <p className="text-xs text-gray-400 mt-0.5">Stations with failures · sorted by highest</p>
+                </div>
+              </div>
+              <button onClick={() => setOpen(false)} className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            {/* Summary strip */}
+            <div className="flex items-center gap-6 px-6 py-3 bg-gray-50 border-b border-gray-100">
+              <div>
+                <p className="text-[10px] text-gray-400 uppercase tracking-widest">Total Failures</p>
+                <p className="text-sm font-bold text-red-600">{total}</p>
+              </div>
+              <div>
+                <p className="text-[10px] text-gray-400 uppercase tracking-widest">Avg Rework</p>
+                <p className="text-sm font-bold text-gray-800">{rework.toFixed(1)}%</p>
+              </div>
+              <div>
+                <p className="text-[10px] text-gray-400 uppercase tracking-widest">Most Failures</p>
+                <p className="text-sm font-bold text-gray-800">{failedStations[0]?.station_name ?? '—'}</p>
+              </div>
+            </div>
+            {/* Column headers */}
+            <div className="flex items-center gap-3 px-6 py-2 border-b border-gray-100">
+              <span className="text-[10px] font-bold text-gray-400 uppercase flex-1">Station</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-40 text-center">Failures</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-16 text-right">PM Stops</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-16 text-right">Util%</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-20 text-right">Rework%</span>
+            </div>
+            {/* Rows */}
+            <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-red-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+              {failedStations.map((s, i) => (
+                <div key={s.station_name} className={`flex items-center gap-3 px-6 py-3.5 border-b border-gray-50 last:border-0 ${i === 0 ? 'bg-red-50/40' : 'hover:bg-gray-50'}`}>
+                  <div className="flex items-center gap-2 flex-1 min-w-0">
+                    <div className="w-2 h-2 rounded-full bg-red-400 shrink-0" />
+                    <span className="text-sm text-gray-800 font-medium truncate">{s.station_name}</span>
+                  </div>
+                  <div className="flex items-center gap-2 w-40 shrink-0">
+                    <div className="flex-1 h-2.5 bg-gray-100 rounded-full overflow-hidden">
+                      <div className="h-full rounded-full bg-red-400" style={{ width: `${(s.failure_breakdowns / maxFailures) * 100}%` }} />
+                    </div>
+                    <span className="text-sm font-bold text-red-600 tabular-nums w-12 text-right">{s.failure_breakdowns}</span>
+                  </div>
+                  <span className="text-sm text-gray-600 tabular-nums w-16 text-right">{s.pm_breakdowns}</span>
+                  <span className="text-sm text-gray-600 tabular-nums w-16 text-right">{s.station_utilization.toFixed(1)}%</span>
+                  <span className="text-sm text-gray-600 tabular-nums w-20 text-right">{s.rework_percentage.toFixed(1)}%</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Sim Duration modal card ──────────────────────────────────────────────────
+
+function SimDurationCard({
+  simDays, simTime, simCfg,
+}: {
+  simDays: string
+  simTime: number
+  simCfg: SimConfigOverride
+}) {
+  const [open, setOpen] = useState(false)
+
+  const totalMin = simCfg.SIM_TIME ?? simTime
+  const shiftMin = simCfg.SHIFT_DURATION ?? 480
+  const shiftsPerDay = Math.floor(1440 / shiftMin)
+  const workMinPerDay = shiftMin * shiftsPerDay
+  const calDays = workMinPerDay > 0 ? (totalMin / workMinPerDay).toFixed(1) : '—'
+  const totalHours = (totalMin / 60).toFixed(1)
+
+  const rows = [
+    { label: 'Total Sim Time', value: `${totalMin.toLocaleString()} min` },
+    { label: 'Total Hours', value: `${totalHours} hrs` },
+    { label: 'Calendar Days', value: `${calDays} days` },
+    { label: 'Shift Duration', value: `${shiftMin} min (${(shiftMin/60).toFixed(1)} hrs)` },
+    { label: 'Shifts per Day', value: `${shiftsPerDay}` },
+    { label: 'Work Min / Day', value: `${workMinPerDay} min` },
+    { label: 'Actual Sim Time', value: simTime > 0 ? `${simTime.toFixed(0)} min` : '—' },
+  ]
+
+  return (
+    <div className="relative h-full">
+      <Card className="border border-gray-200 cursor-pointer hover:border-blue-300 transition-colors h-full" onClick={() => setOpen(true)}>
+        <CardContent className="pt-5 pb-4 h-full">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Sim Duration</p>
+              <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{simDays} days</p>
+              <p className="text-xs text-gray-400 mt-1">{simTime.toFixed(0)} min</p>
+            </div>
+            <div className="p-2 rounded-lg bg-blue-50">
+              <Clock className="h-4 w-4 text-blue-500" />
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {open && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => setOpen(false)} />
+          <div className="relative bg-white rounded-2xl shadow-2xl w-[480px] overflow-hidden">
+            {/* Header */}
+            <div className="flex items-center justify-between px-6 py-5 border-b border-gray-100 bg-gradient-to-r from-blue-50 to-indigo-50">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-blue-100 flex items-center justify-center">
+                  <Clock className="h-5 w-5 text-blue-600" />
+                </div>
+                <div>
+                  <h2 className="text-base font-bold text-gray-900">Simulation Duration</h2>
+                  <p className="text-xs text-gray-400 mt-0.5">Time & shift configuration breakdown</p>
+                </div>
+              </div>
+              <button onClick={() => setOpen(false)} className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {/* Summary strip */}
+            <div className="flex items-center gap-6 px-6 py-3 bg-gray-50 border-b border-gray-100">
+              <div>
+                <p className="text-[10px] text-gray-400 uppercase tracking-widest">Total Minutes</p>
+                <p className="text-sm font-bold text-gray-800">{totalMin.toLocaleString()}</p>
+              </div>
+              <div>
+                <p className="text-[10px] text-gray-400 uppercase tracking-widest">Hours</p>
+                <p className="text-sm font-bold text-gray-800">{totalHours}</p>
+              </div>
+              <div>
+                <p className="text-[10px] text-gray-400 uppercase tracking-widest">Calendar Days</p>
+                <p className="text-sm font-bold text-blue-600">{calDays}</p>
+              </div>
+            </div>
+
+            {/* Breakdown rows */}
+            <div className="px-6 py-4 space-y-3">
+              {rows.map(({ label, value }) => (
+                <div key={label} className="flex items-center justify-between py-2 border-b border-gray-50 last:border-0">
+                  <span className="text-sm text-gray-500">{label}</span>
+                  <span className="text-sm font-bold text-gray-800 tabular-nums">{value}</span>
+                </div>
+              ))}
+            </div>
+
+            {/* Explanation */}
+            <div className="mx-6 mb-5 px-4 py-3 bg-blue-50 rounded-xl">
+              <p className="text-xs text-blue-700 leading-relaxed">
+                The simulation runs for <strong>{totalMin.toLocaleString()} minutes</strong> of simulated factory time,
+                split into <strong>{shiftMin}-minute shifts</strong>. This covers approximately <strong>{calDays} working days</strong>.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── SimConfig dialog ─────────────────────────────────────────────────────────
+
+const PRESETS = [
+  { label: '1 Shift',  sub: '8 hours',  SIM_TIME: 480,    SHIFT_DURATION: 480 },
+  { label: '1 Day',    sub: '16 hours', SIM_TIME: 960,    SHIFT_DURATION: 480 },
+  { label: '1 Week',   sub: '5 days',   SIM_TIME: 4800,   SHIFT_DURATION: 480 },
+  { label: '1 Month',  sub: '20 days',  SIM_TIME: 19200,  SHIFT_DURATION: 480 },
+  { label: '1 Year',   sub: '240 days', SIM_TIME: 230400, SHIFT_DURATION: 480 },
+]
+
+interface SimConfigDialogProps {
+  open: boolean
+  value: SimConfigOverride
+  onChange: (v: SimConfigOverride) => void
+  onClose: () => void
+}
+
+function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDialogProps) {
+  const [custom, setCustom] = useState(String(value.SIM_TIME ?? 10080))
+  const [reps, setReps] = useState(String(value.num_replications ?? 1))
+  const [activePreset, setActivePreset] = useState<number | null>(null)
+
+  if (!open) return null
+
+  const apply = () => {
+    onChange({
+      ...value,
+      SIM_TIME: Number(custom),
+      num_replications: Math.max(1, Math.min(30, Number(reps) || 1)),
+    })
+    onClose()
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center">
+      <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={onClose} />
+      <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-lg z-10 overflow-hidden">
+
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 py-5 border-b border-gray-100">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-lg bg-blue-50 flex items-center justify-center">
+              <Settings className="h-4 w-4 text-blue-600" />
+            </div>
+            <h2 className="text-base font-semibold text-gray-900">Simulation Config</h2>
+          </div>
+          <button onClick={onClose} className="w-7 h-7 flex items-center justify-center rounded-lg text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="px-6 py-5 space-y-5">
+          {/* Presets */}
+          <div>
+            <p className="text-xs font-semibold text-gray-400 uppercase tracking-widest mb-3">Duration Presets</p>
+            <div className="grid grid-cols-5 gap-2">
+              {PRESETS.map((p, i) => (
+                <button
+                  key={p.label}
+                  onClick={() => { setActivePreset(i); setCustom(String(p.SIM_TIME)) }}
+                  className={`flex flex-col items-center py-3 rounded-xl border text-sm transition-all duration-150 ${
+                    activePreset === i
+                      ? 'border-blue-500 bg-blue-50 text-blue-700 shadow-sm'
+                      : 'border-gray-100 bg-gray-50 hover:border-blue-200 hover:bg-blue-50/50 text-gray-600'
+                  }`}
+                >
+                  <span className="font-semibold text-sm">{p.label}</span>
+                  <span className="text-[10px] text-gray-400 mt-0.5">{p.sub}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Simulation Time */}
+          <div>
+            <label className="text-xs font-semibold text-gray-400 uppercase tracking-widest block mb-2">
+              Simulation Time (minutes)
+            </label>
+            <div className="flex items-center border border-gray-200 rounded-xl bg-gray-50 focus-within:border-blue-400 focus-within:bg-white transition-colors overflow-hidden">
+              <button
+                type="button"
+                onClick={() => { setCustom(v => String(Math.max(60, Number(v) - 60))); setActivePreset(null) }}
+                className="px-3 py-2.5 text-blue-500 hover:bg-blue-50 hover:text-blue-700 text-lg font-bold transition-colors select-none"
+              >−</button>
+              <input
+                type="number"
+                min={60}
+                max={525600}
+                value={custom}
+                onChange={e => { setCustom(e.target.value); setActivePreset(null) }}
+                className="flex-1 text-center text-sm text-gray-900 bg-transparent focus:outline-none [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+              />
+              <button
+                type="button"
+                onClick={() => { setCustom(v => String(Math.min(525600, Number(v) + 60))); setActivePreset(null) }}
+                className="px-3 py-2.5 text-blue-500 hover:bg-blue-50 hover:text-blue-700 text-lg font-bold transition-colors select-none"
+              >+</button>
+            </div>
+            <p className="text-xs text-gray-400 mt-1.5">
+              = {(Number(custom) / 60).toFixed(1)} hours · {(Number(custom) / 1440).toFixed(1)} days
+            </p>
+          </div>
+
+          {/* Replications */}
+          <div>
+            <label className="text-xs font-semibold text-gray-400 uppercase tracking-widest block mb-2">
+              Replications (1–30)
+            </label>
+            <div className="flex items-center border border-gray-200 rounded-xl bg-gray-50 focus-within:border-blue-400 focus-within:bg-white transition-colors overflow-hidden">
+              <button
+                type="button"
+                onClick={() => setReps(v => String(Math.max(1, Number(v) - 1)))}
+                className="px-3 py-2.5 text-blue-500 hover:bg-blue-50 hover:text-blue-700 text-lg font-bold transition-colors select-none"
+              >−</button>
+              <input
+                type="number"
+                min={1}
+                max={30}
+                value={reps}
+                onChange={e => setReps(e.target.value)}
+                className="flex-1 text-center text-sm text-gray-900 bg-transparent focus:outline-none [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+              />
+              <button
+                type="button"
+                onClick={() => setReps(v => String(Math.min(30, Number(v) + 1)))}
+                className="px-3 py-2.5 text-blue-500 hover:bg-blue-50 hover:text-blue-700 text-lg font-bold transition-colors select-none"
+              >+</button>
+            </div>
+            <p className="text-xs text-gray-400 mt-1.5">Multiple replications average results for statistical stability.</p>
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="flex gap-3 px-6 pb-6">
+          <Button variant="outline" className="flex-1 rounded-xl border-gray-200 text-gray-600 hover:border-blue-300 hover:text-blue-600" onClick={onClose}>Cancel</Button>
+          <Button className="flex-1 rounded-xl bg-blue-600 hover:bg-blue-700 shadow-sm" onClick={apply}>Apply</Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Gantt chart ──────────────────────────────────────────────────────────────
+
+interface GanttJob {
+  station: string
+  start: number
+  end: number
+  processingTime: number
+  waitingTime: number
+  blockedTime: number
+  downtime: number
+  jobIndex: number
+}
+
+function parseGantt(completionLog: Record<string, unknown[]>): GanttJob[] {
+  const jobs: GanttJob[] = []
+  for (const [station, entries] of Object.entries(completionLog)) {
+    let jobIdx = 0
+    for (const e of entries as Record<string, unknown>[]) {
+      const startStr = e['process_start_time_real'] as string
+      const endStr   = e['process_end_time_real'] as string
+      if (!startStr || !endStr) continue
+      const start = new Date(startStr.replace(' ', 'T').replace(' ', '')).getTime()
+      const end   = new Date(endStr.replace(' ', 'T').replace(' ', '')).getTime()
+      jobs.push({
+        station,
+        start,
+        end,
+        processingTime: Number(e['Processing Time'] ?? 0),
+        waitingTime: Number(e['Waiting Time'] ?? 0),
+        blockedTime: Number(e['Blocked Time'] ?? 0),
+        downtime: Number(e['station_downtime'] ?? 0),
+        jobIndex: ++jobIdx,
+      })
+    }
+  }
+  return jobs
+}
+
+function GanttTimeline({ result, onExpandToggle, isExpanded }: { result: Record<string, unknown>; onExpandToggle?: () => void; isExpanded?: boolean }) {
+  const isDark = useAppStore(s => s.theme) === 'dark'
+  const svgC = isDark
+    ? { rowEven: '#1e293b', rowOdd: '#0f172a', grid: '#334155', legendBg: '#1e293b', label: '#e2e8f0', muted: '#94a3b8', barBorder: 'rgba(255,255,255,0.12)' }
+    : { rowEven: '#f9fafb', rowOdd: '#ffffff', grid: '#e5e7eb', legendBg: '#f8fafc', label: '#374151', muted: '#9ca3af', barBorder: 'rgba(0,0,0,0.08)' }
+
+  const rawLog = result?.completion_log as Record<string, unknown[]> | undefined
+  if (!rawLog || Object.keys(rawLog).length === 0) {
+    return <p className="text-sm text-gray-400 py-8 text-center">No completion log data available.</p>
+  }
+
+  const jobs = parseGantt(rawLog)
+  if (jobs.length === 0) return <p className="text-sm text-gray-400 py-8 text-center">No jobs to display.</p>
+
+  const stations = [...new Set(jobs.map(j => j.station))]
+  const tMin = Math.min(...jobs.map(j => j.start))
+  const tMax = Math.max(...jobs.map(j => j.end))
+  const totalMs = tMax - tMin || 1
+
+  const [scrubPct, setScrubPct] = useState(100)
+  const [speed, setSpeed] = useState<'1×' | '10×' | '50×'>('10×')
+  const [playing, setPlaying] = useState(false)
+  const [hoveredJob, setHoveredJob] = useState<{ job: GanttJob; x: number; y: number } | null>(null)
+  const expanded = isExpanded ?? false
+  const rafRef = useRef<number | null>(null)
+  const lastTsRef = useRef<number | null>(null)
+  const speedMap = { '1×': 1, '10×': 10, '50×': 50 }
+
+  const tick = useCallback((ts: number) => {
+    if (lastTsRef.current === null) { lastTsRef.current = ts }
+    const delta = ts - lastTsRef.current
+    lastTsRef.current = ts
+    const advance = (delta * speedMap[speed]) / totalMs * 100
+    setScrubPct(prev => {
+      const next = prev + advance
+      if (next >= 100) { setPlaying(false); return 100 }
+      return next
+    })
+    rafRef.current = requestAnimationFrame(tick)
+  }, [speed, totalMs])
+
+  useEffect(() => {
+    if (playing) {
+      lastTsRef.current = null
+      rafRef.current = requestAnimationFrame(tick)
+    } else {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current)
+    }
+    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current) }
+  }, [playing, tick])
+
+  const cutoffMs = tMin + (scrubPct / 100) * totalMs
+  const visibleJobs = jobs.filter(j => j.start <= cutoffMs)
+
+  // Per-station summary
+  const stationSummary = stations.map(s => {
+    const sJobs = jobs.filter(j => j.station === s)
+    const totalProc = sJobs.reduce((a, j) => a + j.processingTime, 0)
+    const totalWait = sJobs.reduce((a, j) => a + j.waitingTime, 0)
+    const totalBlock = sJobs.reduce((a, j) => a + j.blockedTime, 0)
+    return { station: s, count: sJobs.length, totalProc, totalWait, totalBlock }
+  })
+
+  // Time axis ticks
+  const totalMinutes = totalMs / 60000
+  const tickCount = 6
+  const ticks = Array.from({ length: tickCount + 1 }, (_, i) => ({
+    pct: i / tickCount,
+    label: `${Math.round((i / tickCount) * totalMinutes)}m`,
+  }))
+
+  // Station colors — distinct from waiting (#f59e0b amber) and blocked (#ef4444 red) overlays
+  const palette = ['#3b82f6','#f97316','#22c55e','#a855f7','#06b6d4','#ec4899','#84cc16','#8b5cf6','#0ea5e9','#14b8a6']
+  const stationColor = (s: string) => palette[stations.indexOf(s) % palette.length]
+
+  const ROW_H = 50
+  const LABEL_W = 140
+  const BAR_H = 24
+  const LEGEND_H = 30
+  const chartH = LEGEND_H + stations.length * ROW_H + 32
+  const CHART_W = 900
+
+  const xPct = (ms: number) => ((ms - tMin) / totalMs)
+  const yOf  = (s: string) => LEGEND_H + stations.indexOf(s) * ROW_H + (ROW_H - BAR_H) / 2
+
+  // Current sim time label
+  const curMinutes = Math.round((scrubPct / 100) * totalMinutes)
+
+  const chartContent = (_isFullscreen: boolean) => (
+    <div className="relative">
+      {/* Controls */}
+      <div className="flex items-center gap-2 mb-3 pr-24">
+        <button onClick={() => { setScrubPct(0); setPlaying(false) }}
+          className="text-xs px-3 py-1.5 rounded-lg border border-gray-200 bg-white text-gray-600 hover:bg-gray-50 font-medium">
+          ↩ Reset
+        </button>
+        <button onClick={() => setPlaying(p => !p)}
+          className="text-xs px-4 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 font-medium flex items-center gap-1">
+          {playing ? '⏸ Pause' : '▶ Play'}
+        </button>
+        {(['1×','10×','50×'] as const).map(s => (
+          <button key={s} onClick={() => setSpeed(s)}
+            className={`text-xs px-2.5 py-1.5 rounded-lg border font-medium transition-colors ${speed === s ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 text-gray-500 hover:border-blue-300'}`}>
+            {s}
+          </button>
+        ))}
+        <input type="range" min={0} max={100} step={0.1}
+          value={scrubPct}
+          onChange={e => { setPlaying(false); setScrubPct(Number(e.target.value)) }}
+          className="flex-1 accent-blue-600" />
+      </div>
+
+      {/* Chart */}
+      <div className="relative rounded-xl border border-gray-100">
+        <svg width="100%" viewBox={`0 0 ${LABEL_W + CHART_W} ${chartH}`} style={{ fontFamily: 'inherit', display: 'block' }}>
+
+          {/* Legend header row */}
+          <rect x={0} y={0} width={LABEL_W + CHART_W} height={LEGEND_H} fill={svgC.legendBg} />
+          <line x1={0} y1={LEGEND_H} x2={LABEL_W + CHART_W} y2={LEGEND_H} stroke={svgC.grid} strokeWidth={1} />
+          {/* Legend items */}
+          {[
+            { color: '#22c55e', label: 'Processing' },
+            { color: '#eab308', label: 'Waiting' },
+            { color: '#ef4444', label: 'Blocked/Down' },
+          ].map((item, i) => (
+            <g key={item.label} transform={`translate(${LABEL_W + 12 + i * 110}, 0)`}>
+              <rect x={0} y={LEGEND_H / 2 - 5} width={10} height={10} rx={2} fill={item.color} />
+              <text x={14} y={LEGEND_H / 2 + 4} fontSize={9} fill={svgC.muted}>{item.label}</text>
+            </g>
+          ))}
+          {/* Time counter in legend row — right aligned */}
+          <text x={LABEL_W + CHART_W - 8} y={LEGEND_H / 2 + 4} textAnchor="end" fontSize={9} fontWeight="600" fill={svgC.label}>
+            {curMinutes}m / {Math.round(totalMinutes)}m
+          </text>
+
+          {/* Row backgrounds */}
+          {stations.map((s, i) => (
+            <rect key={s} x={0} y={LEGEND_H + i * ROW_H} width={LABEL_W + CHART_W} height={ROW_H}
+              fill={i % 2 === 0 ? svgC.rowEven : svgC.rowOdd} />
+          ))}
+
+          {/* Time grid lines */}
+          {ticks.map((t, i) => (
+            <g key={i}>
+              <line x1={LABEL_W + t.pct * CHART_W} y1={LEGEND_H}
+                    x2={LABEL_W + t.pct * CHART_W} y2={chartH - 20}
+                    stroke={svgC.grid} strokeWidth={1} />
+              <text
+                x={LABEL_W + t.pct * CHART_W}
+                y={chartH - 6}
+                textAnchor={i === tickCount ? 'end' : i === 0 ? 'start' : 'middle'}
+                fontSize={9} fill={svgC.muted}>{t.label}</text>
+            </g>
+          ))}
+
+          {/* Station labels */}
+          {stations.map((s, i) => (
+            <g key={s}>
+              <rect x={0} y={LEGEND_H + i * ROW_H} width={LABEL_W - 4} height={ROW_H}
+                fill={i % 2 === 0 ? svgC.rowEven : svgC.rowOdd} />
+              <circle cx={10} cy={LEGEND_H + i * ROW_H + ROW_H / 2} r={4}
+                fill={stationColor(s)} />
+              <text x={20} y={LEGEND_H + i * ROW_H + ROW_H / 2 + 4}
+                fontSize={11} fill={svgC.label} fontWeight="600">
+                {s.length > 18 ? s.slice(0, 17) + '…' : s}
+              </text>
+            </g>
+          ))}
+
+          {/* Divider line between labels and chart */}
+          <line x1={LABEL_W} y1={LEGEND_H} x2={LABEL_W} y2={chartH - 20} stroke={svgC.grid} strokeWidth={1} />
+
+          {/* Job bars */}
+          {visibleJobs.map((j, idx) => {
+            const x1 = LABEL_W + xPct(j.start) * CHART_W
+            const x2 = LABEL_W + xPct(Math.min(j.end, cutoffMs)) * CHART_W
+            const w = Math.max(2, x2 - x1)
+            const y = yOf(j.station)
+            const totalDur = j.end - j.start
+            // Compute clean pixel widths for each segment (proc | wait | blocked)
+            const procW  = totalDur > 0 ? Math.max(0, (j.processingTime * 60000 / totalDur) * w) : w
+            const waitW  = totalDur > 0 ? Math.max(0, (j.waitingTime  * 60000 / totalDur) * w) : 0
+            const blockW = totalDur > 0 ? Math.max(0, (j.blockedTime  * 60000 / totalDur) * w) : 0
+            // Clamp so they don't exceed total width
+            const total3 = procW + waitW + blockW
+            const scale  = total3 > w ? w / total3 : 1
+            const pw = procW  * scale
+            const ww = waitW  * scale
+            const bw = blockW * scale
+
+            return (
+              <g key={idx}
+                onMouseEnter={e => {
+                  const svg = (e.currentTarget as SVGElement).closest('svg')!.getBoundingClientRect()
+                  setHoveredJob({ job: j, x: e.clientX - svg.left, y: e.clientY - svg.top })
+                }}
+                onMouseLeave={() => setHoveredJob(null)}
+                style={{ cursor: 'pointer' }}
+              >
+                {/* Processing segment — green */}
+                {pw > 0 && <rect x={x1} y={y} width={pw} height={BAR_H} fill="#22c55e" rx={2} />}
+                {/* Waiting segment — yellow */}
+                {ww > 0 && <rect x={x1 + pw} y={y} width={ww} height={BAR_H} fill="#eab308" rx={0} />}
+                {/* Blocked segment — red */}
+                {bw > 0 && <rect x={x1 + pw + ww} y={y} width={bw} height={BAR_H} fill="#ef4444" rx={0} />}
+                {/* Thin border around full bar for definition */}
+                <rect x={x1} y={y} width={w} height={BAR_H} fill="none" stroke={svgC.barBorder} strokeWidth={0.5} rx={2} />
+              </g>
+            )
+          })}
+
+          {/* Cursor line */}
+          {scrubPct < 100 && (
+            <line
+              x1={LABEL_W + (scrubPct / 100) * CHART_W} y1={LEGEND_H}
+              x2={LABEL_W + (scrubPct / 100) * CHART_W} y2={chartH - 20}
+              stroke="#1d4ed8" strokeWidth={1.5} strokeDasharray="4 3" />
+          )}
+        </svg>
+
+        {/* Hover tooltip */}
+        {hoveredJob && (() => {
+          const { job, x, y } = hoveredJob
+          const flipLeft = x > LABEL_W + CHART_W * 0.6
+          return (
+            <div className="pointer-events-none absolute z-50 bg-white border border-gray-200 rounded-xl shadow-xl p-3 w-56"
+              style={{ left: flipLeft ? x - 220 : x + 12, top: Math.max(0, y - 10) }}>
+              <div className="flex items-center gap-2 mb-2">
+                <div className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ background: stationColor(job.station) }} />
+                <span className="text-xs font-bold text-gray-800">{job.station}</span>
+                <span className="ml-auto text-[10px] text-gray-400">Job #{job.jobIndex}</span>
+              </div>
+              <div className="space-y-1 text-[10px]">
+                <div className="flex justify-between">
+                  <span className="text-gray-500">Start</span>
+                  <span className="font-semibold tabular-nums text-gray-800">{Math.round((job.start - tMin) / 60000)} min</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-500">End</span>
+                  <span className="font-semibold tabular-nums text-gray-800">{Math.round((job.end - tMin) / 60000)} min</span>
+                </div>
+                <div className="border-t border-gray-100 my-1" />
+                <div className="flex justify-between">
+                  <span className="text-blue-600">Processing</span>
+                  <span className="font-semibold text-blue-700">{job.processingTime.toFixed(1)} min</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-amber-500">Waiting</span>
+                  <span className="font-semibold text-amber-600">{job.waitingTime.toFixed(1)} min</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-red-500">Blocked</span>
+                  <span className="font-semibold text-red-600">{job.blockedTime.toFixed(1)} min</span>
+                </div>
+                {job.downtime > 0 && (
+                  <div className="flex justify-between">
+                    <span className="text-gray-500">Downtime</span>
+                    <span className="font-semibold text-gray-700">{job.downtime.toFixed(1)} min</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          )
+        })()}
+      </div>
+
+      {/* Summary strip */}
+      <div className="grid grid-cols-4 gap-3 mt-4">
+        {stationSummary.map(s => (
+          <div key={s.station} className="rounded-xl border border-gray-100 bg-gray-50 px-3 py-2">
+            <div className="flex items-center gap-1.5 mb-1">
+              <div className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ background: stationColor(s.station) }} />
+              <span className="text-[11px] font-semibold text-gray-700 truncate">{s.station}</span>
+            </div>
+            <div className="flex gap-3 text-[10px] text-gray-500">
+              <span><b className="text-gray-800">{s.count}</b> jobs</span>
+              <span><b className="text-blue-600">{s.totalProc.toFixed(0)}m</b> proc</span>
+              <span><b className="text-amber-500">{s.totalWait.toFixed(0)}m</b> wait</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+
+  return (
+    <div>
+      {expanded && (
+        <div className="fixed inset-0 z-[9999] bg-gray-50 flex flex-col p-8 overflow-auto [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-gray-100 [&::-webkit-scrollbar-thumb]:bg-blue-300 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb:hover]:bg-blue-500">
+          <div className="bg-white rounded-2xl border border-gray-100 shadow-sm flex-1 flex flex-col p-6 overflow-auto">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h2 className="text-base font-bold text-gray-800">Gantt Chart</h2>
+                <p className="text-xs text-gray-400 mt-0.5">Job timeline by station</p>
+              </div>
+              <button onClick={onExpandToggle}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-gray-200 bg-white text-gray-500 hover:border-blue-300 hover:text-blue-600 transition-colors text-xs font-medium">
+                <Shrink className="w-3.5 h-3.5" /> Exit
+              </button>
+            </div>
+            {chartContent(true)}
+          </div>
+        </div>
+      )}
+      {chartContent(false)}
+    </div>
+  )
+}
+
+// ─── Charts ───────────────────────────────────────────────────────────────────
+
+function UtilTooltip({ active, payload, label }: { active?: boolean; payload?: {name: string; value: number; color: string}[]; label?: string }) {
+  if (!active || !payload?.length) return null
+  return (
+    <div className="bg-white border border-gray-100 rounded-xl shadow-lg px-4 py-3 text-sm">
+      <p className="font-semibold text-gray-800 mb-2">{label}</p>
+      {payload.map((p) => (
+        <div key={p.name} className="flex items-center justify-between gap-4">
+          <div className="flex items-center gap-1.5">
+            <div className="w-2 h-2 rounded-full" style={{ background: p.color }} />
+            <span className="text-gray-500 text-xs">{p.name === 'station' ? 'Station' : 'Operator'}</span>
+          </div>
+          <span className="font-bold text-gray-800">{p.value}%</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function UtilisationChart({ stats }: { stats: StationStat[] }) {
+  const isDark = useAppStore(s => s.theme) === 'dark'
+  const gridStroke = isDark ? '#334155' : '#f0f0f0'
+  const tickFill = isDark ? '#94a3b8' : '#666'
+  const cursorFill = isDark ? '#1e293b' : '#f1f5f9'
+  const data = [...stats]
+    .sort((a, b) => b.station_utilization - a.station_utilization)
+    .map((s) => ({
+      name: s.station_name.length > 14 ? s.station_name.slice(0, 13) + '…' : s.station_name,
+      station: parseFloat(s.station_utilization.toFixed(1)),
+      operator: parseFloat(s.operator_utilization.toFixed(1)),
+    }))
+  // Scale chart width with station count so bars/labels stay readable instead
+  // of squeezing to fit a fixed container when there are many stations.
+  const chartWidth = Math.max(600, data.length * 44)
+
+  return (
+    <div className="overflow-x-auto [&::-webkit-scrollbar]:h-1.5 [&::-webkit-scrollbar-thumb]:bg-blue-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+      <BarChart width={chartWidth} height={280} data={data} margin={{ top: 4, right: 16, left: -8, bottom: 30 }}>
+        <CartesianGrid strokeDasharray="3 3" stroke={gridStroke} />
+        <XAxis dataKey="name" tick={{ fontSize: 10, fill: tickFill }} angle={-35} textAnchor="end" interval={0} />
+        <YAxis domain={[0, 100]} tickFormatter={(v) => `${v}%`} tick={{ fontSize: 11, fill: tickFill }} />
+        <Tooltip content={<UtilTooltip />} cursor={{ fill: cursorFill, radius: 4 }} />
+        <Bar dataKey="station" name="station" radius={[3, 3, 0, 0]} barSize={14}>
+          {data.map((d, i) => <Cell key={i} fill={utilColor(d.station)} />)}
+        </Bar>
+        <Bar dataKey="operator" name="operator" fill="#93c5fd" radius={[3, 3, 0, 0]} barSize={14} />
+      </BarChart>
+    </div>
+  )
+}
+
+function BottleneckChart({ stats }: { stats: StationStat[] }) {
+  const isDark = useAppStore(s => s.theme) === 'dark'
+  const gridStroke = isDark ? '#334155' : '#f0f0f0'
+  const tickFill = isDark ? '#94a3b8' : '#666'
+  const cursorFill = isDark ? '#1e293b' : '#f1f5f9'
+  const top = [...stats].sort((a, b) => b.station_utilization - a.station_utilization)
+  const data = top.map((s) => ({
+    name: s.station_name.length > 14 ? s.station_name.slice(0, 13) + '…' : s.station_name,
+    util: parseFloat(s.station_utilization.toFixed(1)),
+  }))
+  // Scale chart width with station count so bars/labels stay readable instead
+  // of squeezing to fit a fixed container when there are many stations.
+  const chartWidth = Math.max(600, data.length * 44)
+
+  return (
+    <div className="overflow-x-auto [&::-webkit-scrollbar]:h-1.5 [&::-webkit-scrollbar-thumb]:bg-blue-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+      <BarChart width={chartWidth} height={280} data={data} margin={{ top: 4, right: 16, left: -8, bottom: 30 }}>
+        <CartesianGrid strokeDasharray="3 3" stroke={gridStroke} />
+        <XAxis dataKey="name" tick={{ fontSize: 10, fill: tickFill }} angle={-35} textAnchor="end" interval={0} />
+        <YAxis domain={[0, 100]} tickFormatter={(v) => `${v}%`} tick={{ fontSize: 11, fill: tickFill }} />
+        <Tooltip
+          cursor={{ fill: cursorFill }}
+          content={({ active, payload, label }) => {
+            if (!active || !payload?.length) return null
+            const val = payload[0].value as number | undefined
+            return (
+              <div className="bg-white border border-gray-100 rounded-xl shadow-lg px-4 py-3 text-sm">
+                <p className="font-semibold text-gray-800 mb-1">{label}</p>
+                <div className="flex items-center gap-1.5">
+                  <div className="w-2 h-2 rounded-full" style={{ background: payload[0].color }} />
+                  <span className="text-gray-500 text-xs">Utilization</span>
+                  <span className="font-bold text-gray-800 ml-2">{val ?? 0}%</span>
+                </div>
+              </div>
+            )
+          }}
+        />
+        <Bar dataKey="util" radius={[3,3,0,0]} barSize={18}>
+          {data.map((d, i) => <Cell key={i} fill={utilColor(d.util)} />)}
+        </Bar>
+      </BarChart>
+    </div>
+  )
+}
+
+function StationHealthGrid({ stats }: { stats: StationStat[] }) {
+  const [popup, setPopup] = useState<{ stat: StationStat; x: number; y: number; below: boolean } | null>(null)
+
+  return (
+    <div className="grid grid-cols-4 sm:grid-cols-6 lg:grid-cols-8 gap-2">
+      {stats.map((s) => (
+        <div
+          key={s.station_name}
+          onMouseEnter={(e) => {
+            const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+            // popup is ~260px tall; flip below if not enough space above
+            const below = rect.top < 280
+            setPopup({ stat: s, x: rect.left + rect.width / 2, y: below ? rect.bottom : rect.top, below })
+          }}
+          onMouseLeave={() => setPopup(null)}
+          className={`relative p-2 rounded-lg border text-center cursor-default ${utilBg(s.station_utilization)}`}
+        >
+          <div className="absolute top-0 left-0 right-0 h-1 rounded-t-lg"
+            style={{ background: utilColor(s.station_utilization) }} />
+          <p className="text-xs font-medium text-gray-700 leading-tight mt-1 truncate" style={{ fontSize: 10 }}>
+            {s.station_name}
+          </p>
+          <p className={`text-sm font-bold mt-0.5 ${utilTextColor(s.station_utilization)}`}>
+            {s.station_utilization.toFixed(0)}%
+          </p>
+        </div>
+      ))}
+
+      {popup && (() => {
+        const s = popup.stat
+        const color = utilColor(s.station_utilization)
+        const metrics = [
+          { label: 'Station Util.', value: `${s.station_utilization.toFixed(1)}%`, badge: utilTextColor(s.station_utilization) },
+          { label: 'Operator Util.', value: `${s.operator_utilization.toFixed(1)}%`, badge: 'text-blue-600' },
+          { label: 'Jobs Completed', value: String(s.completed_jobs), badge: 'text-gray-700' },
+          { label: 'Failures', value: String(s.failure_breakdowns), badge: s.failure_breakdowns > 0 ? 'text-red-500' : 'text-gray-400' },
+          { label: 'Rework Rate', value: `${s.rework_percentage.toFixed(1)}%`, badge: s.rework_percentage > 5 ? 'text-amber-600' : 'text-gray-400' },
+          { label: 'Rework Time', value: `${s.rework_time_ratio.toFixed(1)}%`, badge: s.rework_time_ratio > 10 ? 'text-amber-600' : 'text-gray-400' },
+          { label: 'Throughput', value: `${s.throughput.toFixed(2)} /hr`, badge: 'text-indigo-600' },
+        ]
+        return (
+          <div
+            className="fixed z-[9999] pointer-events-none"
+            style={{
+              left: popup.x,
+              top: popup.below ? popup.y + 8 : popup.y - 8,
+              transform: popup.below ? 'translate(-50%, 0)' : 'translate(-50%, -100%)',
+            }}
+          >
+            {/* Arrow above popup when flipped below */}
+            {popup.below && (
+              <div className="flex justify-center mb-0">
+                <div className="w-0 h-0 border-l-[6px] border-r-[6px] border-b-[6px] border-l-transparent border-r-transparent border-b-white drop-shadow-sm" />
+              </div>
+            )}
+            <div className="bg-white rounded-2xl shadow-2xl border border-gray-100 overflow-hidden w-60">
+              {/* Coloured header */}
+              <div className="px-4 py-3" style={{ background: color + '22' }}>
+                <div className="flex items-center gap-2 mb-1">
+                  <div className="w-2 h-2 rounded-full shrink-0" style={{ background: color }} />
+                  <p className="text-[11px] font-bold text-gray-800 leading-tight">{s.station_name}</p>
+                </div>
+                {/* Utilisation bar */}
+                <div className="flex items-center gap-2 mt-2">
+                  <div className="flex-1 h-1.5 bg-white/60 rounded-full overflow-hidden">
+                    <div className="h-full rounded-full" style={{ width: `${Math.min(s.station_utilization, 100)}%`, background: color }} />
+                  </div>
+                  <span className="text-[10px] font-bold tabular-nums" style={{ color }}>{s.station_utilization.toFixed(1)}%</span>
+                </div>
+              </div>
+              {/* Metrics grid */}
+              <div className="px-4 py-3 grid grid-cols-2 gap-x-4 gap-y-2.5">
+                {metrics.map(({ label, value, badge }) => (
+                  <div key={label}>
+                    <p className="text-[9px] text-gray-400 uppercase tracking-wide">{label}</p>
+                    <p className={`text-xs font-bold tabular-nums mt-0.5 ${badge}`}>{value}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+            {/* Arrow pointing down to the card (when popup is above) */}
+            {!popup.below && (
+              <div className="flex justify-center">
+                <div className="w-0 h-0 border-l-[6px] border-r-[6px] border-t-[6px] border-l-transparent border-r-transparent border-t-white drop-shadow-sm" />
+              </div>
+            )}
+          </div>
+        )
+      })()}
+    </div>
+  )
+}
+
+function StationTable({ stats }: { stats: StationStat[] }) {
+  const th = (label: string) => (
+    <th className="text-left text-xs font-semibold text-gray-400 uppercase tracking-wider py-3 px-4 whitespace-nowrap">
+      {label}
+    </th>
+  )
+
+  const statusConfig = (u: number) => {
+    if (u >= 85) return { label: 'Bottleneck', cls: 'text-red-600 bg-red-50 border border-red-200', dot: 'bg-red-500' }
+    if (u >= 70) return { label: 'High Load',  cls: 'text-amber-600 bg-amber-50 border border-amber-200', dot: 'bg-amber-400' }
+    if (u >= 40) return { label: 'Healthy',    cls: 'text-green-600 bg-green-50 border border-green-200', dot: 'bg-green-500' }
+    return              { label: 'Idle',       cls: 'text-gray-400 bg-gray-50 border border-gray-200', dot: 'bg-gray-300' }
+  }
+
+  return (
+    <div className="overflow-x-auto rounded-xl border border-gray-100 [&::-webkit-scrollbar]:h-1.5 [&::-webkit-scrollbar-track]:bg-gray-100 [&::-webkit-scrollbar-track]:rounded-full [&::-webkit-scrollbar-thumb]:bg-blue-300 [&::-webkit-scrollbar-thumb]:rounded-full hover:[&::-webkit-scrollbar-thumb]:bg-blue-400">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="bg-gray-50 border-b border-gray-100">
+            {th('Station')}
+            {th('Utilization')}
+            {th('Operator')}
+            {th('Jobs')}
+            {th('Failures')}
+            {th('Rework Rate %')}
+            {th('Status')}
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-gray-50">
+          {stats.map((s, idx) => {
+            const u = s.station_utilization
+            const { label, cls, dot } = statusConfig(u)
+            return (
+              <tr
+                key={s.station_name}
+                className={`hover:bg-blue-50/40 transition-colors duration-100 ${idx % 2 === 0 ? 'bg-white' : 'bg-gray-50/40'}`}
+              >
+                {/* Station name */}
+                <td className="py-3 px-4">
+                  <div className="flex items-center gap-2.5">
+                    <div className="w-2 h-2 rounded-full shrink-0" style={{ background: utilColor(u) }} />
+                    <span className="font-semibold text-gray-800 text-sm">{s.station_name}</span>
+                  </div>
+                </td>
+
+                {/* Utilization */}
+                <td className="py-3 px-4">
+                  <span className={`text-sm font-bold tabular-nums ${utilTextColor(u)}`}>
+                    {u.toFixed(1)}%
+                  </span>
+                </td>
+
+                {/* Operator */}
+                <td className="py-3 px-4">
+                  <span className="text-sm text-gray-600 tabular-nums">{s.operator_utilization.toFixed(1)}%</span>
+                </td>
+
+                {/* Jobs */}
+                <td className="py-3 px-4">
+                  <span className="text-sm font-semibold text-gray-700 tabular-nums">{s.completed_jobs}</span>
+                </td>
+
+                {/* Failures */}
+                <td className="py-3 px-4">
+                  <span className={`text-sm font-semibold tabular-nums ${s.failure_breakdowns > 0 ? 'text-red-500' : 'text-gray-400'}`}>
+                    {s.failure_breakdowns}
+                  </span>
+                </td>
+
+                {/* Rework % */}
+                <td className="py-3 px-4">
+                  <span className={`text-sm font-semibold tabular-nums ${s.rework_percentage > 5 ? 'text-amber-600' : 'text-gray-600'}`}>
+                    {s.rework_percentage.toFixed(1)}%
+                  </span>
+                </td>
+
+                {/* Status pill */}
+                <td className="py-3 px-4">
+                  <span className={`inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full ${cls}`}>
+                    <span className={`w-1.5 h-1.5 rounded-full ${dot}`} />
+                    {label}
+                  </span>
+                </td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+// ─── Run history sidebar ──────────────────────────────────────────────────────
+
+function RunHistory({
+  scenarioId, activeRunId, onSelect,
+}: {
+  scenarioId: number; activeRunId: number | null; onSelect: (r: RunDetail) => void
+}) {
+  const { data: runs = [] } = useQuery({
+    queryKey: ['runs', scenarioId],
+    queryFn: () => simulationsApi.listRuns(scenarioId),
+    refetchInterval: 3000,
+  })
+
+  const statusDot: Record<string, string> = {
+    completed: 'bg-green-400',
+    running:   'bg-blue-400 animate-pulse',
+    failed:    'bg-red-400',
+    pending:   'bg-gray-300',
+  }
+
+  return (
+    <div className="space-y-1.5">
+      {runs.map((r) => {
+        const isActive = r.id === activeRunId
+        return (
+          <button
+            key={r.id}
+            onClick={() => {
+              // The history list only carries lightweight KPI fields (no
+              // station_stats/result) — fetch the full run detail so switching
+              // to an older run shows its complete KPIs, station utilization,
+              // and timeline, not just the summary numbers.
+              simulationsApi.getRun(r.id).then(onSelect)
+            }}
+            className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-sm transition-all duration-150 border ${
+              isActive
+                ? 'bg-blue-50 border-blue-300 text-blue-700 shadow-sm shadow-blue-100'
+                : 'bg-white border-gray-100 hover:border-blue-200 hover:bg-blue-50/40 text-gray-600'
+            }`}
+          >
+            <div className="flex items-center gap-2.5">
+              <div className={`w-2 h-2 rounded-full shrink-0 ${statusDot[r.status] ?? 'bg-gray-300'}`} />
+              <div className="text-left">
+                <p className={`text-xs font-semibold ${isActive ? 'text-blue-700' : 'text-gray-700'}`}>
+                  Run #{r.id}
+                </p>
+                <p className={`text-[10px] capitalize ${
+                  r.status === 'completed' ? 'text-green-500' :
+                  r.status === 'running'   ? 'text-blue-400' :
+                  r.status === 'failed'    ? 'text-red-400'  : 'text-gray-400'
+                }`}>{r.status}</p>
+              </div>
+            </div>
+            <ChevronRight className={`h-3 w-3 ${isActive ? 'text-blue-400' : 'text-gray-300'}`} />
+          </button>
+        )
+      })}
+      {runs.length === 0 && (
+        <p className="text-xs text-gray-400 text-center py-4">No runs yet</p>
+      )}
+    </div>
+  )
+}
+
+// ─── Page ─────────────────────────────────────────────────────────────────────
+
+type Tab = 'kpis' | 'gantt'
+
+export default function RunDashboard() {
+  const navigate = useNavigate()
+  const { activeScenario, activeRun, setActiveRun, showToast } = useAppStore()
+  const [displayRun, setDisplayRun] = useState<RunDetail | null>(activeRun)
+  const [tab, setTab] = useState<Tab>('kpis')
+  const [ganttExpanded, setGanttExpanded] = useState(false)
+  const [configOpen, setConfigOpen] = useState(false)
+  const [simCfg, setSimCfg] = useState<SimConfigOverride>({ SIM_TIME: 10080, num_replications: 1 })
+
+  // Whenever the active scenario changes, load THAT scenario's own latest run
+  // (or clear the display entirely if it has none) — otherwise the previously
+  // viewed scenario's run stays on screen after switching scenarios.
+  useEffect(() => {
+    if (!activeScenario) { setDisplayRun(null); setActiveRun(null); return }
+    let cancelled = false
+    simulationsApi.listRuns(activeScenario.id).then((runs) => {
+      if (cancelled) return
+      if (runs.length === 0) { setDisplayRun(null); setActiveRun(null); return }
+      // listRuns only returns lightweight KPI fields (no station_stats/result)
+      // — fetch the full detail for the latest run so the dashboard shows
+      // complete KPIs, station utilization, and timeline immediately.
+      simulationsApi.getRun(runs[0].id).then((detail) => {
+        if (cancelled) return
+        setDisplayRun(detail)
+        setActiveRun(detail)
+      })
+    })
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeScenario?.id])
+
+  const [progress, setProgress] = useState<{ pct: number; msg: string } | null>(null)
+  const [historyCollapsed, setHistoryCollapsed] = useState(false)
+  const esRef = useRef<EventSource | null>(null)
+
+  const stopStream = () => {
+    if (esRef.current) { esRef.current.close(); esRef.current = null }
+  }
+
+  const startStream = (runId: number) => {
+    stopStream()
+    const url = simulationsApi.streamUrl(runId)
+    const es = new EventSource(url)
+    esRef.current = es
+
+    es.onmessage = (e) => {
+      try {
+        const evt = JSON.parse(e.data)
+        if (evt.type === 'progress') {
+          setProgress({ pct: evt.pct, msg: evt.msg })
+        } else if (evt.type === 'done' || evt.type === 'error') {
+          setProgress(null)
+          stopStream()
+          // Fetch final run detail
+          simulationsApi.getRun(runId).then((detail) => {
+            setDisplayRun(detail)
+            setActiveRun(detail)
+            showToast(
+              detail.status === 'completed'
+                ? `Run #${runId} completed — ${detail.completed_jobs} jobs`
+                : `Run #${runId} failed`,
+              detail.status === 'completed' ? 'success' : 'error'
+            )
+          })
+        }
+      } catch { /* ignore */ }
+    }
+
+    es.onerror = () => {
+      // SSE closed or server gone; fallback: poll once
+      stopStream()
+      simulationsApi.getRun(runId).then((detail) => {
+        if (detail.status !== 'running') {
+          setDisplayRun(detail)
+          setActiveRun(detail)
+          setProgress(null)
+        }
+      })
+    }
+  }
+
+  const triggerMutation = useMutation({
+    mutationFn: () => simulationsApi.triggerRun(activeScenario!.id, simCfg),
+    onSuccess: (data) => {
+      showToast('Simulation started')
+      setProgress({ pct: 0, msg: 'Queued…' })
+      startStream(data.id)
+    },
+    onError: (err: Error) => showToast(err.message, 'error'),
+  })
+
+  useEffect(() => { return stopStream }, [])
+
+  if (!activeScenario) {
+    return (
+      <div className="min-h-full p-8">
+        <div className="max-w-5xl mx-auto">
+          <div className="rounded-2xl border border-gray-100 bg-white/70 py-32 flex flex-col items-center gap-4">
+            <div className="w-16 h-16 bg-blue-50 rounded-2xl flex items-center justify-center">
+              <Play className="h-8 w-8 text-blue-400" />
+            </div>
+            <p className="text-gray-700 font-semibold text-lg">No scenario selected</p>
+            <p className="text-sm text-gray-400">Select a scenario first to run simulations and view results.</p>
+            <Button
+              onClick={() => navigate('/')}
+              className="bg-blue-600 hover:bg-blue-700 shadow-sm mt-2"
+            >
+              Go to Scenarios
+            </Button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  const stats = displayRun?.station_stats ?? []
+  const isRunning = !!progress || triggerMutation.isPending
+
+  // KPIs — all pre-calculated by backend
+  const simTime = displayRun?.simulation_time ?? 0
+  const completedJobs = displayRun?.completed_jobs ?? 0
+  const inProgressJobs = displayRun?.in_progress_jobs ?? 0
+  const throughput = displayRun?.kpi_throughput != null ? displayRun.kpi_throughput.toFixed(2) : '—'
+  const avgUtil = displayRun?.kpi_avg_utilization ?? 0
+  const peakUtil = displayRun?.kpi_peak_utilization ?? 0
+  const bottleneck = displayRun?.kpi_bottleneck_station
+    ? stats.find(s => s.station_name === displayRun.kpi_bottleneck_station) ?? null
+    : null
+  const atRisk = displayRun?.kpi_stations_at_risk ?? 0
+  const totalFailures = displayRun?.kpi_total_failures ?? 0
+  const totalRework = displayRun?.kpi_avg_rework_pct ?? 0
+  const simDays = displayRun?.kpi_sim_days?.toFixed(1) ?? '—'
+
+  return (
+    <>
+      <SimConfigDialog
+        open={configOpen}
+        value={simCfg}
+        onChange={setSimCfg}
+        onClose={() => setConfigOpen(false)}
+      />
+
+      <div className="flex h-full">
+        {/* Sidebar */}
+        <aside className={`no-print relative border-r border-gray-100 bg-white flex flex-col shadow-sm transition-all duration-300 ${historyCollapsed ? 'w-10' : 'w-56'}`}>
+          {/* Collapse toggle */}
+          <button
+            onClick={() => setHistoryCollapsed(c => !c)}
+            className="absolute -right-3 top-5 w-6 h-6 rounded-full bg-white border border-gray-200 shadow-sm flex items-center justify-center hover:bg-gray-50 transition-colors z-10"
+            title={historyCollapsed ? 'Expand run history' : 'Collapse run history'}
+          >
+            {historyCollapsed
+              ? <ChevronRight className="h-3 w-3 text-gray-500" />
+              : <ChevronLeft className="h-3 w-3 text-gray-500" />
+            }
+          </button>
+
+          {!historyCollapsed && (<>
+            {/* Header */}
+            <div className="px-4 pt-5 pb-3 border-b border-gray-100">
+              <p className="text-xs font-bold text-gray-500 uppercase tracking-widest">Run History</p>
+            </div>
+
+            {/* Runs list */}
+            <div className="flex-1 overflow-auto p-3 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-blue-200 [&::-webkit-scrollbar-thumb]:rounded-full hover:[&::-webkit-scrollbar-thumb]:bg-blue-300">
+              <RunHistory
+                scenarioId={activeScenario.id}
+                activeRunId={displayRun?.id ?? null}
+                onSelect={(r) => { setDisplayRun(r); setActiveRun(r) }}
+              />
+            </div>
+
+            {/* Legend */}
+            <div className="p-4 border-t border-gray-100 space-y-2">
+              <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-widest mb-2">Legend</p>
+              {[
+                { color: 'bg-green-400', label: 'Healthy (40–69%)' },
+                { color: 'bg-amber-400', label: 'High load (70–84%)' },
+                { color: 'bg-red-400',   label: 'Bottleneck (≥85%)' },
+              ].map(({ color, label }) => (
+                <div key={label} className="flex items-center gap-2">
+                  <div className={`w-2 h-2 rounded-full ${color}`} />
+                  <span className="text-xs text-gray-500">{label}</span>
+                </div>
+              ))}
+            </div>
+          </>)}
+        </aside>
+
+        {/* Main */}
+        <div className="print-main flex-1 p-6 overflow-auto bg-gradient-to-br from-white via-blue-50/30 to-indigo-50/40">
+          {/* Header */}
+          <div className="print:hidden flex items-center justify-between mb-5">
+            <div>
+              <h1 className="text-xl font-bold text-gray-900">{activeScenario.name}</h1>
+              <p className="text-sm text-gray-400 mt-0.5">
+                {/* Show the SELECTED RUN's actual simulated duration (not the
+                    config dialog's pending SIM_TIME), so this updates per-run
+                    when switching between runs in history. */}
+                {displayRun?.simulation_time != null ? Math.round(displayRun.simulation_time) : (simCfg.SIM_TIME ?? '?')} min sim · {Object.keys(activeScenario.stations_data).length} stations ·{' '}
+                {Object.keys(activeScenario.variant_quantities).length} variants
+                {displayRun?.num_replications && displayRun.num_replications > 1 ? ` · ${displayRun.num_replications} reps` : ''}
+              </p>
+            </div>
+            <div className="flex gap-2">
+              <Button variant="outline" size="sm" onClick={() => setConfigOpen(true)}>
+                <Settings className="h-4 w-4 mr-1.5" />
+                Config
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => navigate('/canvas')}>
+                <BarChart2 className="h-4 w-4 mr-1.5" />
+                View Flow
+              </Button>
+              {displayRun?.status === 'completed' && (
+                <Button variant="outline" size="sm" onClick={() => window.print()}>
+                  <Printer className="h-4 w-4 mr-1.5" />
+                  Export PDF
+                </Button>
+              )}
+              <Button size="sm" onClick={() => triggerMutation.mutate()} disabled={isRunning} className="bg-blue-600 hover:bg-blue-700 rounded-lg shadow-sm">
+                {isRunning ? (
+                  <><RefreshCw className="h-4 w-4 mr-1.5 animate-spin" />Running…</>
+                ) : (
+                  <><Play className="h-4 w-4 mr-1.5" />Run Simulation</>
+                )}
+              </Button>
+            </div>
+          </div>
+
+          {/* Live progress */}
+          {progress && (
+            <Card className="mb-5 border-blue-200 bg-blue-50">
+              <CardContent className="pt-4 pb-4">
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-2">
+                    <RefreshCw className="h-4 w-4 text-blue-600 animate-spin" />
+                    <span className="text-sm font-medium text-blue-700">{progress.msg}</span>
+                  </div>
+                  <span className="text-sm font-bold text-blue-700">{progress.pct.toFixed(0)}%</span>
+                </div>
+                <Progress value={progress.pct} className="h-2" />
+              </CardContent>
+            </Card>
+          )}
+
+          {displayRun && (
+            <div className="relative">
+              {/* Status + tabs */}
+              <div className="no-print flex items-center justify-between mb-5">
+                <div className="flex items-center gap-3">
+                  <StatusBadge status={displayRun.status} />
+                  {displayRun.status === 'completed' && <CheckCircle className="h-4 w-4 text-green-500" />}
+                  {displayRun.status === 'failed' && <AlertTriangle className="h-4 w-4 text-red-500" />}
+                  <span className="text-sm text-gray-400">Run #{displayRun.id}</span>
+                </div>
+                {displayRun.status === 'completed' && (
+                  <div className="flex rounded-lg border border-gray-200 overflow-hidden">
+                    <button
+                      onClick={() => setTab('kpis')}
+                      className={`px-4 py-1.5 text-sm font-medium transition-colors ${tab === 'kpis' ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}
+                    >
+                      <Layers className="h-3.5 w-3.5 inline mr-1" />KPIs
+                    </button>
+                    <button
+                      onClick={() => setTab('gantt')}
+                      className={`px-4 py-1.5 text-sm font-medium transition-colors ${tab === 'gantt' ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}
+                    >
+                      <CalendarDays className="h-3.5 w-3.5 inline mr-1" />Timeline
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {displayRun.status === 'failed' && (
+                <Card className="mb-5 border-red-200 bg-red-50">
+                  <CardContent className="pt-4 pb-4 text-sm text-red-700">
+                    {displayRun.error_message?.split('\n')[0]}
+                  </CardContent>
+                </Card>
+              )}
+
+              {displayRun.status === 'completed' && (
+                <>
+                  {tab === 'kpis' && (
+                    <>
+                      {/* KPI row 1 */}
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3 auto-rows-fr">
+                        <CompletedJobsCard completed={completedJobs} inProgress={inProgressJobs} stats={stats} />
+                        <ThroughputCard value={`${throughput} /hr`} sub="jobs per hour" stats={stats} />
+                        <SimDurationCard simDays={simDays} simTime={simTime} simCfg={simCfg} />
+                        <PeakUtilCard peakUtil={peakUtil} bottleneck={bottleneck} stats={stats} />
+                      </div>
+
+                      {/* KPI row 2 */}
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6 auto-rows-fr">
+                        <AvgUtilCard avgUtil={avgUtil} stats={stats} />
+                        <BottleneckCard bottleneck={bottleneck} stats={stats} />
+                        <AtRiskCard count={atRisk} stats={stats} />
+                        <TotalFailuresCard total={totalFailures} rework={totalRework} stats={stats} />
+                      </div>
+
+                      {stats.length > 0 && (
+                        <>
+                          <Card className="mb-5">
+                            <CardHeader className="pb-2">
+                              <CardTitle className="text-sm font-semibold text-gray-700">Station Health Overview</CardTitle>
+                            </CardHeader>
+                            <CardContent>
+                              <StationHealthGrid stats={stats} />
+                            </CardContent>
+                          </Card>
+
+                          <div className="flex flex-col gap-5 mb-5">
+                            <Card>
+                              <CardHeader className="pb-2">
+                                <div className="flex items-center justify-between">
+                                  <CardTitle className="text-sm font-semibold text-gray-700">Station & Operator Utilization</CardTitle>
+                                  <div className="flex items-center gap-3 text-xs text-gray-400">
+                                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-sm inline-block bg-green-400" /> Station</span>
+                                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-sm inline-block bg-blue-200" /> Operator</span>
+                                  </div>
+                                </div>
+                              </CardHeader>
+                              <CardContent>
+                                <UtilisationChart stats={stats} />
+                              </CardContent>
+                            </Card>
+                            <Card>
+                              <CardHeader className="pb-4">
+                                <div className="flex items-center justify-between">
+                                  <CardTitle className="text-sm font-semibold text-gray-700">Top Bottlenecks</CardTitle>
+                                  <span className="text-xs text-gray-400">Sorted by utilization</span>
+                                </div>
+                              </CardHeader>
+                              <CardContent>
+                                <BottleneckChart stats={stats} />
+                              </CardContent>
+                            </Card>
+                          </div>
+
+                          <Card>
+                            <CardHeader className="pb-2">
+                              <div className="flex items-center justify-between">
+                                <CardTitle className="text-sm font-semibold text-gray-700">Station Details</CardTitle>
+                                <button
+                                  onClick={() => navigate('/insights')}
+                                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-xs font-semibold shadow-sm hover:shadow-blue-200 hover:shadow-md transition-all"
+                                >
+                                  <Lightbulb className="h-3 w-3" />
+                                  AI Insights
+                                </button>
+                              </div>
+                            </CardHeader>
+                            <CardContent>
+                              <StationTable stats={stats} />
+                            </CardContent>
+                          </Card>
+                        </>
+                      )}
+                    </>
+                  )}
+
+                  {tab === 'gantt' && (
+                    <Card>
+                      <CardHeader className="pb-2">
+                        <div className="flex items-center justify-between">
+                          <CardTitle className="text-sm font-semibold text-gray-700">
+                            Job Timeline — {completedJobs} jobs across {stats.length} stations
+                          </CardTitle>
+                          <button onClick={() => setGanttExpanded(e => !e)}
+                            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-gray-200 text-gray-500 hover:border-blue-300 hover:text-blue-600 transition-colors text-xs font-medium">
+                            <Expand className="w-3.5 h-3.5" /> Expand
+                          </button>
+                        </div>
+                      </CardHeader>
+                      <CardContent>
+                        <GanttTimeline result={displayRun.result ?? {}} isExpanded={ganttExpanded} onExpandToggle={() => setGanttExpanded(e => !e)} />
+                      </CardContent>
+                    </Card>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+          {!displayRun && !isRunning && (
+            <div className="text-center py-24 text-gray-400">
+              <Play className="h-14 w-14 text-gray-200 mx-auto mb-4" />
+              <p className="font-medium text-gray-500 mb-1">Click "Run Simulation" to start</p>
+              <p className="text-sm text-gray-400">Results will appear here with full KPIs and charts</p>
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  )
+}

@@ -1,0 +1,237 @@
+@import "tailwindcss";
+
+/* Enable class-based dark mode: `dark:` variants apply when <html class="dark"> */
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  color-scheme: light dark;
+}
+
+.dark {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+::-webkit-scrollbar-thumb {
+  background: #93c5fd;
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3b82f6;
+}
+
+.dark ::-webkit-scrollbar-track {
+  background: #1e293b;
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: #475569;
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
+
+/* ── Dark theme overrides ─────────────────────────────────────────────────────
+   The app uses literal Tailwind palette utilities (bg-white, text-gray-800, …).
+   Rather than annotate every element with `dark:` variants, we remap the common
+   surface/text/border utilities when <html class="dark"> is active. Component-
+   specific accent colors (blue/green/red/amber) are left intact.
+   ─────────────────────────────────────────────────────────────────────────── */
+.dark body {
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+/* Surfaces — white & light grays become dark slate */
+.dark .bg-white { background-color: #1e293b !important; }
+.dark .bg-white\/60 { background-color: rgba(30, 41, 59, 0.6) !important; }
+.dark .bg-white\/70 { background-color: rgba(30, 41, 59, 0.7) !important; }
+.dark .bg-gray-50 { background-color: #0f172a !important; }
+.dark .bg-gray-100 { background-color: #1e293b !important; }
+.dark .bg-gray-200 { background-color: #334155 !important; }
+.dark .bg-slate-50 { background-color: #0f172a !important; }
+.dark .bg-slate-100 { background-color: #1e293b !important; }
+
+/* Dividers */
+.dark .divide-gray-50 > * + *,
+.dark .divide-gray-100 > * + * { border-color: #334155 !important; }
+
+/* Light accent borders on empty-state cards */
+.dark .border-blue-100 { border-color: #334155 !important; }
+
+/* Page-background gradients (from-white via-blue-50/30 …) → solid dark base */
+.dark .from-white { background-image: none !important; background-color: #0f172a !important; }
+
+/* Soft tinted gradient strips used on modal headers (from-*-50 to-*-50):
+   flatten to a subtle dark header. Solid accent gradients (from-*-500/-600,
+   e.g. logo & primary buttons) are intentionally NOT matched here. */
+.dark .from-blue-50,
+.dark .from-indigo-50,
+.dark .from-red-50,
+.dark .from-orange-50,
+.dark .from-amber-50,
+.dark .from-rose-50 {
+  background-image: none !important;
+  background-color: #1e293b !important;
+}
+
+/* Text — dark grays become light */
+.dark .text-gray-900 { color: #f1f5f9 !important; }
+.dark .text-gray-800 { color: #e2e8f0 !important; }
+.dark .text-gray-700 { color: #cbd5e1 !important; }
+.dark .text-gray-600 { color: #94a3b8 !important; }
+.dark .text-gray-500 { color: #94a3b8 !important; }
+.dark .text-gray-400 { color: #64748b !important; }
+
+/* Borders */
+.dark .border-gray-100 { border-color: #334155 !important; }
+.dark .border-gray-200 { border-color: #334155 !important; }
+.dark .border-gray-300 { border-color: #475569 !important; }
+
+/* Hover states on light surfaces */
+.dark .hover\:bg-gray-50:hover { background-color: #334155 !important; }
+.dark .hover\:bg-gray-100:hover { background-color: #334155 !important; }
+
+/* Soft accent tints (badges, active nav) — deepen so text stays readable */
+.dark .bg-blue-50 { background-color: rgba(59, 130, 246, 0.15) !important; }
+.dark .bg-green-50 { background-color: rgba(34, 197, 94, 0.15) !important; }
+.dark .bg-red-50 { background-color: rgba(239, 68, 68, 0.15) !important; }
+.dark .bg-amber-50 { background-color: rgba(245, 158, 11, 0.15) !important; }
+.dark .bg-yellow-50 { background-color: rgba(234, 179, 8, 0.15) !important; }
+.dark .bg-blue-100 { background-color: rgba(59, 130, 246, 0.22) !important; }
+.dark .bg-green-100 { background-color: rgba(34, 197, 94, 0.22) !important; }
+.dark .bg-red-100 { background-color: rgba(239, 68, 68, 0.22) !important; }
+.dark .bg-amber-100 { background-color: rgba(245, 158, 11, 0.22) !important; }
+.dark .bg-orange-100 { background-color: rgba(249, 115, 22, 0.22) !important; }
+
+/* Accent text on those tints — lighten one step for contrast on dark */
+.dark .text-blue-700 { color: #93c5fd !important; }
+.dark .text-green-700 { color: #86efac !important; }
+.dark .text-red-700 { color: #fca5a5 !important; }
+.dark .text-amber-700 { color: #fcd34d !important; }
+.dark .text-blue-800,
+.dark .text-green-800,
+.dark .text-red-800 { color: #cbd5e1 !important; }
+
+/* Inputs */
+.dark input,
+.dark textarea,
+.dark select {
+  background-color: #0f172a;
+  color: #e2e8f0;
+  border-color: #334155;
+}
+.dark input::placeholder,
+.dark textarea::placeholder { color: #64748b; }
+/* Neutralize focus:bg-white so inputs don't flash white on focus in dark mode */
+.dark .focus\:bg-white:focus { background-color: #1e293b !important; }
+
+/* React Flow base styles */
+.react-flow__node {
+  font-size: 14px;
+}
+
+/* React Flow — dark theme */
+.dark .react-flow {
+  background-color: #0f172a;
+}
+.dark .react-flow__controls button {
+  background-color: #1e293b;
+  border-color: #334155;
+  color: #e2e8f0;
+  fill: #e2e8f0;
+}
+.dark .react-flow__controls button:hover {
+  background-color: #334155;
+}
+.dark .react-flow__minimap {
+  background-color: #1e293b;
+}
+.dark .react-flow__attribution {
+  background: transparent;
+  color: #64748b;
+}
+
+/* ── Print / PDF export ─────────────────────────────────────────────────────── */
+@media print {
+  /* Hide nav sidebar, run history sidebar, all buttons, toast notification */
+  .no-print,
+  button,
+  [role="button"] {
+    display: none !important;
+  }
+
+  .fixed {
+    display: none !important;
+  }
+
+  /* Root layout — make it block so content flows */
+  html, body, #root {
+    height: auto !important;
+    overflow: visible !important;
+    background: white !important;
+  }
+
+  /* The outer flex wrapper (Layout) — make block so sidebar hides and main fills */
+  #root > div {
+    display: block !important;
+    height: auto !important;
+  }
+
+  /* The page content area */
+  .print-main {
+    display: block !important;
+    height: auto !important;
+    overflow: visible !important;
+    padding: 0 !important;
+    background: white !important;
+  }
+
+  /* Remove height limits on scrollable areas so all content prints */
+  .overflow-auto,
+  .overflow-y-auto {
+    overflow: visible !important;
+    height: auto !important;
+    max-height: none !important;
+  }
+
+  /* Remove box shadows and gradients */
+  * {
+    box-shadow: none !important;
+  }
+  [class*="bg-gradient"] {
+    background: white !important;
+  }
+
+  /* Charts */
+  .recharts-responsive-container {
+    height: 240px !important;
+    width: 100% !important;
+  }
+
+  /* Keep cards from splitting across pages */
+  .break-inside-avoid {
+    break-inside: avoid;
+  }
+
+  @page {
+    margin: 12mm;
+    size: A4;
+  }
+}
