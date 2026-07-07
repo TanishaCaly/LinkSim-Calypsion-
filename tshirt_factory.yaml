@@ -1,0 +1,101 @@
+scenario:
+  simulation_config:
+    SIM_TIME: 480
+    SHIFT_DURATION: 480
+    SHIFT_1_START: 6
+    SHIFT_1_END: 14
+    SHIFT_2_START: 14
+    SHIFT_2_END: 22
+    SHIFT_3_START: 22
+    SHIFT_3_END: 6
+    STATION_DOWNTIME: 0
+    ACTIVE_PROCESSING_TIME: 480
+
+  stations:
+    Cutting:
+      capacity: 2
+      shifts_per_day: 1
+      operator_per_station: 2
+      Failure rate: 0.01
+      Repair Time: 20
+      PM Schedule: Monthly
+      Material Shortage Probability (%): 2
+      Rework Probability (%): 3
+      shift1: Op1
+      shift2: ""
+      shift3: ""
+      STATION_DOWNTIME: 0
+
+    Stitching:
+      capacity: 1
+      shifts_per_day: 1
+      operator_per_station: 3
+      Failure rate: 0.02
+      Repair Time: 30
+      PM Schedule: Monthly
+      Material Shortage Probability (%): 1
+      Rework Probability (%): 5
+      shift1: Op2
+      shift2: ""
+      shift3: ""
+      STATION_DOWNTIME: 0
+
+    QualityCheck:
+      capacity: 1
+      shifts_per_day: 1
+      operator_per_station: 1
+      Failure rate: 0.005
+      Repair Time: 15
+      PM Schedule: Monthly
+      Material Shortage Probability (%): 0
+      Rework Probability (%): 2
+      shift1: Op3
+      shift2: ""
+      shift3: ""
+      STATION_DOWNTIME: 0
+
+    Packaging:
+      capacity: 2
+      shifts_per_day: 1
+      operator_per_station: 1
+      Failure rate: 0.005
+      Repair Time: 10
+      PM Schedule: Monthly
+      Material Shortage Probability (%): 1
+      Rework Probability (%): 1
+      shift1: Op4
+      shift2: ""
+      shift3: ""
+      STATION_DOWNTIME: 0
+
+  operators:
+    Op1:
+      Skill Rating: 4
+      Availability (%): 95
+    Op2:
+      Skill Rating: 3
+      Availability (%): 90
+    Op3:
+      Skill Rating: 4
+      Availability (%): 95
+    Op4:
+      Skill Rating: 5
+      Availability (%): 98
+
+  processflow:
+    tshirt:
+      - operation: Cut Fabric
+        resource: Cutting
+        duration: 10
+      - operation: Stitch Shirt
+        resource: Stitching
+        duration: 25
+      - operation: Quality Inspection
+        resource: QualityCheck
+        duration: 8
+      - operation: Pack & Dispatch
+        resource: Packaging
+        duration: 5
+
+  variant_quantities:
+    tshirt: 200
