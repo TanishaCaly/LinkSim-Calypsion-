@@ -11,6 +11,9 @@ export interface Machine3D {
   utilization: number
   stats?: StationStat
   steps: ProcessStep[]
+  height: number
+  width: number
+  queueDepth: number
 }
 
 export interface Operator3D {
@@ -34,8 +37,14 @@ export interface Connection3D {
   toStation: string
 }
 
+export interface StepLabel {
+  position: [number, number, number]
+  text: string
+}
+
 const X_GAP = 6
 const Z_GAP = 3.5
+const COLS_PER_ROW = 5
 
 function utilColor(u: number): string {
   if (u >= 85) return '#ef4444'
@@ -52,14 +61,17 @@ export function buildScene3D(
   stationsData: Record<string, StationConfig>,
   operatorsData: Record<string, OperatorConfig>,
   stationStats: StationStat[],
-): { machines: Machine3D[]; operators: Operator3D[]; connections: Connection3D[] } {
+): { machines: Machine3D[]; operators: Operator3D[]; connections: Connection3D[]; stepLabels: StepLabel[] } {
   const steps = processflow[variant] ?? []
   const statsMap = new Map(stationStats.map(s => [s.station_name, s]))
+
+  const maxDuration = Math.max(...steps.map(s => s.duration), 1)
 
   const seen = new Map<string, { col: number; machines: Machine3D[] }>()
   const machines: Machine3D[] = []
   const operators: Operator3D[] = []
 
+  let stepIdx = 0
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i]
     const station = stationsData[step.resource]
@@ -68,30 +80,48 @@ export function buildScene3D(
     if (!seen.has(step.resource)) {
       const capacity = station.capacity || 1
       const colMachines: Machine3D[] = []
+      const stats = statsMap.get(step.resource)
+      const util = stats?.station_utilization ?? 0
+      const isBottleneck = util > 85
+      const queueDepth = isBottleneck
+        ? Math.min(Math.floor((util - 85) / 2), 8)
+        : 0
+      const height = 1.2 + (step.duration / maxDuration) * 0.8
+      const width = 2.0 + (capacity - 1) * 0.3
+
+      const row = Math.floor(stepIdx / COLS_PER_ROW)
+      const colInRow = stepIdx % COLS_PER_ROW
+      const isReversed = row % 2 === 1
+      const col = isReversed ? (COLS_PER_ROW - 1 - colInRow) : colInRow
+      const xPos = col * X_GAP - (COLS_PER_ROW - 1) * X_GAP * 0.5
+      const zPos = row * Z_GAP * 2.5
 
       for (let m = 0; m < capacity; m++) {
         const id = capacity > 1 ? `${step.resource}#${m + 1}` : step.resource
         const z = capacity > 1
-          ? -(((capacity - 1) * Z_GAP) / 2) + m * Z_GAP
-          : 0
+          ? zPos + (-(((capacity - 1) * Z_GAP) / 2) + m * Z_GAP)
+          : zPos
 
         const machine: Machine3D = {
           id,
-          position: [i * X_GAP, 0, z],
+          position: [xPos, 0, z],
           label: capacity > 1 ? `${step.resource} #${m + 1}` : step.resource,
           baseName: step.resource,
           capacity,
           machineIndex: m,
           machineCount: capacity,
-          utilization: statsMap.get(step.resource)?.station_utilization ?? 0,
-          stats: statsMap.get(step.resource),
+          utilization: stats?.station_utilization ?? 0,
+          stats,
           steps: [],
+          height,
+          width,
+          queueDepth,
         }
         colMachines.push(machine)
         machines.push(machine)
       }
 
-      seen.set(step.resource, { col: i, machines: colMachines })
+      seen.set(step.resource, { col: stepIdx, machines: colMachines })
 
       const opCount = station.operator_per_station || 1
       const shiftOp = station.shift1 || 'Op?'
@@ -118,6 +148,8 @@ export function buildScene3D(
           })
         }
       }
+
+      stepIdx++
     }
 
     const entry = seen.get(step.resource)!
@@ -157,5 +189,19 @@ export function buildScene3D(
     }
   }
 
-  return { machines, operators, connections }
+  const uniqueSteps = steps.filter((s, i) => steps.findIndex(t => t.resource === s.resource) === i)
+  const stepLabels: StepLabel[] = uniqueSteps.map((step, i) => {
+    const row = Math.floor(i / COLS_PER_ROW)
+    const colInRow = i % COLS_PER_ROW
+    const isReversed = row % 2 === 1
+    const col = isReversed ? (COLS_PER_ROW - 1 - colInRow) : colInRow
+    const xPos = col * X_GAP - (COLS_PER_ROW - 1) * X_GAP * 0.5
+    const zPos = row * Z_GAP * 2.5
+    return {
+      position: [xPos, 0.02, zPos - 3.5],
+      text: `Step ${i}`,
+    }
+  })
+
+  return { machines, operators, connections, stepLabels }
 }

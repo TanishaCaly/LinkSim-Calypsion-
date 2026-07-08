@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ReactFlow, {
   addEdge, Background, Controls, MiniMap,
   useNodesState, useEdgesState,
@@ -8,7 +8,7 @@ import ReactFlow, {
 import 'reactflow/dist/style.css'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { Save, Plus, Trash2, Settings, Eye, Edit3, Play, ChevronLeft, ChevronRight } from 'lucide-react'
+import { Save, Plus, Trash2, Settings, Eye, Edit3, Play, ChevronLeft, ChevronRight, Box, Layout } from 'lucide-react'
 import { scenariosApi } from '@/api/scenarios'
 import { useAppStore } from '@/store/useAppStore'
 import { Button } from '@/components/ui/button'
@@ -48,6 +48,7 @@ function StationNode({ data, selected }: { data: StationNodeData; selected: bool
 }
 
 const nodeTypes: NodeTypes = { station: StationNode }
+const defaultEdgeTypes = {}
 
 // ─── Property editor ─────────────────────────────────────────────────────────
 
@@ -95,7 +96,20 @@ function PropertyEditor({
             <Input
               type={type}
               value={String(node.data[key as keyof StationNodeData])}
-              onChange={(e) => onChange(node.id, { [key]: type === 'number' ? Number(e.target.value) : e.target.value })}
+              onChange={(e) => {
+                const raw = e.target.value
+                if (type === 'number') {
+                  // FIX: guard against NaN from an empty field or a partial
+                  // value like "12." — previously this would write NaN into
+                  // node data and render the literal string "NaN" in the input.
+                  if (raw === '') return
+                  const parsed = Number(raw)
+                  if (Number.isNaN(parsed)) return
+                  onChange(node.id, { [key]: parsed })
+                } else {
+                  onChange(node.id, { [key]: raw })
+                }
+              }}
               className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
             />
           </div>
@@ -134,8 +148,6 @@ const PALETTE_ITEMS = [
   { label: 'Inspection', description: 'QA station',         color: 'bg-purple-50 text-purple-500 border-purple-400' },
   { label: 'Packaging',  description: 'Pack & dispatch',    color: 'bg-orange-50 text-orange-500 border-orange-400' },
 ]
-
-let nodeCounter = 0
 
 // ─── Build mode graph builder ─────────────────────────────────────────────────
 
@@ -199,9 +211,8 @@ export default function Canvas() {
   const { activeScenario, activeRun, setActiveScenario, showToast } = useAppStore()
   const isDark = useAppStore(s => s.theme) === 'dark'
 
-  const stableNodeTypes = useMemo(() => nodeTypes, [])
-
   const [mode, setMode] = useState<'view' | 'build'>(activeScenario ? 'view' : 'build')
+  const [viewMode, setViewMode] = useState<'3d' | '2d'>('3d')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [selectedVariant, setSelectedVariant] = useState<string>('')
 
@@ -210,6 +221,16 @@ export default function Canvas() {
   const [edges, setEdges, onEdgesChange] = useEdgesState([])
   const [selectedNode, setSelectedNode] = useState<Node<StationNodeData> | null>(null)
   const [scenarioName, setScenarioName] = useState('')
+
+  // FIX: was a module-level `let nodeCounter = 0`, which persists across
+  // component mounts/unmounts and scenario switches within the same page
+  // session (and can double-increment under React strict-mode double
+  // invocation). A ref scopes the counter to this component instance.
+  const nodeCounterRef = useRef(0)
+  const nextNodeId = () => {
+    nodeCounterRef.current += 1
+    return nodeCounterRef.current
+  }
 
   // View mode: derive 3D scene from scenario
   const variants = useMemo(
@@ -231,6 +252,20 @@ export default function Canvas() {
       activeRun?.station_stats ?? [],
     )
   }, [activeScenario, selectedVariant, activeRun])
+
+  const completionLog = useMemo(() =>
+    (activeRun?.result as Record<string, unknown> | null)?.completion_log as Record<string, unknown[]> | undefined,
+    [activeRun]
+  )
+
+  const viewGraphData = useMemo(() => {
+    if (!activeScenario || !selectedVariant) return { nodes: [], edges: [] }
+    return buildEditableGraph(
+      activeScenario.processflow_data,
+      selectedVariant,
+      activeScenario.stations_data
+    )
+  }, [activeScenario, selectedVariant])
 
   const stepCount = useMemo(() => {
     if (!activeScenario || !selectedVariant) return 0
@@ -258,14 +293,14 @@ export default function Canvas() {
   )
 
   const addNode = (label: string) => {
-    nodeCounter++
+    const id = nextNodeId()
     setNodes((nds) => {
       const rightmostX = nds.length > 0 ? Math.max(...nds.map((n) => n.position.x)) : 40
       const avgY = nds.length > 0 ? nds.reduce((sum, n) => sum + n.position.y, 0) / nds.length : 160
       return [
         ...nds,
         {
-          id: `station_${nodeCounter}`,
+          id: `station_${id}`,
           type: 'station',
           position: { x: nds.length > 0 ? rightmostX + 220 : 80, y: avgY },
           data: { label, capacity: 1, cycleTime: 30, operators: 1 },
@@ -286,7 +321,9 @@ export default function Canvas() {
   }
 
   const addParallelMachine = (id: string) => {
-    nodeCounter++
+    const newIdNum = nextNodeId()
+    const newId = `station_${newIdNum}`
+
     setNodes((nds) => {
       const source = nds.find((n) => n.id === id)
       if (!source) return nds
@@ -300,7 +337,6 @@ export default function Canvas() {
         return { ...n, data: { ...n.data, label: `${base} #${idx}` } }
       })
 
-      const newId = `station_${nodeCounter}`
       const stackOffset = 170
       const boxWidth = 180
       const boxHeight = 150
@@ -328,8 +364,8 @@ export default function Canvas() {
       const incoming = eds.filter((e) => e.target === id)
       const outgoing = eds.filter((e) => e.source === id)
       const newEdges: Edge[] = [
-        ...incoming.map((e) => ({ ...e, id: `e_${e.source}__station_${nodeCounter}`, target: `station_${nodeCounter}` })),
-        ...outgoing.map((e) => ({ ...e, id: `e_station_${nodeCounter}__${e.target}`, source: `station_${nodeCounter}` })),
+        ...incoming.map((e) => ({ ...e, id: `e_${e.source}__${newId}`, target: newId })),
+        ...outgoing.map((e) => ({ ...e, id: `e_${newId}__${e.target}`, source: newId })),
       ]
       return [...eds, ...newEdges]
     })
@@ -487,6 +523,28 @@ export default function Canvas() {
                   </div>
                 </div>
 
+                <div>
+                  <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">View</p>
+                  <div className="flex rounded-xl border border-gray-200 overflow-hidden">
+                    <button
+                      onClick={() => setViewMode('3d')}
+                      className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-semibold transition-all ${
+                        viewMode === '3d' ? 'bg-blue-600 text-white' : 'text-gray-500 hover:bg-gray-50'
+                      }`}
+                    >
+                      <Box className="h-3 w-3" /> 3D
+                    </button>
+                    <button
+                      onClick={() => setViewMode('2d')}
+                      className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-semibold transition-all ${
+                        viewMode === '2d' ? 'bg-blue-600 text-white' : 'text-gray-500 hover:bg-gray-50'
+                      }`}
+                    >
+                      <Layout className="h-3 w-3" /> 2D
+                    </button>
+                  </div>
+                </div>
+
                 {activeRun?.status === 'completed' && (
                   <div className="pt-3 border-t border-gray-100">
                     <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Util. Overlay</p>
@@ -505,6 +563,24 @@ export default function Canvas() {
                     </div>
                   </div>
                 )}
+
+                <div className="pt-3 border-t border-gray-100">
+                  <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Operator Skill</p>
+                  <div className="space-y-1.5">
+                    {[
+                      { color: '#3b82f6', label: '5 — Expert' },
+                      { color: '#22c55e', label: '4 — High' },
+                      { color: '#f59e0b', label: '3 — Medium' },
+                      { color: '#f97316', label: '2 — Low' },
+                      { color: '#ef4444', label: '1 — Beginner' },
+                    ].map(({ color, label }) => (
+                      <div key={label} className="flex items-center gap-2">
+                        <div className="w-2 h-3 rounded-sm" style={{ background: color }} />
+                        <span className="text-[11px] text-gray-500">{label}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
 
                 <div className="pt-3 border-t border-gray-100">
                   <div className="flex items-center justify-between">
@@ -602,24 +678,56 @@ export default function Canvas() {
         <div className="flex-1 flex min-h-0">
           <div className="flex-1 min-h-0">
             {mode === 'view' ? (
-              scene3D.machines.length > 0 ? (
-                <Scene
-                  machines={scene3D.machines}
-                  operators={scene3D.operators}
-                  connections={scene3D.connections}
-                  stationsData={activeScenario!.stations_data}
-                  operatorsData={activeScenario!.operators_data}
-                  isDark={isDark}
-                />
-              ) : (
-                <div className="flex items-center justify-center h-full text-gray-400">
-                  <div className="text-center">
-                    <Eye className="h-12 w-12 text-gray-200 mx-auto mb-3" />
-                    <p className="text-sm font-medium text-gray-500">
-                      {activeScenario ? 'Select a variant to view the process flow' : 'No scenario loaded'}
-                    </p>
+              viewMode === '3d' ? (
+                scene3D.machines.length > 0 ? (
+                  <Scene
+                    machines={scene3D.machines}
+                    operators={scene3D.operators}
+                    connections={scene3D.connections}
+                    stepLabels={scene3D.stepLabels}
+                    stationsData={activeScenario!.stations_data}
+                    operatorsData={activeScenario!.operators_data}
+                    isDark={isDark}
+                    completionLog={completionLog}
+                  />
+                ) : (
+                  <div className="flex items-center justify-center h-full text-gray-400">
+                    <div className="text-center">
+                      <Eye className="h-12 w-12 text-gray-200 mx-auto mb-3" />
+                      <p className="text-sm font-medium text-gray-500">
+                        {activeScenario ? 'Select a variant to view the process flow' : 'No scenario loaded'}
+                      </p>
+                    </div>
                   </div>
-                </div>
+                )
+              ) : (
+                viewGraphData.nodes.length > 0 ? (
+                  <ReactFlow
+                    nodes={viewGraphData.nodes}
+                    edges={viewGraphData.edges}
+                    nodeTypes={nodeTypes}
+                    edgeTypes={defaultEdgeTypes}
+                    nodesDraggable={false}
+                    nodesConnectable={false}
+                    elementsSelectable={false}
+                    panOnDrag
+                    onInit={(instance) => instance.fitView({ padding: 0.2 })}
+                    proOptions={{ hideAttribution: true }}
+                  >
+                    <Background color={isDark ? '#334155' : undefined} />
+                    <Controls />
+                    <MiniMap nodeColor="#3b82f6" maskColor={isDark ? 'rgba(15,23,42,0.7)' : 'rgba(240,244,255,0.7)'} />
+                  </ReactFlow>
+                ) : (
+                  <div className="flex items-center justify-center h-full text-gray-400">
+                    <div className="text-center">
+                      <Layout className="h-12 w-12 text-gray-200 mx-auto mb-3" />
+                      <p className="text-sm font-medium text-gray-500">
+                        {activeScenario ? 'Select a variant to view the process flow' : 'No scenario loaded'}
+                      </p>
+                    </div>
+                  </div>
+                )
               )
             ) : (
               <ReactFlow
@@ -628,7 +736,8 @@ export default function Canvas() {
                 onNodesChange={onNodesChange}
                 onEdgesChange={onEdgesChange}
                 onConnect={onConnect}
-                nodeTypes={stableNodeTypes}
+                nodeTypes={nodeTypes}
+                edgeTypes={defaultEdgeTypes}
                 onNodeClick={(_, node) => setSelectedNode(node as Node<StationNodeData>)}
                 onPaneClick={() => setSelectedNode(null)}
                 nodesDraggable

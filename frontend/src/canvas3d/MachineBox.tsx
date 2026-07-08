@@ -20,8 +20,13 @@ export default function MachineBox({ machine, selected = false, onClick, onHover
   const targetGlow = useRef(0)
 
   const color = utilColor(machine.utilization)
+  const isActive = machine.utilization > 5
+  const isIdle = machine.utilization <= 5
 
-  useFrame((_, delta) => {
+  const w = machine.width
+  const h = machine.height
+
+  useFrame((state, delta) => {
     if (!groupRef.current) return
     const s = hovered ? 1.05 : selected ? 1.03 : 1
     targetScale.current.set(s, s, s)
@@ -58,9 +63,9 @@ export default function MachineBox({ machine, selected = false, onClick, onHover
       <mesh
         ref={glowRef}
         rotation={[-Math.PI / 2, 0, 0]}
-        position={[0, -0.89, 0]}
+        position={[0, -0.01, 0]}
       >
-        <planeGeometry args={[3.2, 2.2]} />
+        <planeGeometry args={[w + 0.7, 2.2]} />
         <meshBasicMaterial
           color={selected ? '#f59e0b' : color}
           transparent
@@ -71,24 +76,26 @@ export default function MachineBox({ machine, selected = false, onClick, onHover
 
       {/* Main box body */}
       <RoundedBox
-        args={[2.5, 1.8, 1.5]}
+        args={[w, h, 1.5]}
         radius={0.12}
         smoothness={4}
         castShadow
         receiveShadow
       >
         <meshStandardMaterial
-          color={color}
+          color={isIdle ? '#cbd5e1' : color}
           roughness={0.45}
           metalness={0.15}
-          emissive={selected ? '#f59e0b' : hovered ? color : '#000000'}
-          emissiveIntensity={selected ? 0.15 : hovered ? 0.1 : 0}
+          emissive={selected ? '#f59e0b' : isIdle ? '#64748b' : color}
+          emissiveIntensity={selected ? 0.15 : isIdle ? 0.02 : 0.08}
+          transparent={isIdle}
+          opacity={isIdle ? 0.8 : 1}
         />
       </RoundedBox>
 
       {/* Top face accent stripe */}
-      <mesh position={[0, 0.91, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-        <planeGeometry args={[2.3, 1.3]} />
+      <mesh position={[0, h / 2 + 0.01, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+        <planeGeometry args={[w - 0.2, 1.3]} />
         <meshStandardMaterial
           color={color}
           roughness={0.3}
@@ -100,14 +107,14 @@ export default function MachineBox({ machine, selected = false, onClick, onHover
 
       {/* Edge highlight lines */}
       {[
-        { pos: [0, 0.9, -0.75] as [number, number, number], scale: [2.5, 0.02, 0.02] as [number, number, number] },
-        { pos: [0, 0.9, 0.75] as [number, number, number], scale: [2.5, 0.02, 0.02] as [number, number, number] },
-        { pos: [-1.25, 0.9, 0] as [number, number, number], scale: [0.02, 0.02, 1.5] as [number, number, number] },
-        { pos: [1.25, 0.9, 0] as [number, number, number], scale: [0.02, 0.02, 1.5] as [number, number, number] },
+        { pos: [0, h / 2, -0.75] as [number, number, number], scale: [w, 0.02, 0.02] as [number, number, number] },
+        { pos: [0, h / 2, 0.75] as [number, number, number], scale: [w, 0.02, 0.02] as [number, number, number] },
+        { pos: [-w / 2, h / 2, 0] as [number, number, number], scale: [0.02, 0.02, 1.5] as [number, number, number] },
+        { pos: [w / 2, h / 2, 0] as [number, number, number], scale: [0.02, 0.02, 1.5] as [number, number, number] },
       ].map((edge, i) => (
         <mesh key={i} position={edge.pos}>
           <boxGeometry args={edge.scale} />
-          <meshBasicMaterial color="#ffffff" transparent opacity={0.25} />
+          <meshBasicMaterial color="#ffffff" transparent opacity={0.2} />
         </mesh>
       ))}
     </group>
