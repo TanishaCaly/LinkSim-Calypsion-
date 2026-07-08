@@ -13,8 +13,6 @@ interface JobParticleProps {
 
 const SPHERE_HOVER_Y = 0.8
 
-// ─── Gantt parsing (mirrors RunDashboard.parseGantt) ─────────────────────────
-
 interface GanttEntry {
   station: string
   startMs: number
@@ -49,31 +47,35 @@ function parseCompletionLog(log: Record<string, unknown[]>): GanttEntry[] {
   return entries
 }
 
-// ─── Pre-computed per-job data (flat arrays for zero-alloc hot loop) ─────────
-
 interface JobData {
-  startMs: Float64Array    // step start times
-  endMs: Float64Array      // step end times
-  procMs: Float64Array     // processing duration within step
-  waitMs: Float64Array     // waiting duration within step
-  pos: THREE.Vector3[]     // station position per step
-  curveKeys: string[]      // "fromStation|toStation" per transition
+  jobId: number
+  startMs: Float64Array
+  endMs: Float64Array
+  procMs: Float64Array
+  waitMs: Float64Array
+  pos: THREE.Vector3[][]
+  curveKeys: string[]
   totalSteps: number
-  jobStart: number         // first step startMs
-  jobEnd: number           // last step endMs
+  totalMeshes: number
+  stepMeshStart: Uint32Array
+  jobStart: number
+  jobEnd: number
 }
 
-// Reusable Vector3 to avoid getPoint() allocations per frame
 const _curvePoint = new THREE.Vector3()
+const _tangent = new THREE.Vector3()
+const _perp = new THREE.Vector3()
 
-// ─── Three.js helpers ─────────────────────────────────────────────────────────
+const sphereGeo = new THREE.SphereGeometry(0.12, 8, 8)
+const sphereMat = new THREE.MeshBasicMaterial({ color: '#22c55e' })
+const glowGeo = new THREE.SphereGeometry(0.2, 6, 6)
+const glowMat = new THREE.MeshBasicMaterial({ color: '#16a34a', transparent: true, opacity: 0.4 })
+const boxGeo = new THREE.BoxGeometry(0.24, 0.24, 0.24)
+const boxMat = new THREE.MeshBasicMaterial({ color: '#eab308' })
+const blockedMat = new THREE.MeshBasicMaterial({ color: '#ef4444' })
 
 function makeSphereGroup(): THREE.Group {
-  const geo = new THREE.SphereGeometry(0.12, 8, 8)
-  const mat = new THREE.MeshBasicMaterial({ color: '#22c55e' })
-  const mesh = new THREE.Mesh(geo, mat)
-  const glowGeo = new THREE.SphereGeometry(0.2, 6, 6)
-  const glowMat = new THREE.MeshBasicMaterial({ color: '#16a34a', transparent: true, opacity: 0.4 })
+  const mesh = new THREE.Mesh(sphereGeo, sphereMat)
   const glowMesh = new THREE.Mesh(glowGeo, glowMat)
   const group = new THREE.Group()
   group.add(mesh)
@@ -83,44 +85,22 @@ function makeSphereGroup(): THREE.Group {
 
 function makeBoxGroup(): THREE.Group {
   const group = new THREE.Group()
-  const geo = new THREE.BoxGeometry(0.24, 0.24, 0.24)
-  const mat = new THREE.MeshBasicMaterial({ color: '#eab308' })
-  const mesh = new THREE.Mesh(geo, mat)
+  const mesh = new THREE.Mesh(boxGeo, boxMat)
   group.add(mesh)
   return group
 }
 
 function makeBlockedGroup(): THREE.Group {
   const group = new THREE.Group()
-  const geo = new THREE.BoxGeometry(0.24, 0.24, 0.24)
-  const mat = new THREE.MeshBasicMaterial({ color: '#ef4444' })
-  const mesh = new THREE.Mesh(geo, mat)
+  const mesh = new THREE.Mesh(boxGeo, blockedMat)
   group.add(mesh)
   return group
 }
 
-function disposeObject3D(obj: THREE.Object3D) {
-  obj.traverse((child) => {
-    if (child instanceof THREE.Mesh || child instanceof THREE.LineSegments) {
-      child.geometry?.dispose()
-      const mats = Array.isArray(child.material) ? child.material : [child.material]
-      for (const m of mats) m?.dispose()
-    }
-    if (child instanceof THREE.Sprite) {
-      const mat = child.material as THREE.SpriteMaterial
-      mat.map?.dispose()
-      mat.dispose()
-    }
-  })
-}
-
-// ─── Component ───────────────────────────────────────────────────────────────
-
 export default function JobParticle({ machines, connections, completionLog, timelineRefs }: JobParticleProps) {
   const containerRef = useRef<THREE.Group>(new THREE.Group())
-  const particlesRef = useRef<{ jobId: number; sphere: THREE.Group; box: THREE.Group; blocked: THREE.Group }[]>([])
+  const particlesRef = useRef<{ jobId: number; meshes: { sphere: THREE.Group; box: THREE.Group; blocked: THREE.Group }[] }[]>([])
 
-  // Pipeline: ordered list of station groups
   const pipeline = useMemo(() => {
     const unique = new Map<string, Machine3D[]>()
     for (const m of machines) {
@@ -138,7 +118,6 @@ export default function JobParticle({ machines, connections, completionLog, time
     return order
   }, [machines])
 
-  // Station name → ALL machine positions (hover height) for parallel machines
   const stationToPositions = useMemo(() => {
     const map = new Map<string, THREE.Vector3[]>()
     for (const group of pipeline) {
@@ -148,7 +127,6 @@ export default function JobParticle({ machines, connections, completionLog, time
     return map
   }, [pipeline])
 
-  // Connection curves keyed by "fromStation|toStation"
   const connectionCurves = useMemo(() => {
     const map = new Map<string, THREE.QuadraticBezierCurve3>()
     for (const conn of connections) {
@@ -170,13 +148,11 @@ export default function JobParticle({ machines, connections, completionLog, time
     return map
   }, [connections, stationToPositions])
 
-  // Parse + pre-compute flat arrays for zero-alloc hot loop
   const { jobData, globalStart, globalEnd } = useMemo(() => {
     if (!completionLog) return { jobData: [], globalStart: 0, globalEnd: 1 }
     const entries = parseCompletionLog(completionLog)
     if (entries.length === 0) return { jobData: [], globalStart: 0, globalEnd: 1 }
 
-    // Group by jobIndex
     const byJob = new Map<number, GanttEntry[]>()
     for (const e of entries) {
       if (!byJob.has(e.jobIndex)) byJob.set(e.jobIndex, [])
@@ -193,8 +169,11 @@ export default function JobParticle({ machines, connections, completionLog, time
       const endMs = new Float64Array(n)
       const procMs = new Float64Array(n)
       const waitMs = new Float64Array(n)
-      const pos: THREE.Vector3[] = new Array(n)
+      const pos: THREE.Vector3[][] = new Array(n)
       const curveKeys: string[] = new Array(n - 1)
+
+      let totalMeshes = 0
+      const stepMeshStart = new Uint32Array(n)
 
       for (let i = 0; i < n; i++) {
         const e = jobEntries[i]
@@ -202,9 +181,9 @@ export default function JobParticle({ machines, connections, completionLog, time
         endMs[i] = e.endMs
         procMs[i] = e.processingMin * 60000
         waitMs[i] = e.waitingMin * 60000
-        const positions = stationToPositions.get(e.station)
-        const machineIdx = (jobIdx - 1) % (positions?.length ?? 1)
-        pos[i] = positions ? positions[machineIdx] : new THREE.Vector3()
+        pos[i] = stationToPositions.get(e.station) ?? [new THREE.Vector3()]
+        stepMeshStart[i] = totalMeshes
+        totalMeshes += pos[i].length
         if (i < n - 1) {
           curveKeys[i] = `${e.station}|${jobEntries[i + 1].station}`
         }
@@ -213,8 +192,9 @@ export default function JobParticle({ machines, connections, completionLog, time
       }
 
       data.push({
+        jobId: jobIdx,
         startMs, endMs, procMs, waitMs, pos, curveKeys,
-        totalSteps: n,
+        totalSteps: n, totalMeshes, stepMeshStart,
         jobStart: startMs[0],
         jobEnd: endMs[n - 1],
       })
@@ -223,58 +203,49 @@ export default function JobParticle({ machines, connections, completionLog, time
     return { jobData: data, globalStart: gMin, globalEnd: gMax }
   }, [completionLog, stationToPositions])
 
-  // Update totalMs ref for the timeline controls
   useEffect(() => {
+    if (!timelineRefs) return
     timelineRefs.totalMs.current = globalEnd - globalStart || 1
-  }, [globalStart, globalEnd, timelineRefs.totalMs])
+  }, [globalStart, globalEnd, timelineRefs?.totalMs])
 
-  // Create particle meshes for each job
   useEffect(() => {
     const container = containerRef.current
-    for (const p of particlesRef.current) {
-      disposeObject3D(p.sphere)
-      disposeObject3D(p.box)
-      disposeObject3D(p.blocked)
-    }
     particlesRef.current = []
     container.clear()
 
     if (jobData.length === 0) return
 
     for (const jd of jobData) {
-      const sphere = makeSphereGroup()
-      const box = makeBoxGroup()
-      const blocked = makeBlockedGroup()
-      box.visible = false
-      blocked.visible = false
-      const firstPos = jd.pos[0]
-      if (firstPos) {
-        sphere.position.copy(firstPos)
-        box.position.copy(firstPos)
-        blocked.position.copy(firstPos)
+      const meshes: { sphere: THREE.Group; box: THREE.Group; blocked: THREE.Group }[] = []
+      for (let si = 0; si < jd.totalSteps; si++) {
+        for (const p of jd.pos[si]) {
+          const sphere = makeSphereGroup()
+          const box = makeBoxGroup()
+          const blocked = makeBlockedGroup()
+          sphere.visible = false
+          box.visible = false
+          blocked.visible = false
+          sphere.position.copy(p)
+          box.position.copy(p)
+          blocked.position.copy(p)
+          container.add(sphere, box, blocked)
+          meshes.push({ sphere, box, blocked })
+        }
       }
-      container.add(sphere, box, blocked)
-      particlesRef.current.push({ jobId: 0, sphere, box, blocked })
+      particlesRef.current.push({ jobId: jd.jobId, meshes })
     }
 
     return () => {
-      for (const p of particlesRef.current) {
-        disposeObject3D(p.sphere)
-        disposeObject3D(p.box)
-        disposeObject3D(p.blocked)
-      }
       particlesRef.current = []
       container.clear()
     }
   }, [jobData])
 
-  // Animate particles — zero allocations in the hot path
   useFrame((_, delta) => {
-    if (jobData.length === 0) return
+    if (jobData.length === 0 || !timelineRefs) return
 
     const { playing, speed, scrubPct, simClockMs, totalMs } = timelineRefs
 
-    // Advance simulation clock
     if (playing.current) {
       simClockMs.current += delta * speed.current * 1000
       const pct = (simClockMs.current / totalMs.current) * 100
@@ -294,11 +265,9 @@ export default function JobParticle({ machines, connections, completionLog, time
       const p = particlesRef.current[i]
       if (!p) continue
 
-      // Binary search for current step
       const n = jd.totalSteps
       let stepIdx = -1
 
-      // Simple scan — steps are sorted and typically few (< 20)
       for (let si = 0; si < n; si++) {
         if (now >= jd.startMs[si] && now <= jd.endMs[si]) {
           stepIdx = si
@@ -306,41 +275,57 @@ export default function JobParticle({ machines, connections, completionLog, time
         }
       }
 
-      // Before first step → hidden
-      if (stepIdx === -1 && now < jd.jobStart) {
-        p.sphere.visible = false
-        p.box.visible = false
-        p.blocked.visible = false
-        continue
+      for (let mi = 0; mi < p.meshes.length; mi++) {
+        const m = p.meshes[mi]
+        m.sphere.visible = false
+        m.box.visible = false
+        m.blocked.visible = false
       }
 
-      // After last step → hidden
-      if (stepIdx === -1 && now > jd.jobEnd) {
-        p.sphere.visible = false
-        p.box.visible = false
-        p.blocked.visible = false
-        continue
-      }
+      if (stepIdx === -1 && now < jd.jobStart) continue
+      if (stepIdx === -1 && now > jd.jobEnd) continue
 
-      // Traveling between steps
       if (stepIdx === -1) {
-        // Find which gap we're in
         for (let si = 0; si < n - 1; si++) {
           if (now > jd.endMs[si] && now < jd.startMs[si + 1]) {
             const travelDur = jd.startMs[si + 1] - jd.endMs[si]
             const t = travelDur > 0 ? (now - jd.endMs[si]) / travelDur : 1
             const clamped = Math.min(Math.max(t, 0), 0.999)
 
-            p.sphere.visible = true
-            p.box.visible = false
-            p.blocked.visible = false
+            const srcStart = jd.stepMeshStart[si]
+            const srcCount = jd.pos[si].length
+            const nextStart = jd.stepMeshStart[si + 1]
+            const nextCount = jd.pos[si + 1].length
+
+            for (let mi = 0; mi < srcCount; mi++) {
+              p.meshes[srcStart + mi].sphere.visible = true
+            }
+            for (let mi = 0; mi < nextCount; mi++) {
+              p.meshes[nextStart + mi].sphere.visible = true
+            }
 
             const curve = connectionCurves.get(jd.curveKeys[si])
             if (curve) {
-              curve.getPoint(clamped, _curvePoint)
-              p.sphere.position.copy(_curvePoint)
+              for (let mi = 0; mi < srcCount; mi++) {
+                p.meshes[srcStart + mi].sphere.position.lerpVectors(jd.pos[si][mi], jd.pos[si + 1][mi % nextCount], clamped)
+              }
+              for (let mi = 0; mi < nextCount; mi++) {
+                p.meshes[nextStart + mi].sphere.position.lerpVectors(jd.pos[si][mi % srcCount], jd.pos[si + 1][mi], clamped)
+              }
             } else {
-              p.sphere.position.lerpVectors(jd.pos[si], jd.pos[si + 1], clamped)
+              _tangent.set(0, 0, 0)
+              for (const p of jd.pos[si]) _tangent.add(p)
+              _tangent.divideScalar(srcCount)
+              _perp.set(0, 0, 0)
+              for (const p of jd.pos[si + 1]) _perp.add(p)
+              _perp.divideScalar(nextCount)
+              _curvePoint.lerpVectors(_tangent, _perp, clamped)
+              for (let mi = 0; mi < srcCount; mi++) {
+                p.meshes[srcStart + mi].sphere.position.lerpVectors(jd.pos[si][mi], _curvePoint, clamped)
+              }
+              for (let mi = 0; mi < nextCount; mi++) {
+                p.meshes[nextStart + mi].sphere.position.lerpVectors(_curvePoint, jd.pos[si + 1][mi], clamped)
+              }
             }
             break
           }
@@ -348,29 +333,23 @@ export default function JobParticle({ machines, connections, completionLog, time
         continue
       }
 
-      // At a station
       const procEnd = jd.procMs[stepIdx]
       const waitEnd = procEnd + jd.waitMs[stepIdx]
       const stepLocalTime = now - jd.startMs[stepIdx]
 
-      let isProc = false
-      let isWait = false
-      let isBlock = false
+      const isProc = stepLocalTime < procEnd
+      const isWait = !isProc && stepLocalTime < waitEnd
+      const isBlock = !isProc && !isWait
 
-      if (stepLocalTime < procEnd) {
-        isProc = true
-      } else if (stepLocalTime < waitEnd) {
-        isWait = true
-      } else {
-        isBlock = true
+      const meshStart = jd.stepMeshStart[stepIdx]
+      const meshCount = jd.pos[stepIdx].length
+      for (let mi = 0; mi < meshCount; mi++) {
+        const m = p.meshes[meshStart + mi]
+        const pos = jd.pos[stepIdx][mi]
+        if (isProc) { m.sphere.visible = true; m.sphere.position.copy(pos) }
+        else if (isWait) { m.box.visible = true; m.box.position.copy(pos) }
+        else { m.blocked.visible = true; m.blocked.position.copy(pos) }
       }
-
-      p.sphere.visible = isProc
-      p.box.visible = isWait
-      p.blocked.visible = isBlock
-
-      const active = isProc ? p.sphere : isWait ? p.box : p.blocked
-      active.position.copy(jd.pos[stepIdx])
     }
   })
 

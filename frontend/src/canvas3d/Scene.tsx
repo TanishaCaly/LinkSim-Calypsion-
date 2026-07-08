@@ -71,15 +71,10 @@ export default function Scene({
   const scrubPctRef = useRef(0)
   const simClockMsRef = useRef(0)
   const totalMsRef = useRef(1)
-  // Force re-render when scrub changes for the slider UI
   const [scrubUI, setScrubUI] = useState(0)
   const [speedUI, setSpeedUI] = useState(10)
   const [playingUI, setPlayingUI] = useState(false)
 
-  // FIX: memoize so JobParticle (and any effect/memo keyed on this prop)
-  // sees a stable object reference across renders instead of a new one
-  // every time — the underlying refs are already stable, only the wrapper
-  // object literal was being recreated.
   const timelineRefs: TimelineRefs = useMemo(() => ({
     playing: playingRef,
     speed: speedRef,
@@ -110,10 +105,6 @@ export default function Scene({
     ? stationsData[selectedMachine.baseName]
     : undefined
 
-  const centerX = machines.length > 0
-    ? (machines[machines.length - 1].position[0] + machines[0].position[0]) / 2
-    : 0
-
   const { floorSize, centerZ } = (() => {
     if (machines.length === 0) return { floorSize: 40, centerZ: 0 }
     let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity
@@ -136,6 +127,10 @@ export default function Scene({
     return { floorSize: Math.max(size, 40), centerZ: cz }
   })()
 
+  const centerX = machines.length > 0
+    ? (machines[machines.length - 1].position[0] + machines[0].position[0]) / 2
+    : 0
+
   const totalMinutes = Math.round(totalMsRef.current / 60000)
   const curMinutes = Math.round((scrubPctRef.current / 100) * totalMinutes)
 
@@ -147,7 +142,6 @@ export default function Scene({
         gl={{ antialias: true, toneMapping: 3 }}
         onPointerMissed={() => setSelectedMachine(null)}
       >
-        {/* Lighting */}
         <ambientLight intensity={isDark ? 0.35 : 0.55} />
         <directionalLight
           position={[centerX + 12, 25, centerZ + 12]}
@@ -167,10 +161,8 @@ export default function Scene({
         />
         <pointLight position={[centerX, 5, centerZ]} intensity={0.3} color="#f59e0b" distance={30} />
 
-        {/* Floor */}
         <Floor isDark={isDark} size={floorSize} centerX={centerX} centerZ={centerZ} />
 
-        {/* Grid */}
         <Grid
           args={[floorSize, floorSize]}
           cellSize={1}
@@ -184,7 +176,6 @@ export default function Scene({
           position={[centerX, 0.01, centerZ]}
         />
 
-        {/* Camera controls */}
         <OrbitControls
           enablePan
           enableZoom
@@ -197,7 +188,6 @@ export default function Scene({
           dampingFactor={0.05}
         />
 
-        {/* Step labels on floor */}
         {stepLabels.map((label, i) => (
           <LabelSprite
             key={`step-${i}`}
@@ -207,7 +197,6 @@ export default function Scene({
           />
         ))}
 
-        {/* Machines */}
         {machines.map(m => (
           <MachineBox
             key={m.id}
@@ -218,7 +207,6 @@ export default function Scene({
           />
         ))}
 
-        {/* Labels above machines */}
         {machines.map(m => (
           <LabelSprite
             key={`label-${m.id}`}
@@ -229,7 +217,6 @@ export default function Scene({
           />
         ))}
 
-        {/* Operators */}
         {operators.map(op => (
           <OperatorDot
             key={op.id}
@@ -238,17 +225,14 @@ export default function Scene({
           />
         ))}
 
-        {/* Queue stacks */}
         {machines.filter(m => m.queueDepth > 0).map(m => (
           <QueueStack key={`queue-${m.id}`} machine={m} />
         ))}
 
-        {/* Flow connections */}
         {connections.map(c => (
           <FlowLine key={c.id} connection={c} />
         ))}
 
-        {/* Job particles driven by completion log */}
         <JobParticle
           machines={machines}
           connections={connections}
@@ -257,7 +241,6 @@ export default function Scene({
         />
       </Canvas>
 
-      {/* Timeline controls overlay */}
       {completionLog && (
         <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-white/95 backdrop-blur-sm rounded-xl shadow-lg border border-gray-200 px-4 py-2 z-10">
           <button
@@ -265,6 +248,7 @@ export default function Scene({
               scrubPctRef.current = 0
               simClockMsRef.current = 0
               playingRef.current = false
+              setPlayingUI(false)
               setScrubUI(0)
             }}
             className="text-xs px-2.5 py-1.5 rounded-lg border border-gray-200 bg-white text-gray-600 hover:bg-gray-50 font-medium"
@@ -294,6 +278,7 @@ export default function Scene({
             value={scrubUI}
             onChange={e => {
               playingRef.current = false
+              setPlayingUI(false)
               const pct = Number(e.target.value)
               scrubPctRef.current = pct
               simClockMsRef.current = (pct / 100) * totalMsRef.current
@@ -307,7 +292,6 @@ export default function Scene({
         </div>
       )}
 
-      {/* Selection detail panel */}
       {selectedMachine && (
         <MachineDetail
           machine={selectedMachine}
@@ -317,7 +301,6 @@ export default function Scene({
         />
       )}
 
-      {/* Hover tooltip */}
       {highlightedMachine && !selectedMachine && (
         <div className="absolute bottom-4 left-4 bg-white/95 backdrop-blur-sm rounded-xl shadow-lg border border-gray-200 px-4 py-2.5 text-sm text-gray-800 z-10 font-medium">
           {highlightedMachine}
