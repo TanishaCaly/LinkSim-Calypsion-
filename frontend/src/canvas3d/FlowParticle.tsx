@@ -2,13 +2,15 @@ import { useRef, useMemo } from 'react'
 import { useFrame } from '@react-three/fiber'
 import * as THREE from 'three'
 import type { Connection3D } from './layout'
+import type { TimelineRefs } from './Scene'
 
 interface FlowParticleProps {
   connection: Connection3D
   count?: number
+  timelineRefs?: TimelineRefs
 }
 
-export default function FlowParticle({ connection, count = 2 }: FlowParticleProps) {
+export default function FlowParticle({ connection, count = 2, timelineRefs }: FlowParticleProps) {
   const groupRef = useRef<THREE.Group>(null)
   const particlesRef = useRef<THREE.Mesh[]>([])
   const glowsRef = useRef<THREE.Mesh[]>([])
@@ -36,11 +38,15 @@ export default function FlowParticle({ connection, count = 2 }: FlowParticleProp
   }, [count])
 
   useFrame((state, delta) => {
+    let globalTime = Date.now() * 0.001
+    if (timelineRefs && timelineRefs.simClockMs) {
+      globalTime = timelineRefs.simClockMs.current * 0.001
+    }
     for (let i = 0; i < count; i++) {
       const mesh = particlesRef.current[i]
       const glow = glowsRef.current[i]
       if (!mesh) continue
-      const t = ((Date.now() * speed * 0.001 + offsets[i]) % 1)
+      const t = ((globalTime * speed + offsets[i]) % 1)
       const pos = curve.getPoint(t)
       mesh.position.set(pos.x, pos.y, pos.z)
       if (glow) {

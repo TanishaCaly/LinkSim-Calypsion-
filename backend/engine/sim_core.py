@@ -570,6 +570,7 @@ class ManufacturingSimulation:
             self.completion_log[resource_name] = []
         self.completion_log[resource_name].append({
             "station_name": resource_name,
+            "job_id": variant_name,
             "Completed_jobs": self.stations_data[resource_name].get("completed_jobs_per_station", 0),
             "Blocked Time": total_blocked,
             "Waiting Time": self.stations_data[resource_name].get("total_waiting_time", 0),

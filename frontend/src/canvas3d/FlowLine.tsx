@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useMemo, useEffect } from 'react'
 import * as THREE from 'three'
 import { makeLabelTexture } from './makeLabelTexture'
 import type { Connection3D } from './layout'
@@ -8,7 +8,7 @@ interface FlowLineProps {
 }
 
 export default function FlowLine({ connection }: FlowLineProps) {
-  const { tubeGeometry, midpoint, arrowPositions, curveLength } = useMemo(() => {
+  const { tubeGeometry, midpoint, arrowPositions } = useMemo(() => {
     const from = new THREE.Vector3(...connection.from)
     const to = new THREE.Vector3(...connection.to)
 
@@ -35,7 +35,7 @@ export default function FlowLine({ connection }: FlowLineProps) {
       arrows.push({ pos: p, rot })
     }
 
-    return { tubeGeometry: tubeGeo, midpoint: mid, arrowPositions: arrows, curveLength: len }
+    return { tubeGeometry: tubeGeo, midpoint: mid, arrowPositions: arrows }
   }, [connection.from, connection.to])
 
   const labelText = `${connection.operation} · ${connection.duration} min`
@@ -51,6 +51,10 @@ export default function FlowLine({ connection }: FlowLineProps) {
     }),
     [labelText, subtext],
   )
+
+  useEffect(() => () => { labelTexture.dispose() }, [labelTexture])
+
+  useEffect(() => () => { tubeGeometry.dispose() }, [tubeGeometry])
 
   return (
     <group>

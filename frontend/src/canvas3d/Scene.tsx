@@ -1,6 +1,6 @@
 import { Canvas } from '@react-three/fiber'
 import { OrbitControls, Grid } from '@react-three/drei'
-import { useState, useCallback, useRef, useMemo } from 'react'
+import { useState, useCallback, useRef, useMemo, useEffect } from 'react'
 import MachineBox from './MachineBox'
 import LabelSprite from './LabelSprite'
 import OperatorDot from './OperatorDot'
@@ -17,6 +17,9 @@ export interface TimelineRefs {
   scrubPct: React.MutableRefObject<number>
   simClockMs: React.MutableRefObject<number>
   totalMs: React.MutableRefObject<number>
+  setScrubUI: (pct: number) => void
+  setTotalMsUI: (ms: number) => void
+  setPlayingUI: (playing: boolean) => void
 }
 
 interface SceneProps {
@@ -72,6 +75,7 @@ export default function Scene({
   const simClockMsRef = useRef(0)
   const totalMsRef = useRef(1)
   const [scrubUI, setScrubUI] = useState(0)
+  const [totalMsUI, setTotalMsUI] = useState(1)
   const [speedUI, setSpeedUI] = useState(10)
   const [playingUI, setPlayingUI] = useState(false)
 
@@ -81,7 +85,18 @@ export default function Scene({
     scrubPct: scrubPctRef,
     simClockMs: simClockMsRef,
     totalMs: totalMsRef,
+    setScrubUI,
+    setTotalMsUI,
+    setPlayingUI,
   }), [])
+
+  useEffect(() => {
+    scrubPctRef.current = 0
+    simClockMsRef.current = 0
+    playingRef.current = false
+    setScrubUI(0)
+    setPlayingUI(false)
+  }, [completionLog])
 
   const handleSelectMachine = useCallback((machine: Machine3D | null) => {
     setSelectedMachine(machine)
@@ -131,8 +146,8 @@ export default function Scene({
     ? (machines[machines.length - 1].position[0] + machines[0].position[0]) / 2
     : 0
 
-  const totalMinutes = Math.round(totalMsRef.current / 60000)
-  const curMinutes = Math.round((scrubPctRef.current / 100) * totalMinutes)
+  const totalMinutes = Math.round(totalMsUI / 60000)
+  const curMinutes = Math.round((scrubUI / 100) * totalMinutes)
 
   return (
     <div className="relative w-full h-full">

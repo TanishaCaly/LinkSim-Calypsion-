@@ -104,7 +104,7 @@ export function buildScene3D(
 
         const machine: Machine3D = {
           id,
-          position: [xPos, 0, z],
+          position: [xPos, height / 2, z],
           label: capacity > 1 ? `${step.resource} #${m + 1}` : step.resource,
           baseName: step.resource,
           capacity,

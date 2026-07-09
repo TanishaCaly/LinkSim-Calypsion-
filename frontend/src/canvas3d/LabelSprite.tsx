@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useMemo, useEffect } from 'react'
 import * as THREE from 'three'
 import { makeLabelTexture } from './makeLabelTexture'
 import { utilColor } from './layout'
@@ -22,6 +22,8 @@ export default function LabelSprite({ position, text, utilization, scale = 1, se
     }),
     [text, utilization],
   )
+
+  useEffect(() => () => { texture.dispose() }, [texture])
 
   return (
     <sprite

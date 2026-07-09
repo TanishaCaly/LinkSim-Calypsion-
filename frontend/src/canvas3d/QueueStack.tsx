@@ -14,7 +14,6 @@ const BLOCK_SIZE = 0.4
 export default function QueueStack({ machine }: QueueStackProps) {
   const [visibleCount, setVisibleCount] = useState(0)
   const lastUpdate = useRef(Date.now())
-  const nextBlockAt = useRef(0)
   const maxCount = machine.queueDepth
 
   const interval = useMemo(() => {

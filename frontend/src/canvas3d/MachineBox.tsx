@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react'
-import { useFrame } from '@react-three/fiber'
+import { useFrame, type ThreeEvent } from '@react-three/fiber'
 import { RoundedBox } from '@react-three/drei'
 import * as THREE from 'three'
 import type { Machine3D } from './layout'
@@ -20,7 +20,6 @@ export default function MachineBox({ machine, selected = false, onClick, onHover
   const targetGlow = useRef(0)
 
   const color = utilColor(machine.utilization)
-  const isActive = machine.utilization > 5
   const isIdle = machine.utilization <= 5
 
   const w = machine.width
@@ -43,11 +42,11 @@ export default function MachineBox({ machine, selected = false, onClick, onHover
     <group
       ref={groupRef}
       position={machine.position}
-      onClick={(e: THREE.Event) => {
+      onClick={(e: ThreeEvent<MouseEvent>) => {
         e.stopPropagation()
         onClick(machine)
       }}
-      onPointerOver={(e: THREE.Event) => {
+      onPointerOver={(e: ThreeEvent<PointerEvent>) => {
         e.stopPropagation()
         setHovered(true)
         onHover?.(machine.id)
