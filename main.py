@@ -24,7 +24,10 @@ logging.basicConfig(
 logger = logging.getLogger("linksim")
 logger.info(f"LinkSim starting — log file: {_LOG_PATH}")
 
+from fastapi import Depends
+
 from backend.storage.database import init_db
+from backend.api.auth import router as auth_router, require_auth
 from backend.api.routes import (
     scenarios_router,
     simulations_router,
@@ -70,12 +73,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Register routers
-app.include_router(scenarios_router)
-app.include_router(simulations_router)
-app.include_router(upload_router)
-app.include_router(insights_router)
-app.include_router(debug_router)
+# Auth routes are open (you need to be able to log in without a token first);
+# every other router requires a valid session token.
+app.include_router(auth_router)
+
+_auth_dep = [Depends(require_auth)]
+app.include_router(scenarios_router, dependencies=_auth_dep)
+app.include_router(simulations_router, dependencies=_auth_dep)
+app.include_router(upload_router, dependencies=_auth_dep)
+app.include_router(insights_router, dependencies=_auth_dep)
+app.include_router(debug_router, dependencies=_auth_dep)
 
 
 @app.get("/health")

@@ -6,6 +6,12 @@ export interface StationConfig {
   operator_per_station: number
   'Failure rate': number
   'Repair Time': number
+  'Setup time': number
+  'Buffer Capacity': number
+  'Buffer Discipline': string
+  'Buffer Width': number
+  'Buffer Depth': number
+  'Buffer Height': number
   'PM Schedule': string
   'Material Shortage Probability (%)': number
   'Rework Probability (%)': number
@@ -16,9 +22,17 @@ export interface StationConfig {
   [key: string]: unknown
 }
 
+export interface RoutingConfig {
+  mode: 'round_robin' | 'percentage' | 'condition' | 'shortest_queue'
+  options: string[]
+  weights?: number[]
+  rules?: { if: string; resource: string }[]
+  default?: string
+}
+
 export interface ProcessStep {
   operation: string
-  resource: string
+  resource: string | RoutingConfig
   duration: number
 }
 
@@ -49,6 +63,8 @@ export interface Scenario {
   stations_data: Record<string, StationConfig>
   processflow_data: Record<string, ProcessStep[]>
   variant_quantities: Record<string, number>
+  variant_intervals: Record<string, number>
+  setup_matrix: Record<string, Record<string, number>>
   operators_data: Record<string, OperatorConfig>
   simulation_config: SimConfig
 }
@@ -67,6 +83,8 @@ export interface ScenarioCreate {
   stations_data: Record<string, StationConfig>
   processflow_data: Record<string, ProcessStep[]>
   variant_quantities: Record<string, number>
+  variant_intervals?: Record<string, number>
+  setup_matrix?: Record<string, Record<string, number>>
   operators_data: Record<string, OperatorConfig>
   simulation_config?: Partial<SimConfig> | Record<string, unknown>
 }
@@ -88,12 +106,20 @@ export interface StationStat {
   operator_utilization: number
   rework_percentage: number
   rework_time_ratio: number
+  setup_time_ratio: number
+  total_setup_time: number
+  buffer_blocked_ratio: number
+  buffer_blocked_time: number
+  buffer_capacity: number
+  buffer_discipline: string
   completed_jobs: number
   throughput: number
   busy_time: number
   avg_block_time: number
   failure_breakdowns: number
   pm_breakdowns: number
+  operator_per_station: number
+  capacity: number
   top_bottleneck_type: string | null
   top_bottleneck_metric: string | null
 }
@@ -155,6 +181,8 @@ export interface UploadResponse {
   operators: Record<string, OperatorConfig>
   processflow: Record<string, ProcessStep[]>
   variant_quantities: Record<string, number>
+  variant_intervals?: Record<string, number>
+  setup_matrix?: Record<string, Record<string, number>>
   simulation_config?: Partial<SimConfig>
 }
 
@@ -165,4 +193,8 @@ export interface StationNodeData {
   capacity: number
   cycleTime: number
   operators: number
+  routingMode?: 'round_robin' | 'percentage' | 'condition' | 'shortest_queue'
+  routingWeights?: Record<string, number>
+  routingRules?: { variantType: string; resource: string }[]
+  routingDefault?: string
 }

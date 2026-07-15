@@ -203,6 +203,8 @@ def _execute_run(run_id: int, scenario_id: int, sim_config_override: dict):
             operators_data=scenario.operators_data,
             simulation_config=base_cfg,
             progress_callback=_push,
+            variant_intervals=scenario.variant_intervals,
+            setup_matrix=scenario.setup_matrix,
         )
 
         run_record = crud.get_run(db, run_id)

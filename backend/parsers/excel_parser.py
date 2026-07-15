@@ -30,10 +30,11 @@ class ExcelParser:
     }
 
     ALIASES = {
-        "stations":    ["stations", "station"],
-        "operators":   ["operators", "operator"],
-        "processflow": ["processflow", "process flow", "processflows"],
-        "quantities":  ["variantquantities", "variant quantities", "quantities", "variant_quantities"],
+        "stations":     ["stations", "station"],
+        "operators":    ["operators", "operator"],
+        "processflow":  ["processflow", "process flow", "processflows"],
+        "quantities":   ["variantquantities", "variant quantities", "quantities", "variant_quantities"],
+        "setup_matrix": ["setupmatrix", "setup matrix", "setup_matrix", "changeover matrix"],
     }
 
     def __init__(self, sheet_names=None):
@@ -166,6 +167,8 @@ class ExcelParser:
             "operators":          self.parse_operators(sheets),
             "processflow":        self.parse_processflow(sheets),
             "variant_quantities": self.parse_variant_quantities(sheets),
+            "variant_intervals":  self.parse_variant_intervals(sheets),
+            "setup_matrix":       self.parse_setup_matrix(sheets),
         }
 
     def parse_stations(self, source):
@@ -239,6 +242,24 @@ class ExcelParser:
         if df is None or df.empty:
             return {}
         return _csv.parse_variant_quantities(df.to_csv(index=False))
+
+    def parse_variant_intervals(self, source):
+        """Optional 'Interval' column on the same Variant Quantities sheet/table."""
+        sheets = source if isinstance(source, dict) else self._load(source)
+        df = self._find_sheet(sheets, "quantities")
+        if df is None:
+            df = self._find_subtable(sheets, ["variant", "quantity"])
+        if df is None or df.empty:
+            return {}
+        return _csv.parse_variant_intervals(df.to_csv(index=False))
+
+    def parse_setup_matrix(self, source):
+        """Optional 'Setup Matrix' sheet: Station, From, To, Setup Time —
+        entirely absent from most files, which is fine (returns {})."""
+        df = self._resolve(source, "setup_matrix")
+        if df is None or df.empty:
+            return {}
+        return _csv.parse_setup_matrix(df.to_csv(index=False))
 
     def _resolve(self, source, key):
         sheets = source if isinstance(source, dict) else self._load(source)

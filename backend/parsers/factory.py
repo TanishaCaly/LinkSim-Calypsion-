@@ -41,6 +41,7 @@ class ParserFactory:
             "operators":          cls._csv.parse_operators(operators),
             "processflow":        cls._csv.parse_processflow(processflow),
             "variant_quantities": cls._csv.parse_variant_quantities(quantities),
+            "variant_intervals":  cls._csv.parse_variant_intervals(quantities),
         }
 
     @classmethod

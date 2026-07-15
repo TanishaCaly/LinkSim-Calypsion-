@@ -1,8 +1,9 @@
 import { useState } from 'react'
-import { NavLink, Outlet } from 'react-router-dom'
-import { LayoutDashboard, FolderOpen, GitBranch, Lightbulb, Cpu, ChevronLeft, ChevronRight, Sun, Moon } from 'lucide-react'
+import { NavLink, Outlet, useNavigate } from 'react-router-dom'
+import { LayoutDashboard, FolderOpen, GitBranch, Lightbulb, Cpu, ChevronLeft, ChevronRight, Sun, Moon, LogOut } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAppStore } from '@/store/useAppStore'
+import { authApi } from '@/api/auth'
 
 const nav = [
   { to: '/', icon: FolderOpen, label: 'Scenarios' },
@@ -14,6 +15,12 @@ const nav = [
 export default function Layout() {
   const { toast, clearToast, theme, toggleTheme } = useAppStore()
   const [collapsed, setCollapsed] = useState(false)
+  const navigate = useNavigate()
+
+  async function handleLogout() {
+    await authApi.logout().catch(() => {})
+    navigate('/login', { replace: true })
+  }
 
   return (
     <div className="flex h-screen bg-gray-50">
@@ -97,6 +104,17 @@ export default function Layout() {
               : <Moon className="h-4 w-4 shrink-0 text-gray-400" />
             }
             {!collapsed && (theme === 'dark' ? 'Light mode' : 'Dark mode')}
+          </button>
+          <button
+            onClick={handleLogout}
+            title="Log out"
+            className={cn(
+              'flex items-center gap-3 w-full py-3 rounded-xl text-sm font-medium transition-all duration-150 text-gray-500 hover:bg-red-50 hover:text-red-600',
+              collapsed ? 'justify-center px-0' : 'px-4'
+            )}
+          >
+            <LogOut className="h-4 w-4 shrink-0" />
+            {!collapsed && 'Log out'}
           </button>
         </div>
 

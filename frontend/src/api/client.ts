@@ -1,8 +1,30 @@
 import axios from 'axios'
 
+const TOKEN_KEY = 'linksim_token'
+
+export function getToken(): string | null {
+  return sessionStorage.getItem(TOKEN_KEY)
+}
+
+export function setToken(token: string): void {
+  sessionStorage.setItem(TOKEN_KEY, token)
+}
+
+export function clearToken(): void {
+  sessionStorage.removeItem(TOKEN_KEY)
+}
+
 const api = axios.create({
   baseURL: '/api',
   headers: { 'Content-Type': 'application/json' },
+})
+
+api.interceptors.request.use((config) => {
+  const token = getToken()
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
 })
 
 /** FastAPI errors come back as a string, an array of validation errors, or a nested object.
@@ -35,6 +57,12 @@ function formatDetail(detail: unknown): string {
 api.interceptors.response.use(
   (r) => r,
   (err) => {
+    if (err.response?.status === 401 && !err.config?.url?.includes('/auth/login')) {
+      clearToken()
+      if (!window.location.pathname.startsWith('/login')) {
+        window.location.href = '/login'
+      }
+    }
     const msg = err.response?.data?.detail
       ? formatDetail(err.response.data.detail)
       : (err.message ?? 'Unknown error')

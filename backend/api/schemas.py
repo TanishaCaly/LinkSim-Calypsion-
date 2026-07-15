@@ -16,6 +16,8 @@ class ScenarioCreate(BaseModel):
     stations_data: Dict[str, Any] = Field(default_factory=dict)
     processflow_data: Dict[str, Any] = Field(default_factory=dict)
     variant_quantities: Dict[str, int] = Field(default_factory=dict)
+    variant_intervals: Dict[str, float] = Field(default_factory=dict)
+    setup_matrix: Dict[str, Dict[str, float]] = Field(default_factory=dict)
     operators_data: Dict[str, Any] = Field(default_factory=dict)
     simulation_config: Dict[str, Any] = Field(default_factory=dict)
     source_filename: Optional[str] = None
@@ -28,6 +30,8 @@ class ScenarioUpdate(BaseModel):
     stations_data: Optional[Dict[str, Any]] = None
     processflow_data: Optional[Dict[str, Any]] = None
     variant_quantities: Optional[Dict[str, int]] = None
+    variant_intervals: Optional[Dict[str, float]] = None
+    setup_matrix: Optional[Dict[str, Dict[str, float]]] = None
     operators_data: Optional[Dict[str, Any]] = None
     simulation_config: Optional[Dict[str, Any]] = None
 
@@ -41,6 +45,8 @@ class ScenarioResponse(BaseModel):
     stations_data: Dict[str, Any]
     processflow_data: Dict[str, Any]
     variant_quantities: Dict[str, int]
+    variant_intervals: Dict[str, float] = Field(default_factory=dict)
+    setup_matrix: Dict[str, Dict[str, float]] = Field(default_factory=dict)
     operators_data: Dict[str, Any]
     simulation_config: Dict[str, Any]
 
@@ -77,12 +83,20 @@ class StationStatResponse(BaseModel):
     operator_utilization: float
     rework_percentage: float
     rework_time_ratio: float = 0.0
+    setup_time_ratio: float = 0.0
+    total_setup_time: float = 0.0
+    buffer_blocked_ratio: float = 0.0
+    buffer_blocked_time: float = 0.0
+    buffer_capacity: int = 0
+    buffer_discipline: str = "FIFO"
     completed_jobs: int
     throughput: float = 0.0
     busy_time: float
     avg_block_time: float
     failure_breakdowns: int
     pm_breakdowns: int
+    operator_per_station: int = 1
+    capacity: int = 1
     top_bottleneck_type: Optional[str]
     top_bottleneck_metric: Optional[str]
 
@@ -130,6 +144,8 @@ class UploadResponse(BaseModel):
     operators: Dict[str, Any]
     processflow: Dict[str, Any]
     variant_quantities: Dict[str, int]
+    variant_intervals: Dict[str, float] = Field(default_factory=dict)
+    setup_matrix: Dict[str, Dict[str, float]] = Field(default_factory=dict)
     simulation_config: Optional[Dict[str, Any]] = None
 
 

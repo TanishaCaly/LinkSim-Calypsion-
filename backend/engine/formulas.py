@@ -5,7 +5,13 @@ To change any formula, edit ONLY this file.
 All other modules (sim_core, bottleneck, machine, ai_insights) import from here.
 """
 
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
+
+# Fixed simulation anchor date (must match ManufacturingSimulation.simulation_state
+# "start_date" in sim_core.py) — used to work out how many of the simulated
+# calendar days are Mon-Fri for 1/2-shift (weekday-only) stations.
+SIMULATION_START_DATE = datetime(2025, 1, 1, 6, 0, 0)
 
 
 # ── Thresholds ────────────────────────────────────────────────────────────────
@@ -65,30 +71,71 @@ def daily_failure_rate_to_per_minute(daily_failure_prob: float) -> float:
 
 # ── Per-station utilization ───────────────────────────────────────────────────
 
+def _working_days(sim_time: float, shifts_per_day: int) -> float:
+    """
+    Number of calendar days within sim_time that a station actually operates.
+    1 and 2 shifts/day are Mon-Fri only (matches SimulationUtils.is_active_shift's
+    weekend gating); 0 or 3 shifts/day run every day (24/7).
+    """
+    total_days = sim_time / MINUTES_PER_DAY
+    if shifts_per_day not in (1, 2):
+        return total_days
+
+    whole_days = int(total_days)
+    remainder = total_days - whole_days
+    weekdays = 0.0
+    for i in range(whole_days):
+        if (SIMULATION_START_DATE + timedelta(days=i)).weekday() < 5:
+            weekdays += 1.0
+    if remainder > 0 and (SIMULATION_START_DATE + timedelta(days=whole_days)).weekday() < 5:
+        weekdays += remainder
+    return weekdays
+
+
+def _available_minutes_per_day(shifts_per_day: int, shift_duration: float) -> float:
+    """
+    Minutes per day a station is actually active, matching
+    SimulationUtils.is_active_shift's real gating: 0 or 3 shifts/day run
+    24/7 (1440 min/day); 1 or 2 shifts/day run shift_duration * shifts_per_day
+    minutes/day (e.g. two 8-hour shifts = 960 min/day).
+    """
+    if shifts_per_day in (1, 2):
+        return shift_duration * shifts_per_day
+    return MINUTES_PER_DAY
+
+
 def calc_station_utilization(station: dict, sim_config: dict) -> float:
     """
     Station utilization % = busy_time / available_time * 100
-    Available time accounts for shift duration, shifts per day, sim days, and capacity.
+    Available time accounts for shift duration, working days (Mon-Fri for 1/2
+    shifts/day), sim days, and capacity.
     """
     busy = station.get("busy_time", 0)
     sim_time = sim_config.get("SIM_TIME", 1)
     capacity = station.get("capacity", 1)
     shifts = station.get("shifts_per_day", 1)
     shift_duration = sim_config.get("SHIFT_DURATION", 480)
-    available = shift_duration * shifts * (sim_time / MINUTES_PER_DAY) * capacity
+    per_day = _available_minutes_per_day(shifts, shift_duration)
+    available = per_day * _working_days(sim_time, shifts) * capacity
     return round((busy / available * 100) if available > 0 else 0.0, 2)
 
 
 def calc_operator_utilization(station: dict, sim_config: dict) -> float:
     """
-    Operator utilization % = operator_busy_time / available_shift_time * 100
-    Denominator is NOT multiplied by operator count — measures work vs available shift time.
+    Operator utilization % = operator_busy_time / available_operator_time * 100
+    operator_per_station operators are assigned to EACH of the station's
+    capacity parallel machine slots (e.g. a capacity=3 station built from 3
+    parallel machines in the Canvas each has its own operator_per_station
+    crew), so total operator-minutes available = capacity * operator_per_station.
     """
     busy = station.get("operator_busy_time", station.get("busy_time", 0))
     sim_time = sim_config.get("SIM_TIME", 1)
-    shifts = station.get("shifts_per_day", 1) or 1
+    capacity = station.get("capacity", 1)
+    shifts = station.get("shifts_per_day", 1)
     shift_duration = sim_config.get("SHIFT_DURATION", 480)
-    available = shift_duration * shifts * (sim_time / MINUTES_PER_DAY)
+    operators = station.get("operator_per_station", 1) or 1
+    per_day = _available_minutes_per_day(shifts, shift_duration)
+    available = per_day * _working_days(sim_time, shifts) * operators * capacity
     return round((busy / available * 100) if available > 0 else 0.0, 2)
 
 
@@ -114,6 +161,34 @@ def calc_rework_time_ratio(station: dict) -> float:
     return round(rework / busy * 100, 2)
 
 
+def calc_setup_time_ratio(station: dict) -> float:
+    """
+    Setup Time Ratio (%) = total_setup_time / (busy_time + total_setup_time) * 100
+    Changeover overhead as a fraction of total time the station spent occupied
+    (processing + setup) — how much of the station's occupied time was lost
+    to changeovers rather than actual work.
+    """
+    setup = station.get("total_setup_time", 0)
+    busy = station.get("busy_time", 0)
+    denom = busy + setup
+    return round(setup / denom * 100, 2) if denom > 0 else 0.0
+
+
+def calc_buffer_blocked_ratio(station: dict) -> float:
+    """
+    Buffer Blocked Ratio (%) = buffer_blocked_time / (busy_time + buffer_blocked_time) * 100
+    Fraction of a station's occupied time it spent stuck holding a finished
+    job because the NEXT station's buffer was full — distinct from generic
+    Blocked Time (which also includes waiting for THIS station's own machine
+    to free up). Answers: is this station slow because of a downstream
+    buffer constraint specifically?
+    """
+    blocked = station.get("buffer_blocked_time", 0)
+    busy = station.get("busy_time", 0)
+    denom = busy + blocked
+    return round(blocked / denom * 100, 2) if denom > 0 else 0.0
+
+
 def calc_avg_block_time(station: dict) -> float:
     """Average block/wait time per job = total_block_time / job_wait_count"""
     total = station.get("total_block_time", 0)
@@ -126,7 +201,7 @@ def calc_avg_block_time(station: dict) -> float:
 def calc_time_percentages(
     processing: float, blocked: float, station_dt: float, pause: float,
     op_dt: float, rework: float, mat_unavail: float, waiting: float,
-    total_shift_min: float,
+    total_shift_min: float, setup: float = 0.0,
 ) -> Dict[str, float]:
     """All time-as-%-of-total-shift metrics for a station."""
     if total_shift_min <= 0:
@@ -135,6 +210,7 @@ def calc_time_percentages(
             "station_downtime_percent", "station_blocked_time_percent",
             "station_pause_time_percent", "operator_downtime_percent",
             "total_rework_time_percent", "material_unavailability_percent",
+            "setup_time_percent",
         ]}
     return {
         "processing_time_percent":         processing    / total_shift_min * 100,
@@ -145,6 +221,7 @@ def calc_time_percentages(
         "operator_downtime_percent":       op_dt         / total_shift_min * 100,
         "total_rework_time_percent":       rework        / total_shift_min * 100,
         "material_unavailability_percent": mat_unavail   / total_shift_min * 100,
+        "setup_time_percent":              setup         / total_shift_min * 100,
     }
 
 

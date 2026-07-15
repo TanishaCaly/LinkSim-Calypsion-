@@ -96,7 +96,16 @@ class SimulationUtils:
         """True if real_time falls within an active shift window."""
         h = real_time.hour + real_time.minute / 60.0
 
-        if shifts_per_day == 0 or shifts_per_day == 3:
+        if shifts_per_day == 0:
+            return True  # 24/7, no weekly schedule at all
+
+        # 1 and 2 shifts/day represent a Mon-Fri operation, matching
+        # get_active_shift's weekend gating — a 3rd shift covers the
+        # overnight window and, by convention, runs every day (24/7).
+        if shifts_per_day in (1, 2) and real_time.weekday() >= 5:
+            return False
+
+        if shifts_per_day == 3:
             return True  # 24/7
 
         if shifts_per_day == 1:
@@ -149,20 +158,35 @@ class SimulationUtils:
         def to_min(h: float) -> int:
             return int(h * 60)
 
+        def skip_weekend(wait: float) -> float:
+            # 1 and 2 shifts/day are Mon-Fri operations (matches is_active_shift's
+            # weekend gating) — if the computed wait lands on a Sat/Sun, roll
+            # forward to the same shift-start time on the next Monday.
+            landing_day = real_time + timedelta(minutes=wait)
+            extra_days = 0
+            weekday = landing_day.weekday()
+            if weekday >= 5:
+                extra_days = 7 - weekday
+            return wait + extra_days * 24 * 60
+
         s1 = to_min(sim_config["SHIFT_1_START"])
 
         if shifts_per_day == 1:
             e1 = to_min(sim_config["SHIFT_1_END"])
             next_start = s1 + (24 * 60 if current_mins >= e1 else 0)
-            return float((next_start - current_mins) % (24 * 60))
+            wait = float((next_start - current_mins) % (24 * 60))
+            return skip_weekend(wait)
 
         if shifts_per_day == 2:
             e2 = to_min(sim_config["SHIFT_2_END"])
             if current_mins < s1:
-                return float(s1 - current_mins)
+                return skip_weekend(float(s1 - current_mins))
             if current_mins >= e2:
-                return float((24 * 60 - current_mins) + s1)
-            return 0.0
+                return skip_weekend(float((24 * 60 - current_mins) + s1))
+            # Time-of-day is within the shift window, but is_active_shift only
+            # calls us when it already said "not active" — that only happens
+            # here on a weekend, so roll forward to Monday instead of a 0-wait.
+            return skip_weekend(0.0)
 
         if shifts_per_day == 3:
             s1e = to_min(sim_config["SHIFT_1_END"])
@@ -284,6 +308,14 @@ class SimulationUtils:
     def is_first_station(resource_name: str, processflow_data: dict) -> bool:
         """True if resource_name is the first station in any variant flow."""
         for steps in processflow_data.values():
-            if steps and steps[0].get("resource") == resource_name:
+            if not steps:
+                continue
+            first = steps[0].get("resource")
+            if first == resource_name:
+                return True
+            # Routing step ("Exit controller type") — resource is a dict of
+            # possible destinations rather than a single name; treat it as a
+            # first station if resource_name is one of its options.
+            if isinstance(first, dict) and resource_name in first.get("options", []):
                 return True
         return False

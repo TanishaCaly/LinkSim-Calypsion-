@@ -1,6 +1,8 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import Layout from '@/components/layout/Layout'
+import RequireAuth from '@/components/RequireAuth'
+import Login from '@/pages/Login'
 import ScenarioManager from '@/pages/ScenarioManager'
 import RunDashboard from '@/pages/RunDashboard'
 import Canvas from '@/pages/Canvas'
@@ -17,7 +19,14 @@ export default function App() {
     <QueryClientProvider client={queryClient}>
       <BrowserRouter>
         <Routes>
-          <Route element={<Layout />}>
+          <Route path="login" element={<Login />} />
+          <Route
+            element={
+              <RequireAuth>
+                <Layout />
+              </RequireAuth>
+            }
+          >
             <Route index element={<ScenarioManager />} />
             <Route path="run" element={<RunDashboard />} />
             <Route path="canvas" element={<Canvas />} />

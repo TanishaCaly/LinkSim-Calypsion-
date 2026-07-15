@@ -7,7 +7,7 @@ import {
 import {
   Play, RefreshCw, AlertTriangle, CheckCircle, Clock, ChevronRight, ChevronLeft,
   TrendingUp, Zap, Activity, Target, AlertCircle, BarChart2, Settings,
-  CalendarDays, Layers, X, Lightbulb, Printer, Expand, Shrink,
+  CalendarDays, Layers, X, Lightbulb, Printer, Expand, Shrink, List, Search,
 } from 'lucide-react'
 import { simulationsApi } from '@/api/simulations'
 import type { SimConfigOverride } from '@/api/simulations'
@@ -243,6 +243,138 @@ function AvgUtilCard({ avgUtil, stats }: { avgUtil: number; stats: StationStat[]
                   </div>
                 )
               })}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Setup time modal card ────────────────────────────────────────────────────
+
+function AvgSetupCard({ stats }: { stats: StationStat[] }) {
+  const [open, setOpen] = useState(false)
+  const avgSetup = stats.length
+    ? stats.reduce((sum, s) => sum + (s.setup_time_ratio ?? 0), 0) / stats.length
+    : 0
+  const sorted = [...stats].sort((a, b) => (b.setup_time_ratio ?? 0) - (a.setup_time_ratio ?? 0))
+
+  return (
+    <div className="relative h-full">
+      <Card className="border border-gray-200 cursor-pointer hover:border-purple-300 transition-colors h-full" onClick={() => setOpen(true)}>
+        <CardContent className="pt-5 pb-4 h-full">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Avg Setup Time</p>
+              <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{avgSetup.toFixed(1)}%</p>
+              <p className="text-xs text-gray-400 mt-1">of occupied time, across stations</p>
+            </div>
+            <div className="p-2 rounded-lg bg-purple-50"><Settings className="h-4 w-4 text-purple-500" /></div>
+          </div>
+        </CardContent>
+      </Card>
+      {open && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => setOpen(false)} />
+          <div className="relative bg-white rounded-2xl shadow-2xl w-[640px] max-h-[80vh] flex flex-col overflow-hidden">
+            <div className="flex items-center justify-between px-6 py-5 border-b border-gray-100 bg-gradient-to-r from-purple-50 to-indigo-50">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-purple-100 flex items-center justify-center"><Settings className="h-5 w-5 text-purple-600" /></div>
+                <div>
+                  <h2 className="text-base font-bold text-gray-900">Setup / Changeover Time</h2>
+                  <p className="text-xs text-gray-400 mt-0.5">Per-station breakdown · sorted by setup time %</p>
+                </div>
+              </div>
+              <button onClick={() => setOpen(false)} className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors"><X className="h-4 w-4" /></button>
+            </div>
+            <div className="flex items-center gap-6 px-6 py-3 bg-gray-50 border-b border-gray-100">
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Avg Setup</p><p className="text-sm font-bold text-purple-600">{avgSetup.toFixed(1)}%</p></div>
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Stations</p><p className="text-sm font-bold text-gray-800">{stats.length}</p></div>
+            </div>
+            <div className="flex items-center gap-3 px-6 py-2 border-b border-gray-100">
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-6">#</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase flex-1">Station</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-24 text-right">Setup%</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-28 text-right">Setup Time (min)</span>
+            </div>
+            <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-purple-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+              {sorted.map((s, i) => (
+                <div key={s.station_name} className={`flex items-center gap-3 px-6 py-3.5 border-b border-gray-50 last:border-0 ${i === 0 ? 'bg-purple-50/40' : 'hover:bg-gray-50'}`}>
+                  <span className="text-xs font-bold text-gray-300 w-6 tabular-nums shrink-0">{i + 1}</span>
+                  <span className="text-sm text-gray-800 font-medium flex-1">{s.station_name}</span>
+                  <span className="text-sm font-bold text-purple-600 tabular-nums w-24 text-right">{(s.setup_time_ratio ?? 0).toFixed(1)}%</span>
+                  <span className="text-sm text-gray-600 tabular-nums w-28 text-right">{(s.total_setup_time ?? 0).toFixed(1)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Buffer blocked modal card ────────────────────────────────────────────────
+
+function AvgBufferBlockedCard({ stats }: { stats: StationStat[] }) {
+  const [open, setOpen] = useState(false)
+  const avgBlocked = stats.length
+    ? stats.reduce((sum, s) => sum + (s.buffer_blocked_ratio ?? 0), 0) / stats.length
+    : 0
+  const sorted = [...stats].sort((a, b) => (b.buffer_blocked_ratio ?? 0) - (a.buffer_blocked_ratio ?? 0))
+
+  return (
+    <div className="relative h-full">
+      <Card className="border border-gray-200 cursor-pointer hover:border-rose-300 transition-colors h-full" onClick={() => setOpen(true)}>
+        <CardContent className="pt-5 pb-4 h-full">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Buffer Blocked</p>
+              <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{avgBlocked.toFixed(1)}%</p>
+              <p className="text-xs text-gray-400 mt-1">stuck waiting on a full downstream buffer</p>
+            </div>
+            <div className="p-2 rounded-lg bg-rose-50"><Layers className="h-4 w-4 text-rose-500" /></div>
+          </div>
+        </CardContent>
+      </Card>
+      {open && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => setOpen(false)} />
+          <div className="relative bg-white rounded-2xl shadow-2xl w-[680px] max-h-[80vh] flex flex-col overflow-hidden">
+            <div className="flex items-center justify-between px-6 py-5 border-b border-gray-100 bg-gradient-to-r from-rose-50 to-red-50">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-rose-100 flex items-center justify-center"><Layers className="h-5 w-5 text-rose-600" /></div>
+                <div>
+                  <h2 className="text-base font-bold text-gray-900">Buffer-Caused Blocking</h2>
+                  <p className="text-xs text-gray-400 mt-0.5">Per-station breakdown · sorted by blocked % · a station is "blocked" here when it finished a job but the next station's buffer was full</p>
+                </div>
+              </div>
+              <button onClick={() => setOpen(false)} className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors"><X className="h-4 w-4" /></button>
+            </div>
+            <div className="flex items-center gap-6 px-6 py-3 bg-gray-50 border-b border-gray-100">
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Avg Blocked</p><p className="text-sm font-bold text-rose-600">{avgBlocked.toFixed(1)}%</p></div>
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Stations</p><p className="text-sm font-bold text-gray-800">{stats.length}</p></div>
+            </div>
+            <div className="flex items-center gap-3 px-6 py-2 border-b border-gray-100">
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-6">#</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase flex-1">Station</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-20 text-right">Blocked%</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-28 text-right">Blocked (min)</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-20 text-right">Next Buf.</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-16 text-right">Order</span>
+            </div>
+            <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-rose-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+              {sorted.map((s, i) => (
+                <div key={s.station_name} className={`flex items-center gap-3 px-6 py-3.5 border-b border-gray-50 last:border-0 ${i === 0 ? 'bg-rose-50/40' : 'hover:bg-gray-50'}`}>
+                  <span className="text-xs font-bold text-gray-300 w-6 tabular-nums shrink-0">{i + 1}</span>
+                  <span className="text-sm text-gray-800 font-medium flex-1">{s.station_name}</span>
+                  <span className="text-sm font-bold text-rose-600 tabular-nums w-20 text-right">{(s.buffer_blocked_ratio ?? 0).toFixed(1)}%</span>
+                  <span className="text-sm text-gray-600 tabular-nums w-28 text-right">{(s.buffer_blocked_time ?? 0).toFixed(1)}</span>
+                  <span className="text-sm text-gray-600 tabular-nums w-20 text-right">{s.buffer_capacity ? s.buffer_capacity : 'Unlimited'}</span>
+                  <span className="text-sm text-gray-600 tabular-nums w-16 text-right">{s.buffer_discipline || 'FIFO'}</span>
+                </div>
+              ))}
             </div>
           </div>
         </div>
@@ -885,6 +1017,162 @@ function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDialogProp
   )
 }
 
+// ─── Job Trace table ──────────────────────────────────────────────────────────
+
+interface JobTraceRow {
+  jobId: string
+  station: string
+  arrival: string | null
+  departure: string | null
+  windowMin: number | null
+  waitingMin: number | null
+  processingMin: number | null
+  totalMin: number | null
+  status: string
+  delayReason: string
+}
+
+function parseJobTrace(completionLog: Record<string, unknown[]>): JobTraceRow[] {
+  const rows: JobTraceRow[] = []
+  for (const [station, entries] of Object.entries(completionLog)) {
+    for (const e of entries as Record<string, unknown>[]) {
+      const jobId = (e['job_id'] as string) ?? '—'
+      // process_start/end_time_real mark when this job actually started/finished
+      // being WORKED ON at this station (after it already got the machine) —
+      // NOT when it first arrived and began waiting in queue. So the window
+      // between them is "Processing Time + Setup Time + Rework Time + any
+      // shift-pause time falling inside it," not the job's full time at this
+      // station. "Blocked Time" is the SEPARATE, prior queue-wait period
+      // before the machine was acquired. Verified against real engine output:
+      // one job's Blocked Time consistently equals the sum of the
+      // process-window durations of jobs ahead of it in a single-server
+      // queue. The true end-to-end time a job spends at a station is
+      // Blocked Time + this window, not this window alone.
+      const arrival = (e['process_start_time_real'] as string) ?? null
+      const departure = (e['process_end_time_real'] as string) ?? null
+      const status = (e['status'] as string) ?? (departure ? 'Completed' : 'In Progress')
+      const delayReason = (e['delay_reason'] as string) ?? '—'
+      // Round to 2dp rather than truncating to a whole number — station
+      // durations imported from a spreadsheet are routinely fractional
+      // (e.g. 4.39 min), and Math.round() was silently flattening those to
+      // "4", losing real precision the user configured.
+      const round2 = (n: number) => Math.round(n * 100) / 100
+      const waitingMin = e['Blocked Time'] != null ? round2(Number(e['Blocked Time'])) : null
+      const processingMin = e['Processing Time'] != null ? round2(Number(e['Processing Time'])) : null
+      let windowMin: number | null = null
+      if (arrival && departure) {
+        const start = new Date(arrival.replace(' ', 'T')).getTime()
+        const end = new Date(departure.replace(' ', 'T')).getTime()
+        windowMin = round2((end - start) / 60000)
+      }
+      const totalMin = waitingMin != null && windowMin != null ? round2(waitingMin + windowMin) : null
+      rows.push({ jobId, station, arrival, departure, windowMin, waitingMin, processingMin, totalMin, status, delayReason })
+    }
+  }
+  // Sort by arrival time (jobs with no arrival timestamp sink to the bottom)
+  rows.sort((a, b) => {
+    if (!a.arrival) return 1
+    if (!b.arrival) return -1
+    return a.arrival.localeCompare(b.arrival)
+  })
+  return rows
+}
+
+function JobTraceTable({
+  result, isExpanded, onExpandToggle,
+}: { result: Record<string, unknown>; isExpanded?: boolean; onExpandToggle?: () => void }) {
+  const [search, setSearch] = useState('')
+  const rawLog = result?.completion_log as Record<string, unknown[]> | undefined
+  const allRows = rawLog ? parseJobTrace(rawLog) : []
+  const expanded = isExpanded ?? false
+
+  const filtered = search.trim()
+    ? allRows.filter(r =>
+        r.jobId.toLowerCase().includes(search.toLowerCase()) ||
+        r.station.toLowerCase().includes(search.toLowerCase())
+      )
+    : allRows
+
+  if (allRows.length === 0) {
+    return <p className="text-sm text-gray-400 py-8 text-center">No job trace data for this run.</p>
+  }
+
+  const tableContent = (
+    <div>
+      <div className="flex items-center gap-2 mb-3">
+        <div className="relative flex-1 max-w-xs">
+          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-gray-400" />
+          <input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Filter by Job ID or Station…"
+            className="w-full pl-8 pr-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400"
+          />
+        </div>
+        <span className="text-xs text-gray-400">{filtered.length} of {allRows.length} rows</span>
+      </div>
+      <div className={`overflow-auto rounded-xl border border-gray-100 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-blue-200 [&::-webkit-scrollbar-thumb]:rounded-full ${expanded ? 'max-h-[calc(100vh-260px)]' : 'max-h-[600px]'}`}>
+        <table className="w-full text-sm">
+          <thead className="sticky top-0 bg-gray-50 z-10">
+            <tr className="border-b border-gray-100">
+              {['Job ID', 'Station', 'Processing Start', 'Processing End', 'Waiting (min)', 'Processing (min)', 'Total (min)', 'Status', 'Delay Reason'].map(h => (
+                <th key={h} className="text-left text-[10px] font-bold text-gray-400 uppercase tracking-widest py-3 px-4 whitespace-nowrap">{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-50">
+            {filtered.map((r, i) => (
+              <tr key={i} className={i % 2 === 0 ? 'bg-white' : 'bg-gray-50/40'}>
+                <td className="py-2.5 px-4 font-medium text-gray-800 whitespace-nowrap">{r.jobId}</td>
+                <td className="py-2.5 px-4 text-gray-600 whitespace-nowrap">{r.station}</td>
+                <td className="py-2.5 px-4 text-gray-600 whitespace-nowrap">{r.arrival ?? '—'}</td>
+                <td className="py-2.5 px-4 text-gray-600 whitespace-nowrap">{r.departure ?? '—'}</td>
+                <td className={`py-2.5 px-4 tabular-nums whitespace-nowrap ${r.waitingMin ? 'text-amber-600 font-medium' : 'text-gray-400'}`}>{r.waitingMin ?? '—'}</td>
+                <td className="py-2.5 px-4 text-blue-600 font-medium tabular-nums whitespace-nowrap">{r.processingMin ?? '—'}</td>
+                <td className="py-2.5 px-4 text-gray-800 font-semibold tabular-nums whitespace-nowrap">{r.totalMin ?? '—'}</td>
+                <td className="py-2.5 px-4 whitespace-nowrap">
+                  <span className={`text-xs font-semibold px-2 py-0.5 rounded-full border ${
+                    r.status === 'Completed'
+                      ? 'text-green-600 bg-green-50 border-green-200'
+                      : r.status === 'In Progress'
+                        ? 'text-amber-600 bg-amber-50 border-amber-200'
+                        : 'text-gray-500 bg-gray-50 border-gray-200'
+                  }`}>
+                    {r.status}
+                  </span>
+                </td>
+                <td className={`py-2.5 px-4 whitespace-nowrap ${r.delayReason === 'No delay' || r.delayReason === '—' ? 'text-gray-400' : 'text-gray-700 font-medium'}`}>
+                  {r.delayReason}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+
+  if (!expanded) return tableContent
+
+  return (
+    <div className="fixed inset-0 z-[9999] bg-gray-50 flex flex-col p-8 overflow-auto [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-gray-100 [&::-webkit-scrollbar-thumb]:bg-blue-300 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb:hover]:bg-blue-500">
+      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm flex-1 flex flex-col p-6 overflow-auto">
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <h2 className="text-base font-bold text-gray-800">Job Trace</h2>
+            <p className="text-xs text-gray-400 mt-0.5">Every job's arrival/departure at each station</p>
+          </div>
+          <button onClick={onExpandToggle}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-gray-200 bg-white text-gray-500 hover:border-blue-300 hover:text-blue-600 transition-colors text-xs font-medium">
+            <Shrink className="w-3.5 h-3.5" /> Exit
+          </button>
+        </div>
+        {tableContent}
+      </div>
+    </div>
+  )
+}
+
 // ─── Gantt chart ──────────────────────────────────────────────────────────────
 
 interface GanttJob {
@@ -945,7 +1233,7 @@ function GanttTimeline({ result, onExpandToggle, isExpanded }: { result: Record<
   const [scrubPct, setScrubPct] = useState(100)
   const [speed, setSpeed] = useState<'1×' | '10×' | '50×'>('10×')
   const [playing, setPlaying] = useState(false)
-  const [hoveredJob, setHoveredJob] = useState<{ job: GanttJob; x: number; y: number } | null>(null)
+  const [hoveredJob, setHoveredJob] = useState<{ job: GanttJob; x: number; y: number; clientY: number } | null>(null)
   const expanded = isExpanded ?? false
   const rafRef = useRef<number | null>(null)
   const lastTsRef = useRef<number | null>(null)
@@ -1117,7 +1405,7 @@ function GanttTimeline({ result, onExpandToggle, isExpanded }: { result: Record<
               <g key={idx}
                 onMouseEnter={e => {
                   const svg = (e.currentTarget as SVGElement).closest('svg')!.getBoundingClientRect()
-                  setHoveredJob({ job: j, x: e.clientX - svg.left, y: e.clientY - svg.top })
+                  setHoveredJob({ job: j, x: e.clientX - svg.left, y: e.clientY - svg.top, clientY: e.clientY })
                 }}
                 onMouseLeave={() => setHoveredJob(null)}
                 style={{ cursor: 'pointer' }}
@@ -1145,11 +1433,21 @@ function GanttTimeline({ result, onExpandToggle, isExpanded }: { result: Record<
 
         {/* Hover tooltip */}
         {hoveredJob && (() => {
-          const { job, x, y } = hoveredJob
+          const { job, x, y, clientY } = hoveredJob
           const flipLeft = x > LABEL_W + CHART_W * 0.6
+          // The tooltip's own height (~190px incl. downtime row) can push it
+          // past the bottom of the actual browser viewport when hovering a
+          // job near the bottom of a tall, scrollable Gantt chart — clientY
+          // is viewport-relative (unlike x/y, which are SVG-relative and
+          // don't know how much of the SVG is actually visible on screen).
+          const TOOLTIP_H = 190
+          const flipUp = clientY + TOOLTIP_H > window.innerHeight
           return (
             <div className="pointer-events-none absolute z-50 bg-white border border-gray-200 rounded-xl shadow-xl p-3 w-56"
-              style={{ left: flipLeft ? x - 220 : x + 12, top: Math.max(0, y - 10) }}>
+              style={{
+                left: flipLeft ? x - 220 : x + 12,
+                top: flipUp ? Math.max(0, y - TOOLTIP_H) : Math.max(0, y - 10),
+              }}>
               <div className="flex items-center gap-2 mb-2">
                 <div className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ background: stationColor(job.station) }} />
                 <span className="text-xs font-bold text-gray-800">{job.station}</span>
@@ -1275,7 +1573,7 @@ function UtilisationChart({ stats }: { stats: StationStat[] }) {
         <XAxis dataKey="name" tick={{ fontSize: 10, fill: tickFill }} angle={-35} textAnchor="end" interval={0} />
         <YAxis domain={[0, 100]} tickFormatter={(v) => `${v}%`} tick={{ fontSize: 11, fill: tickFill }} />
         <Tooltip content={<UtilTooltip />} cursor={{ fill: cursorFill, radius: 4 }} />
-        <Bar dataKey="station" name="station" radius={[3, 3, 0, 0]} barSize={14}>
+        <Bar dataKey="station" name="station" fill={utilColor(0)} radius={[3, 3, 0, 0]} barSize={14}>
           {data.map((d, i) => <Cell key={i} fill={utilColor(d.station)} />)}
         </Bar>
         <Bar dataKey="operator" name="operator" fill="#93c5fd" radius={[3, 3, 0, 0]} barSize={14} />
@@ -1321,7 +1619,7 @@ function BottleneckChart({ stats }: { stats: StationStat[] }) {
             )
           }}
         />
-        <Bar dataKey="util" radius={[3,3,0,0]} barSize={18}>
+        <Bar dataKey="util" fill={utilColor(0)} radius={[3,3,0,0]} barSize={18}>
           {data.map((d, i) => <Cell key={i} fill={utilColor(d.util)} />)}
         </Bar>
       </BarChart>
@@ -1329,8 +1627,11 @@ function BottleneckChart({ stats }: { stats: StationStat[] }) {
   )
 }
 
+const POPUP_WIDTH = 240
+const POPUP_MARGIN = 12
+
 function StationHealthGrid({ stats }: { stats: StationStat[] }) {
-  const [popup, setPopup] = useState<{ stat: StationStat; x: number; y: number; below: boolean } | null>(null)
+  const [popup, setPopup] = useState<{ stat: StationStat; x: number; anchorX: number; y: number; below: boolean } | null>(null)
 
   return (
     <div className="grid grid-cols-4 sm:grid-cols-6 lg:grid-cols-8 gap-2">
@@ -1339,9 +1640,27 @@ function StationHealthGrid({ stats }: { stats: StationStat[] }) {
           key={s.station_name}
           onMouseEnter={(e) => {
             const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
-            // popup is ~260px tall; flip below if not enough space above
-            const below = rect.top < 280
-            setPopup({ stat: s, x: rect.left + rect.width / 2, y: below ? rect.bottom : rect.top, below })
+            // Popup height grows with the metrics list (2-column grid, ~40px
+            // per row) plus header/padding/arrow — estimate rather than
+            // hard-code so adding another metric doesn't silently break this.
+            const estimatedPopupHeight = 380
+            const spaceAbove = rect.top
+            const spaceBelow = window.innerHeight - rect.bottom
+            // Prefer whichever side actually has room; if neither does, use
+            // whichever has more space so it's clipped as little as possible.
+            const below = spaceBelow >= estimatedPopupHeight
+              ? true
+              : spaceAbove >= estimatedPopupHeight
+                ? false
+                : spaceBelow > spaceAbove
+            const anchorX = rect.left + rect.width / 2
+            // clamp horizontally so the fixed-width popup never overflows the viewport
+            const half = POPUP_WIDTH / 2
+            const x = Math.min(
+              Math.max(anchorX, half + POPUP_MARGIN),
+              window.innerWidth - half - POPUP_MARGIN
+            )
+            setPopup({ stat: s, x, anchorX, y: below ? rect.bottom : rect.top, below })
           }}
           onMouseLeave={() => setPopup(null)}
           className={`relative p-2 rounded-lg border text-center cursor-default ${utilBg(s.station_utilization)}`}
@@ -1363,12 +1682,17 @@ function StationHealthGrid({ stats }: { stats: StationStat[] }) {
         const metrics = [
           { label: 'Station Util.', value: `${s.station_utilization.toFixed(1)}%`, badge: utilTextColor(s.station_utilization) },
           { label: 'Operator Util.', value: `${s.operator_utilization.toFixed(1)}%`, badge: 'text-blue-600' },
+          { label: 'No. of Stations', value: String(s.capacity ?? 1), badge: 'text-gray-700' },
+          { label: 'Operators', value: String(s.operator_per_station ?? 1), badge: 'text-gray-700' },
           { label: 'Jobs Completed', value: String(s.completed_jobs), badge: 'text-gray-700' },
           { label: 'Failures', value: String(s.failure_breakdowns), badge: s.failure_breakdowns > 0 ? 'text-red-500' : 'text-gray-400' },
           { label: 'Rework Rate', value: `${s.rework_percentage.toFixed(1)}%`, badge: s.rework_percentage > 5 ? 'text-amber-600' : 'text-gray-400' },
           { label: 'Rework Time', value: `${s.rework_time_ratio.toFixed(1)}%`, badge: s.rework_time_ratio > 10 ? 'text-amber-600' : 'text-gray-400' },
+          { label: 'Setup Time', value: `${(s.setup_time_ratio ?? 0).toFixed(1)}%`, badge: (s.setup_time_ratio ?? 0) > 10 ? 'text-purple-600' : 'text-gray-400' },
+          { label: 'Buffer Blocked', value: `${(s.buffer_blocked_ratio ?? 0).toFixed(1)}%`, badge: (s.buffer_blocked_ratio ?? 0) > 10 ? 'text-rose-600' : 'text-gray-400' },
           { label: 'Throughput', value: `${s.throughput.toFixed(2)} /hr`, badge: 'text-indigo-600' },
         ]
+        const arrowOffset = popup.anchorX - popup.x
         return (
           <div
             className="fixed z-[9999] pointer-events-none"
@@ -1380,7 +1704,7 @@ function StationHealthGrid({ stats }: { stats: StationStat[] }) {
           >
             {/* Arrow above popup when flipped below */}
             {popup.below && (
-              <div className="flex justify-center mb-0">
+              <div className="flex justify-center mb-0" style={{ transform: `translateX(${arrowOffset}px)` }}>
                 <div className="w-0 h-0 border-l-[6px] border-r-[6px] border-b-[6px] border-l-transparent border-r-transparent border-b-white drop-shadow-sm" />
               </div>
             )}
@@ -1411,7 +1735,7 @@ function StationHealthGrid({ stats }: { stats: StationStat[] }) {
             </div>
             {/* Arrow pointing down to the card (when popup is above) */}
             {!popup.below && (
-              <div className="flex justify-center">
+              <div className="flex justify-center" style={{ transform: `translateX(${arrowOffset}px)` }}>
                 <div className="w-0 h-0 border-l-[6px] border-r-[6px] border-t-[6px] border-l-transparent border-r-transparent border-t-white drop-shadow-sm" />
               </div>
             )}
@@ -1580,7 +1904,7 @@ function RunHistory({
 
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
-type Tab = 'kpis' | 'gantt'
+type Tab = 'kpis' | 'gantt' | 'jobtrace'
 
 export default function RunDashboard() {
   const navigate = useNavigate()
@@ -1588,6 +1912,7 @@ export default function RunDashboard() {
   const [displayRun, setDisplayRun] = useState<RunDetail | null>(activeRun)
   const [tab, setTab] = useState<Tab>('kpis')
   const [ganttExpanded, setGanttExpanded] = useState(false)
+  const [jobTraceExpanded, setJobTraceExpanded] = useState(false)
   const [configOpen, setConfigOpen] = useState(false)
   const [simCfg, setSimCfg] = useState<SimConfigOverride>({ SIM_TIME: 10080, num_replications: 1 })
 
@@ -1615,7 +1940,31 @@ export default function RunDashboard() {
 
   const [progress, setProgress] = useState<{ pct: number; msg: string } | null>(null)
   const [historyCollapsed, setHistoryCollapsed] = useState(false)
+  const [historyWidth, setHistoryWidth] = useState(224) // matches the old fixed w-56
+  const isResizingHistory = useRef(false)
   const esRef = useRef<EventSource | null>(null)
+
+  // Drag-to-resize the run-history sidebar — mirrors a native panel splitter
+  // instead of the old all-or-nothing collapse toggle. Tracks the delta from
+  // drag-start rather than e.clientX directly, since this sidebar isn't at
+  // the screen's left edge (the app nav sidebar sits to its left).
+  const startHistoryResize = (e: React.MouseEvent) => {
+    isResizingHistory.current = true
+    const startX = e.clientX
+    const startWidth = historyWidth
+    const onMouseMove = (ev: MouseEvent) => {
+      if (!isResizingHistory.current) return
+      const next = Math.min(480, Math.max(160, startWidth + (ev.clientX - startX)))
+      setHistoryWidth(next)
+    }
+    const onMouseUp = () => {
+      isResizingHistory.current = false
+      window.removeEventListener('mousemove', onMouseMove)
+      window.removeEventListener('mouseup', onMouseUp)
+    }
+    window.addEventListener('mousemove', onMouseMove)
+    window.addEventListener('mouseup', onMouseUp)
+  }
 
   const stopStream = () => {
     if (esRef.current) { esRef.current.close(); esRef.current = null }
@@ -1654,10 +2003,16 @@ export default function RunDashboard() {
       // SSE closed or server gone; fallback: poll once
       stopStream()
       simulationsApi.getRun(runId).then((detail) => {
-        if (detail.status !== 'running') {
-          setDisplayRun(detail)
-          setActiveRun(detail)
-          setProgress(null)
+        // Whatever the run's actual status, the live stream is gone — never
+        // leave the "Queued…" banner stuck on screen after this point. A
+        // fast-completing run can finish (and its progress_store entry get
+        // cleaned up) before the EventSource even finishes connecting, so
+        // "running" here just means "poll again shortly", not "keep waiting".
+        setProgress(null)
+        setDisplayRun(detail)
+        setActiveRun(detail)
+        if (detail.status === 'running') {
+          setTimeout(() => startStream(runId), 500)
         }
       })
     }
@@ -1669,6 +2024,22 @@ export default function RunDashboard() {
       showToast('Simulation started')
       setProgress({ pct: 0, msg: 'Queued…' })
       startStream(data.id)
+      // Safety net: a small/fast scenario can finish (and its progress_store
+      // entry get cleaned up) before the EventSource even finishes
+      // connecting, so the "done" SSE event is never seen and the banner
+      // gets stuck at "Queued…" forever. Back this up with a direct poll —
+      // if the run is already done by the time this fires, clear the
+      // banner and show the result even if SSE missed it.
+      setTimeout(() => {
+        simulationsApi.getRun(data.id).then((detail) => {
+          if (detail.status !== 'running' && detail.status !== 'pending') {
+            stopStream()
+            setProgress(null)
+            setDisplayRun(detail)
+            setActiveRun(detail)
+          }
+        })
+      }, 1500)
     },
     onError: (err: Error) => showToast(err.message, 'error'),
   })
@@ -1726,7 +2097,10 @@ export default function RunDashboard() {
 
       <div className="flex h-full">
         {/* Sidebar */}
-        <aside className={`no-print relative border-r border-gray-100 bg-white flex flex-col shadow-sm transition-all duration-300 ${historyCollapsed ? 'w-10' : 'w-56'}`}>
+        <aside
+          className={`no-print relative border-r border-gray-100 bg-white flex flex-col shadow-sm ${historyCollapsed ? 'w-10' : ''}`}
+          style={historyCollapsed ? undefined : { width: historyWidth }}
+        >
           {/* Collapse toggle */}
           <button
             onClick={() => setHistoryCollapsed(c => !c)}
@@ -1739,6 +2113,18 @@ export default function RunDashboard() {
             }
           </button>
 
+          {/* Drag-to-resize handle — starts below the collapse button so the
+              two controls never share a hit-area. */}
+          {!historyCollapsed && (
+            <div
+              onMouseDown={startHistoryResize}
+              className="absolute right-0 top-12 bottom-0 w-1.5 -mr-px cursor-col-resize z-10 group"
+              title="Drag to resize"
+            >
+              <div className="w-full h-full bg-transparent group-hover:bg-blue-300 transition-colors" />
+            </div>
+          )}
+
           {!historyCollapsed && (<>
             {/* Header */}
             <div className="px-4 pt-5 pb-3 border-b border-gray-100">
@@ -1750,7 +2136,15 @@ export default function RunDashboard() {
               <RunHistory
                 scenarioId={activeScenario.id}
                 activeRunId={displayRun?.id ?? null}
-                onSelect={(r) => { setDisplayRun(r); setActiveRun(r) }}
+                onSelect={(r) => {
+                  // Switching to a different run (e.g. an older completed one)
+                  // must never leave a previous run's "Queued…" banner or SSE
+                  // connection alive on screen.
+                  stopStream()
+                  setProgress(null)
+                  setDisplayRun(r)
+                  setActiveRun(r)
+                }}
               />
             </div>
 
@@ -1851,6 +2245,12 @@ export default function RunDashboard() {
                     >
                       <CalendarDays className="h-3.5 w-3.5 inline mr-1" />Timeline
                     </button>
+                    <button
+                      onClick={() => setTab('jobtrace')}
+                      className={`px-4 py-1.5 text-sm font-medium transition-colors ${tab === 'jobtrace' ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}
+                    >
+                      <List className="h-3.5 w-3.5 inline mr-1" />Job Trace
+                    </button>
                   </div>
                 )}
               </div>
@@ -1882,6 +2282,37 @@ export default function RunDashboard() {
                         <AtRiskCard count={atRisk} stats={stats} />
                         <TotalFailuresCard total={totalFailures} rework={totalRework} stats={stats} />
                       </div>
+
+                      {/* KPI row 3 */}
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6 auto-rows-fr">
+                        <AvgSetupCard stats={stats} />
+                        <AvgBufferBlockedCard stats={stats} />
+                      </div>
+
+                      {Object.keys(activeScenario.variant_intervals ?? {}).length > 0 && (
+                        <Card className="mb-5">
+                          <CardHeader className="pb-2">
+                            <CardTitle className="text-sm font-semibold text-gray-700">Job Arrival Schedule</CardTitle>
+                            <p className="text-xs text-gray-400">How often a new job of each variant enters the simulation</p>
+                          </CardHeader>
+                          <CardContent>
+                            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
+                              {Object.entries(activeScenario.variant_quantities ?? {}).map(([variant, qty]) => {
+                                const interval = activeScenario.variant_intervals?.[variant]
+                                return (
+                                  <div key={variant} className="p-2.5 rounded-lg border border-gray-100 bg-gray-50/60">
+                                    <p className="text-xs font-medium text-gray-700 truncate">{variant}</p>
+                                    <p className="text-xs text-gray-500 mt-0.5">{qty} jobs</p>
+                                    <p className="text-xs font-semibold mt-0.5" style={{ color: interval ? '#7c3aed' : '#9ca3af' }}>
+                                      {interval ? `every ${interval} min` : 'all at once'}
+                                    </p>
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          </CardContent>
+                        </Card>
+                      )}
 
                       {stats.length > 0 && (
                         <>
@@ -1959,6 +2390,29 @@ export default function RunDashboard() {
                       </CardHeader>
                       <CardContent>
                         <GanttTimeline result={displayRun.result ?? {}} isExpanded={ganttExpanded} onExpandToggle={() => setGanttExpanded(e => !e)} />
+                      </CardContent>
+                    </Card>
+                  )}
+
+                  {tab === 'jobtrace' && (
+                    <Card>
+                      <CardHeader className="pb-2">
+                        <div className="flex items-center justify-between">
+                          <CardTitle className="text-sm font-semibold text-gray-700">
+                            Job Trace — every job's arrival/departure at each station
+                          </CardTitle>
+                          <button onClick={() => setJobTraceExpanded(e => !e)}
+                            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-gray-200 text-gray-500 hover:border-blue-300 hover:text-blue-600 transition-colors text-xs font-medium">
+                            <Expand className="w-3.5 h-3.5" /> Expand
+                          </button>
+                        </div>
+                      </CardHeader>
+                      <CardContent>
+                        <JobTraceTable
+                          result={displayRun.result ?? {}}
+                          isExpanded={jobTraceExpanded}
+                          onExpandToggle={() => setJobTraceExpanded(e => !e)}
+                        />
                       </CardContent>
                     </Card>
                   )}

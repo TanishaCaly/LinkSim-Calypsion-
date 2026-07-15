@@ -14,7 +14,7 @@ import io
 import yaml
 from typing import Any, Dict, List, Optional, Union
 
-from .csv_parser import _safe_int
+from .csv_parser import _safe_int, _safe_float
 
 
 class YamlParser:
@@ -76,6 +76,13 @@ class YamlParser:
             data = data["scenario"]
         return {str(k): _safe_int(v, 0) for k, v in data.get("variant_quantities", {}).items() if k}
 
+    def parse_variant_intervals(self, source: Union[str, bytes]) -> Dict[str, float]:
+        """Optional 'variant_intervals' block — minutes between job arrivals per variant."""
+        data = self.parse(source)
+        if "scenario" in data:
+            data = data["scenario"]
+        return {str(k): _safe_float(v, 0) for k, v in data.get("variant_intervals", {}).items() if k}
+
     def parse_all(self, source: Union[str, bytes]) -> Dict[str, Any]:
         """Parse a full scenario YAML into all LinkSim inputs."""
         data = self.parse(source)
@@ -87,6 +94,7 @@ class YamlParser:
             "operators": self.parse_operators(source),
             "processflow": data.get("processflow", {}),
             "variant_quantities": {str(k): _safe_int(v, 0) for k, v in data.get("variant_quantities", {}).items() if k},
+            "variant_intervals": {str(k): _safe_float(v, 0) for k, v in data.get("variant_intervals", {}).items() if k},
         }
 
 

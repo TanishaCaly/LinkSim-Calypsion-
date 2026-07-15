@@ -9,10 +9,17 @@ from typing import Optional
 from .formulas import daily_failure_rate_to_per_minute, PM_INTERVALS
 
 
-class Machine(simpy.Resource):
+class Machine(simpy.PriorityResource):
     """
     SimPy resource representing a physical machine with failure and PM support.
     Extracted from existing projects; print statements replaced with structured logs.
+
+    Subclasses PriorityResource (not plain Resource) so a station's waiting
+    queue can be served FIFO (default — every request uses priority 0, tied
+    requests are served in arrival order, identical to plain Resource) or
+    LIFO (requests use a priority that decreases with arrival time, so the
+    most recently queued job is served next) — see Buffer Discipline in
+    sim_core.py's _perform_operation.
     """
 
     def __init__(

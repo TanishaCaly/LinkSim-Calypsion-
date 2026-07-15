@@ -64,6 +64,7 @@ class FlatCsvParser:
             "operators":          {},   # not present in flat format
             "processflow":        self._extract_processflow(df),
             "variant_quantities": self._extract_quantities(df),
+            "variant_intervals":  {},   # not present in flat format
         }
 
     # ------------------------------------------------------------------
@@ -87,6 +88,7 @@ class FlatCsvParser:
                 "operator_per_station":          1,
                 "Failure rate":                  0.02,
                 "Repair Time":                   30,
+                "Setup time":                    0,
                 "PM Schedule":                   "Monthly",
                 "Material Shortage Probability (%)": 2.0,
                 "Rework Probability (%)":        5.0,
