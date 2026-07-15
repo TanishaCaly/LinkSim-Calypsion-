@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ReactFlow, {
   addEdge, Background, Controls, MiniMap,
   useNodesState, useEdgesState,
@@ -8,7 +8,7 @@ import ReactFlow, {
 import 'reactflow/dist/style.css'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { Save, Plus, Trash2, Settings, Eye, Edit3, Play, ChevronLeft, ChevronRight } from 'lucide-react'
+import { Save, Plus, Trash2, Settings, Eye, Edit3, Play, ChevronLeft, ChevronRight, Box, Layout as LayoutIcon } from 'lucide-react'
 import { scenariosApi } from '@/api/scenarios'
 import { useAppStore } from '@/store/useAppStore'
 import { Button } from '@/components/ui/button'
@@ -16,6 +16,8 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
+import Scene from '@/canvas3d/Scene'
+import { buildScene3D } from '@/canvas3d/layout'
 import type { StationNodeData, ScenarioCreate, StationConfig } from '@/types'
 
 // ─── Colour helpers ───────────────────────────────────────────────────────────
@@ -224,7 +226,20 @@ function PropertyEditor({
             <Input
               type={type}
               value={String(node.data[key as keyof StationNodeData])}
-              onChange={(e) => onChange(node.id, { [key]: type === 'number' ? Number(e.target.value) : e.target.value })}
+              onChange={(e) => {
+                const raw = e.target.value
+                if (type === 'number') {
+                  // FIX: guard against NaN from an empty field or a partial
+                  // value like "12." — previously this would write NaN into
+                  // node data and render the literal string "NaN" in the input.
+                  if (raw === '') return
+                  const parsed = Number(raw)
+                  if (Number.isNaN(parsed)) return
+                  onChange(node.id, { [key]: parsed })
+                } else {
+                  onChange(node.id, { [key]: raw })
+                }
+              }}
               className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
             />
           </div>
@@ -346,8 +361,6 @@ const PALETTE_ITEMS = [
   { label: 'Inspection', description: 'QA station',         color: 'bg-purple-50 text-purple-500 border-purple-400' },
   { label: 'Packaging',  description: 'Pack & dispatch',    color: 'bg-orange-50 text-orange-500 border-orange-400' },
 ]
-
-let nodeCounter = 0
 
 // A step's `resource` is either a plain station name, or a routing dict
 // ({mode, options, weights?/rules?}) for a branching "Exit Controller" step
@@ -599,6 +612,8 @@ export default function Canvas() {
 
   // Mode: 'view' shows scenario flow; 'build' is free-canvas builder
   const [mode, setMode] = useState<'view' | 'build'>(activeScenario ? 'view' : 'build')
+  // Within View mode: '2d' is the existing ReactFlow diagram, '3d' is the new Scene
+  const [viewMode, setViewMode] = useState<'3d' | '2d'>('3d')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [selectedVariant, setSelectedVariant] = useState<string>('')
 
@@ -607,6 +622,16 @@ export default function Canvas() {
   const [edges, setEdges, onEdgesChange] = useEdgesState([])
   const [selectedNode, setSelectedNode] = useState<Node<StationNodeData> | null>(null)
   const [scenarioName, setScenarioName] = useState('')
+
+  // FIX: was a module-level `let nodeCounter = 0`, which persists across
+  // component mounts/unmounts and scenario switches within the same page
+  // session (and can double-increment under React strict-mode double
+  // invocation). A ref scopes the counter to this component instance.
+  const nodeCounterRef = useRef(0)
+  const nextNodeId = () => {
+    nodeCounterRef.current += 1
+    return nodeCounterRef.current
+  }
 
   // View mode: derive graph from scenario
   const variants = useMemo(
@@ -736,6 +761,26 @@ export default function Canvas() {
     })
   }, [activeScenario, activeRun])
 
+  // 3D Scene data — used when viewMode === '3d' inside View mode (see render below)
+  const scene3D = useMemo(() => {
+    if (!activeScenario || !selectedVariant) return { machines: [], operators: [], connections: [], stepLabels: [] }
+    return buildScene3D(
+      activeScenario.processflow_data,
+      selectedVariant,
+      activeScenario.stations_data,
+      activeScenario.operators_data,
+      activeRun?.station_stats ?? [],
+    )
+  }, [activeScenario, selectedVariant, activeRun])
+
+  // Raw completion log passed straight through to the 3D Scene (it does its own
+  // per-station filtering); the 2D view instead uses selectedFlowNodeJobs above,
+  // which is already filtered to the clicked station.
+  const completionLog = useMemo(() =>
+    (activeRun?.result as Record<string, unknown> | null)?.completion_log as Record<string, unknown[]> | undefined,
+    [activeRun]
+  )
+
   // When switching into Build mode with a scenario loaded, populate the canvas
   // with editable boxes for that scenario (only if Build is currently empty —
   // so we never clobber in-progress manual edits).
@@ -766,7 +811,7 @@ export default function Canvas() {
   }
 
   const addNode = (label: string) => {
-    nodeCounter++
+    const id = nextNodeId()
     setNodes((nds) => {
       // Place the new box just to the right of the current rightmost node
       // (and vertically centered among existing nodes), instead of drifting
@@ -776,7 +821,7 @@ export default function Canvas() {
       return [
         ...nds,
         {
-          id: `station_${nodeCounter}`,
+          id: `station_${id}`,
           type: 'station',
           position: { x: nds.length > 0 ? rightmostX + 220 : 80, y: avgY },
           data: { label, capacity: 1, cycleTime: 30, operators: 1 },
@@ -800,7 +845,9 @@ export default function Canvas() {
    *  both to "Name #1" / "Name #2" (etc.), and wires the copy to the same
    *  predecessors/successors so it stays a proper parallel branch. */
   const addParallelMachine = (id: string) => {
-    nodeCounter++
+    const newIdNum = nextNodeId()
+    const newId = `station_${newIdNum}`
+
     setNodes((nds) => {
       const source = nds.find((n) => n.id === id)
       if (!source) return nds
@@ -815,7 +862,6 @@ export default function Canvas() {
         return { ...n, data: { ...n.data, label: `${base} #${idx}` } }
       })
 
-      const newId = `station_${nodeCounter}`
       const stackOffset = 170   // vertical gap between stacked parallel-machine boxes
       const boxWidth = 180      // approx box width used for collision checks
       const boxHeight = 150     // approx box height used for collision checks
@@ -847,8 +893,8 @@ export default function Canvas() {
       const incoming = eds.filter((e) => e.target === id)
       const outgoing = eds.filter((e) => e.source === id)
       const newEdges: Edge[] = [
-        ...incoming.map((e) => ({ ...e, id: `e_${e.source}__station_${nodeCounter}`, target: `station_${nodeCounter}` })),
-        ...outgoing.map((e) => ({ ...e, id: `e_station_${nodeCounter}__${e.target}`, source: `station_${nodeCounter}` })),
+        ...incoming.map((e) => ({ ...e, id: `e_${e.source}__${newId}`, target: newId })),
+        ...outgoing.map((e) => ({ ...e, id: `e_${newId}__${e.target}`, source: newId })),
       ]
       return [...eds, ...newEdges]
     })
@@ -1050,6 +1096,29 @@ export default function Canvas() {
                   </div>
                 </div>
 
+                {/* 2D / 3D view toggle (only meaningful in View mode) */}
+                <div>
+                  <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">View</p>
+                  <div className="flex rounded-xl border border-gray-200 overflow-hidden">
+                    <button
+                      onClick={() => setViewMode('3d')}
+                      className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-semibold transition-all ${
+                        viewMode === '3d' ? 'bg-blue-600 text-white' : 'text-gray-500 hover:bg-gray-50'
+                      }`}
+                    >
+                      <Box className="h-3 w-3" /> 3D
+                    </button>
+                    <button
+                      onClick={() => setViewMode('2d')}
+                      className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-semibold transition-all ${
+                        viewMode === '2d' ? 'bg-blue-600 text-white' : 'text-gray-500 hover:bg-gray-50'
+                      }`}
+                    >
+                      <LayoutIcon className="h-3 w-3" /> 2D
+                    </button>
+                  </div>
+                </div>
+
                 {/* Util overlay legend */}
                 {activeRun?.status === 'completed' && (
                   <div className="pt-3 border-t border-gray-100">
@@ -1070,7 +1139,25 @@ export default function Canvas() {
                   </div>
                 )}
 
-                {/* Steps + run info */}
+                {/* Operator skill legend */}
+                <div className="pt-3 border-t border-gray-100">
+                  <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Operator Skill</p>
+                  <div className="space-y-1.5">
+                    {[
+                      { color: '#3b82f6', label: '5 — Expert' },
+                      { color: '#22c55e', label: '4 — High' },
+                      { color: '#f59e0b', label: '3 — Medium' },
+                      { color: '#f97316', label: '2 — Low' },
+                      { color: '#ef4444', label: '1 — Beginner' },
+                    ].map(({ color, label }) => (
+                      <div key={label} className="flex items-center gap-2">
+                        <div className="w-2 h-3 rounded-sm" style={{ background: color }} />
+                        <span className="text-[11px] text-gray-500">{label}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
                 <div className="pt-3 border-t border-gray-100">
                   <div className="flex items-center justify-between">
                     <span className="text-xs text-gray-400">{viewNodes.length} steps</span>
@@ -1166,47 +1253,71 @@ export default function Canvas() {
 
         {/* Flow + property panel */}
         <div className="flex-1 flex min-h-0">
-          <div className="flex-1" style={{ height: '100%' }}>
+          <div className="flex-1 min-h-0" style={{ height: '100%' }}>
             {mode === 'view' ? (
-              viewNodes.length > 0 ? (
-                <ReactFlow
-                  nodes={viewNodes}
-                  edges={viewEdges}
-                  nodeTypes={stableNodeTypes}
-                  edgeTypes={stableEdgeTypes}
-                  fitView
-                  fitViewOptions={{ padding: 0.2 }}
-                  nodesConnectable={false}
-                  zoomOnDoubleClick={false}
-                  onInit={setViewFlowInstance}
-                  onNodeDragStop={(_, node) => {
-                    if (node.type !== 'endpoint') return
-                    setEndpointPositions((p) => ({ ...p, [node.id]: node.position }))
-                  }}
-                  onNodeClick={(_, node) => {
-                    if (node.type === 'endpoint') {
-                      setSelectedEndpoint(node.id as 'entry' | 'exit')
-                      setSelectedFlowNodeId(null)
-                    } else if (node.type === 'flow') {
-                      setSelectedFlowNodeId(node.id)
-                      setSelectedEndpoint(null)
-                    }
-                  }}
-                  onPaneClick={() => { setSelectedEndpoint(null); setSelectedFlowNodeId(null) }}
-                >
-                  <Background color={isDark ? '#334155' : '#e5e7eb'} gap={20} />
-                  <Controls showInteractive={false} />
-                  <MiniMap nodeColor={(n) => utilColor((n.data as FlowNodeData).utilization ?? 0)} maskColor={isDark ? 'rgba(15,23,42,0.7)' : 'rgba(240,244,255,0.7)'} />
-                </ReactFlow>
-              ) : (
-                <div className="flex items-center justify-center h-full text-gray-400">
-                  <div className="text-center">
-                    <Eye className="h-12 w-12 text-gray-200 mx-auto mb-3" />
-                    <p className="text-sm font-medium text-gray-500">
-                      {activeScenario ? 'Select a variant to view the process flow' : 'No scenario loaded'}
-                    </p>
+              viewMode === '3d' ? (
+                scene3D.machines.length > 0 ? (
+                  <Scene
+                    machines={scene3D.machines}
+                    operators={scene3D.operators}
+                    connections={scene3D.connections}
+                    stepLabels={scene3D.stepLabels}
+                    stationsData={activeScenario!.stations_data}
+                    operatorsData={activeScenario!.operators_data}
+                    isDark={isDark}
+                    completionLog={completionLog}
+                  />
+                ) : (
+                  <div className="flex items-center justify-center h-full text-gray-400">
+                    <div className="text-center">
+                      <Eye className="h-12 w-12 text-gray-200 mx-auto mb-3" />
+                      <p className="text-sm font-medium text-gray-500">
+                        {activeScenario ? 'Select a variant to view the process flow' : 'No scenario loaded'}
+                      </p>
+                    </div>
                   </div>
-                </div>
+                )
+              ) : (
+                viewNodes.length > 0 ? (
+                  <ReactFlow
+                    nodes={viewNodes}
+                    edges={viewEdges}
+                    nodeTypes={stableNodeTypes}
+                    edgeTypes={stableEdgeTypes}
+                    fitView
+                    fitViewOptions={{ padding: 0.2 }}
+                    nodesConnectable={false}
+                    zoomOnDoubleClick={false}
+                    onInit={setViewFlowInstance}
+                    onNodeDragStop={(_, node) => {
+                      if (node.type !== 'endpoint') return
+                      setEndpointPositions((p) => ({ ...p, [node.id]: node.position }))
+                    }}
+                    onNodeClick={(_, node) => {
+                      if (node.type === 'endpoint') {
+                        setSelectedEndpoint(node.id as 'entry' | 'exit')
+                        setSelectedFlowNodeId(null)
+                      } else if (node.type === 'flow') {
+                        setSelectedFlowNodeId(node.id)
+                        setSelectedEndpoint(null)
+                      }
+                    }}
+                    onPaneClick={() => { setSelectedEndpoint(null); setSelectedFlowNodeId(null) }}
+                  >
+                    <Background color={isDark ? '#334155' : '#e5e7eb'} gap={20} />
+                    <Controls showInteractive={false} />
+                    <MiniMap nodeColor={(n) => utilColor((n.data as FlowNodeData).utilization ?? 0)} maskColor={isDark ? 'rgba(15,23,42,0.7)' : 'rgba(240,244,255,0.7)'} />
+                  </ReactFlow>
+                ) : (
+                  <div className="flex items-center justify-center h-full text-gray-400">
+                    <div className="text-center">
+                      <LayoutIcon className="h-12 w-12 text-gray-200 mx-auto mb-3" />
+                      <p className="text-sm font-medium text-gray-500">
+                        {activeScenario ? 'Select a variant to view the process flow' : 'No scenario loaded'}
+                      </p>
+                    </div>
+                  </div>
+                )
               )
             ) : (
               <ReactFlow
@@ -1502,4 +1613,3 @@ export default function Canvas() {
     </div>
   )
 }
-

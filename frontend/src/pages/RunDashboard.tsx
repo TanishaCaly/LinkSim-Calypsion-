@@ -1217,18 +1217,27 @@ function GanttTimeline({ result, onExpandToggle, isExpanded }: { result: Record<
     ? { rowEven: '#1e293b', rowOdd: '#0f172a', grid: '#334155', legendBg: '#1e293b', label: '#e2e8f0', muted: '#94a3b8', barBorder: 'rgba(255,255,255,0.12)' }
     : { rowEven: '#f9fafb', rowOdd: '#ffffff', grid: '#e5e7eb', legendBg: '#f8fafc', label: '#374151', muted: '#9ca3af', barBorder: 'rgba(0,0,0,0.08)' }
 
+  // FIX: `rawLog`/`jobs` are computed up front (instead of via early
+  // `return` statements) so that every hook below is called on every
+  // render regardless of whether there's data. Previously the two early
+  // returns sat *before* the useState/useCallback/useEffect calls, which
+  // violates the Rules of Hooks — switching from an empty-data run to a
+  // populated one while this component stayed mounted (e.g. via Run
+  // History) could throw "Rendered fewer hooks than expected" or corrupt
+  // playback/scrub state.
   const rawLog = result?.completion_log as Record<string, unknown[]> | undefined
-  if (!rawLog || Object.keys(rawLog).length === 0) {
-    return <p className="text-sm text-gray-400 py-8 text-center">No completion log data available.</p>
-  }
-
-  const jobs = parseGantt(rawLog)
-  if (jobs.length === 0) return <p className="text-sm text-gray-400 py-8 text-center">No jobs to display.</p>
+  const hasLog = !!rawLog && Object.keys(rawLog).length > 0
+  const jobs = hasLog ? parseGantt(rawLog!) : []
+  const hasJobs = jobs.length > 0
 
   const stations = [...new Set(jobs.map(j => j.station))]
-  const tMin = Math.min(...jobs.map(j => j.start))
-  const tMax = Math.max(...jobs.map(j => j.end))
-  const totalMs = tMax - tMin || 1
+  // FIX: Math.min(...arr)/Math.max(...arr) spread every element as a
+  // function argument, which can throw "Maximum call stack size exceeded"
+  // once a simulation produces enough completion-log entries. reduce()
+  // avoids the call-stack limit entirely.
+  const tMin = jobs.reduce((min, j) => Math.min(min, j.start), Infinity)
+  const tMax = jobs.reduce((max, j) => Math.max(max, j.end), -Infinity)
+  const totalMs = hasJobs ? (tMax - tMin || 1) : 1
 
   const [scrubPct, setScrubPct] = useState(100)
   const [speed, setSpeed] = useState<'1×' | '10×' | '50×'>('10×')
@@ -1261,6 +1270,15 @@ function GanttTimeline({ result, onExpandToggle, isExpanded }: { result: Record<
     }
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current) }
   }, [playing, tick])
+
+  // Now it's safe to branch on data availability — every hook above has
+  // already been called unconditionally on this render.
+  if (!hasLog) {
+    return <p className="text-sm text-gray-400 py-8 text-center">No completion log data available.</p>
+  }
+  if (!hasJobs) {
+    return <p className="text-sm text-gray-400 py-8 text-center">No jobs to display.</p>
+  }
 
   const cutoffMs = tMin + (scrubPct / 100) * totalMs
   const visibleJobs = jobs.filter(j => j.start <= cutoffMs)
