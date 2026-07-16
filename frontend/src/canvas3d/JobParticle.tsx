@@ -120,21 +120,21 @@ function parseCompletionLog(log: Record<string, unknown[]>) {
 enum Phase { BLOCKED, TRAVEL, WAITING, PROCESSING }
 
 const MAT_CORE = {
-  [Phase.BLOCKED]:    new THREE.MeshBasicMaterial({ color: 0xf97316 }),
-  [Phase.TRAVEL]:     new THREE.MeshBasicMaterial({ color: 0x60a5fa }),
-  [Phase.WAITING]:    new THREE.MeshBasicMaterial({ color: 0xfbbf24 }),
-  [Phase.PROCESSING]: new THREE.MeshBasicMaterial({ color: 0x34d399 }),
+  [Phase.BLOCKED]:    new THREE.MeshBasicMaterial({ color: 0xff4500 }),
+  [Phase.TRAVEL]:     new THREE.MeshBasicMaterial({ color: 0x38bdf8 }),
+  [Phase.WAITING]:    new THREE.MeshBasicMaterial({ color: 0xfacc15 }),
+  [Phase.PROCESSING]: new THREE.MeshBasicMaterial({ color: 0x4ade80 }),
 }
 
 const MAT_GLOW = {
-  [Phase.BLOCKED]:    new THREE.MeshBasicMaterial({ color: 0xea580c, transparent: true, opacity: 0.4 }),
-  [Phase.TRAVEL]:     new THREE.MeshBasicMaterial({ color: 0x3b82f6, transparent: true, opacity: 0.4 }),
-  [Phase.WAITING]:    new THREE.MeshBasicMaterial({ color: 0xd97706, transparent: true, opacity: 0.4 }),
-  [Phase.PROCESSING]: new THREE.MeshBasicMaterial({ color: 0x16a34a, transparent: true, opacity: 0.4 }),
+  [Phase.BLOCKED]:    new THREE.MeshBasicMaterial({ color: 0xff6b35, transparent: true, opacity: 0.65 }),
+  [Phase.TRAVEL]:     new THREE.MeshBasicMaterial({ color: 0x60a5fa, transparent: true, opacity: 0.65 }),
+  [Phase.WAITING]:    new THREE.MeshBasicMaterial({ color: 0xfbbf24, transparent: true, opacity: 0.65 }),
+  [Phase.PROCESSING]: new THREE.MeshBasicMaterial({ color: 0x34d399, transparent: true, opacity: 0.65 }),
 }
 
 const sphereGeo = new THREE.SphereGeometry(0.12, 12, 12)
-const glowGeo = new THREE.SphereGeometry(0.25, 10, 10)
+const glowGeo = new THREE.SphereGeometry(0.35, 10, 10)
 const _curvePoint = new THREE.Vector3()
 
 interface SegmentInfo {
@@ -348,7 +348,7 @@ export default function JobParticle({
     /* --- ambient particle flow (decoupled from timeline for smooth animation) --- */
     // The number of visible particles dynamically matches the active jobs, capped at 25 for performance
     const visualCount = Math.min(activeJobCount, 25)
-    const loopSeconds = 25 // Takes 25 real seconds to traverse the whole pipeline
+
 
     let si = 0 // sphere pool index
 
@@ -366,7 +366,7 @@ export default function JobParticle({
       // Smooth, continuous loop from 0.0 to 1.0
       // Denominator is fixed at 25 so existing particles don't jerk around when visualCount changes
       const offset = p / 25 
-      const rawProgress = (state.clock.elapsedTime / loopSeconds) + offset
+      const rawProgress = (simClockMs.current / traversalMs) + offset
       const progress = rawProgress % 1.0
 
       let segIdx = segs.length - 1
