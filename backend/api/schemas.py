@@ -72,7 +72,7 @@ class RunRequest(BaseModel):
     sim_config_override: Dict[str, Any] = Field(
         default_factory=dict,
         description="Partial sim config that overrides the scenario's stored config. "
-                    "Supports: SIM_TIME, SHIFT_DURATION, SHIFT_1_START/END, "
+                    "Supports: SIM_TIME, WARMUP_TIME, SHIFT_DURATION, SHIFT_1_START/END, "
                     "SHIFT_2_START/END, SHIFT_3_START/END, STATION_DOWNTIME, ACTIVE_PROCESSING_TIME.",
     )
 

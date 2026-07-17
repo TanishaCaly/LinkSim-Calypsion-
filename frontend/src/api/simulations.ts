@@ -3,6 +3,7 @@ import type { RunResponse, RunDetail } from '../types'
 
 export interface SimConfigOverride {
   SIM_TIME?: number
+  WARMUP_TIME?: number
   SHIFT_DURATION?: number
   num_replications?: number
   [key: string]: unknown

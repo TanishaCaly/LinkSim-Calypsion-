@@ -4,6 +4,9 @@ export interface StationConfig {
   capacity: number
   shifts_per_day: number
   operator_per_station: number
+  'Station Type'?: string
+  'Assembly Count'?: number
+  'Assembly Inputs'?: Record<string, number>
   'Failure rate': number
   'Repair Time': number
   'Setup time': number
@@ -12,6 +15,7 @@ export interface StationConfig {
   'Buffer Width': number
   'Buffer Depth': number
   'Buffer Height': number
+  'Buffer Count'?: number
   'PM Schedule': string
   'Material Shortage Probability (%)': number
   'Rework Probability (%)': number
@@ -43,6 +47,7 @@ export interface OperatorConfig {
 
 export interface SimConfig {
   SIM_TIME: number
+  WARMUP_TIME?: number
   SHIFT_DURATION: number
   SHIFT_1_START: number
   SHIFT_1_END: number
@@ -50,6 +55,9 @@ export interface SimConfig {
   SHIFT_2_END: number
   SHIFT_3_START: number
   SHIFT_3_END: number
+  WORKING_DAYS_1?: number[]
+  WORKING_DAYS_2?: number[]
+  WORKING_DAYS_3?: number[]
   STATION_DOWNTIME: number
   ACTIVE_PROCESSING_TIME: number
 }
@@ -190,9 +198,17 @@ export interface UploadResponse {
 
 export interface StationNodeData {
   label: string
+  // Set once from the palette item used to create this node (Station/Assembly/
+  // Inspection/Packaging). Kept separate from `label` so renaming a station
+  // doesn't lose its type-specific fields (e.g. Assembly Count).
+  stationType?: string
   capacity: number
   cycleTime: number
   operators: number
+  assemblyCount?: number
+  // "Assembly type/table" — quantity of each upstream station's output needed
+  // to produce one assembled unit here, keyed by the upstream station's base name.
+  assemblyInputs?: Record<string, number>
   routingMode?: 'round_robin' | 'percentage' | 'condition' | 'shortest_queue'
   routingWeights?: Record<string, number>
   routingRules?: { variantType: string; resource: string }[]

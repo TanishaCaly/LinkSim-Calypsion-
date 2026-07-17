@@ -534,6 +534,7 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
         capacity: 1, shifts_per_day: 1, operator_per_station: 1,
         'Failure rate': 0, 'Repair Time': 10, 'Setup time': 0,
         'Buffer Capacity': 0, 'Buffer Width': 0, 'Buffer Depth': 0, 'Buffer Height': 0,
+        'Buffer Count': 1,
         'Buffer Discipline': 'FIFO', 'PM Schedule': 'Monthly',
         'Rework Probability (%)': 0, 'Material Shortage Probability (%)': 0,
       },
@@ -623,7 +624,7 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-gray-100">
-                  {['Station', 'Capacity', 'Shifts/Day', 'Operators', 'Failure Rate', 'Repair Time', 'Setup Time', 'Buffer Cap.', 'Buffer W', 'Buffer D', 'Buffer H', 'Buffer Order', 'PM Schedule', 'Rework %', 'Material Shortage %', ''].map(h => (
+                  {['Station', 'Capacity', 'Shifts/Day', 'Operators', 'Failure Rate', 'Buffer Quantity', 'Buffer X', 'Buffer Y', 'Buffer Z', 'No. of Buffers', 'Buffer Order', 'PM Schedule', 'Rework %', 'Material Shortage %', ''].map(h => (
                     <th key={h} className="text-left text-[10px] font-bold text-gray-400 uppercase tracking-widest pb-3 pr-4 whitespace-nowrap">{h}</th>
                   ))}
                 </tr>
@@ -653,12 +654,19 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                       <td className="py-1.5 pr-4">{num('shifts_per_day')}</td>
                       <td className="py-1.5 pr-4">{num('operator_per_station')}</td>
                       <td className="py-1.5 pr-4">{num('Failure rate')}</td>
-                      <td className="py-1.5 pr-4">{num('Repair Time')}</td>
-                      <td className="py-1.5 pr-4">{num('Setup time')}</td>
                       <td className="py-1.5 pr-4">{num('Buffer Capacity')}</td>
                       <td className="py-1.5 pr-4">{num('Buffer Width')}</td>
                       <td className="py-1.5 pr-4">{num('Buffer Depth')}</td>
                       <td className="py-1.5 pr-4">{num('Buffer Height')}</td>
+                      <td className="py-1.5 pr-4">
+                        <Input
+                          type="number"
+                          min={1}
+                          value={cfg['Buffer Count'] ?? 1}
+                          onChange={(e) => updateStationField(i, 'Buffer Count', Number(e.target.value))}
+                          className="h-8 text-sm w-20"
+                        />
+                      </td>
                       <td className="py-1.5 pr-4">
                         <select
                           value={cfg['Buffer Discipline'] || 'FIFO'}
@@ -696,7 +704,7 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                 })}
                 {stationRows.length === 0 && (
                   <tr>
-                    <td colSpan={16} className="py-6 text-center text-gray-400 text-sm">
+                    <td colSpan={15} className="py-6 text-center text-gray-400 text-sm">
                       No stations yet — add one below.
                     </td>
                   </tr>
@@ -835,13 +843,32 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-gray-100">
-                      {['Variant', 'Operation', 'Station / Resource', 'Exit Controller (branching)', 'Duration (min)', ''].map(h => (
+                      {['Variant', 'Operation', 'Station / Resource', 'Exit Controller (branching)', 'Duration (min)', 'Repair Time', 'Setup Time', ''].map(h => (
                         <th key={h} className="text-left text-[10px] font-bold text-gray-400 uppercase tracking-widest pb-3 pr-4 whitespace-nowrap">{h}</th>
                       ))}
                     </tr>
                   </thead>
                   <tbody>
-                    {flowRows.map((row, i) => (
+                    {flowRows.map((row, i) => {
+                      // Repair Time / Setup Time are per-STATION properties
+                      // (one physical machine, shared across every variant
+                      // that passes through it) — editing them here writes
+                      // through to the matching row in stationRows, the same
+                      // underlying data the Stations tab saves, rather than
+                      // storing a separate per-flow-step copy.
+                      const stationIdx = stationRows.findIndex((s) => s.name === row.resource)
+                      const stationCfg = stationIdx >= 0 ? stationRows[stationIdx].cfg : null
+                      const stationNum = (field: string) => (
+                        <Input
+                          type="number"
+                          disabled={stationIdx < 0}
+                          value={stationCfg ? (stationCfg[field] ?? 0) : ''}
+                          placeholder={stationIdx < 0 ? '—' : undefined}
+                          onChange={(e) => updateStationField(stationIdx, field, Number(e.target.value))}
+                          className="h-8 text-sm w-20 disabled:bg-gray-50 disabled:text-gray-400"
+                        />
+                      )
+                      return (
                       <tr key={i} className={`border-b border-gray-50 align-top ${i % 2 === 0 ? '' : 'bg-gray-50/50'}`}>
                         <td className="py-1.5 pr-4">
                           <Input
@@ -968,6 +995,8 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                             className="h-8 text-sm w-24"
                           />
                         </td>
+                        <td className="py-1.5 pr-4">{stationNum('Repair Time')}</td>
+                        <td className="py-1.5 pr-4">{stationNum('Setup time')}</td>
                         <td className="py-1.5 pr-4">
                           <button
                             onClick={() => deleteFlowRow(i)}
@@ -978,10 +1007,11 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                           </button>
                         </td>
                       </tr>
-                    ))}
+                      )
+                    })}
                     {flowRows.length === 0 && (
                       <tr>
-                        <td colSpan={6} className="py-6 text-center text-gray-400 text-sm">
+                        <td colSpan={8} className="py-6 text-center text-gray-400 text-sm">
                           No process flow steps yet — add one below.
                         </td>
                       </tr>
@@ -999,15 +1029,22 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                   Add step
                 </button>
                 <div className="flex items-center gap-3">
-                  {flowSaved && <span className="text-xs text-green-600 font-medium">Saved</span>}
+                  {(flowSaved || stationsSaved) && <span className="text-xs text-green-600 font-medium">Saved</span>}
                   <Button
                     size="sm"
-                    disabled={!flowDirty || saveFlowMutation.isPending}
-                    onClick={() => saveFlowMutation.mutate(flowRows)}
+                    disabled={(!flowDirty && !stationsDirty) || saveFlowMutation.isPending || saveStationsMutation.isPending}
+                    onClick={() => {
+                      // Repair Time / Setup Time edited on this tab live in
+                      // stationRows (see stationNum above), so saving here
+                      // must persist both mutations, not just the
+                      // process-flow rows.
+                      if (flowDirty) saveFlowMutation.mutate(flowRows)
+                      if (stationsDirty) saveStationsMutation.mutate(stationRows)
+                    }}
                     className="bg-blue-600 hover:bg-blue-700"
                   >
                     <Save className="h-3.5 w-3.5 mr-1.5" />
-                    {saveFlowMutation.isPending ? 'Saving…' : 'Save changes'}
+                    {(saveFlowMutation.isPending || saveStationsMutation.isPending) ? 'Saving…' : 'Save changes'}
                   </Button>
                 </div>
               </div>

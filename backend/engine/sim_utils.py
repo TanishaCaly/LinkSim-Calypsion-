@@ -92,6 +92,23 @@ class SimulationUtils:
         return cfg
 
     @staticmethod
+    def working_days(sim_config: dict, shift_num: int) -> List[int]:
+        """
+        Days of the week (Python weekday numbering: Monday=0 ... Sunday=6)
+        that the given shift (1, 2, or 3) operates on. Each shift has its
+        own independent pattern — WORKING_DAYS_1/2/3 — with no shift
+        special-cased to always run every day. Defaults to Mon-Fri for
+        shifts 1/2 and every day for shift 3 when unset, matching this
+        engine's original hardcoded assumption, so scenarios saved before
+        this field existed behave exactly as before.
+        """
+        key = f"WORKING_DAYS_{shift_num}"
+        days = sim_config.get(key)
+        if days:
+            return list(days)
+        return [0, 1, 2, 3, 4] if shift_num in (1, 2) else [0, 1, 2, 3, 4, 5, 6]
+
+    @staticmethod
     def is_active_shift(sim_config: dict, real_time: datetime, shifts_per_day: int) -> bool:
         """True if real_time falls within an active shift window."""
         h = real_time.hour + real_time.minute / 60.0
@@ -99,20 +116,31 @@ class SimulationUtils:
         if shifts_per_day == 0:
             return True  # 24/7, no weekly schedule at all
 
-        # 1 and 2 shifts/day represent a Mon-Fri operation, matching
-        # get_active_shift's weekend gating — a 3rd shift covers the
-        # overnight window and, by convention, runs every day (24/7).
-        if shifts_per_day in (1, 2) and real_time.weekday() >= 5:
-            return False
-
-        if shifts_per_day == 3:
-            return True  # 24/7
+        weekday = real_time.weekday()
 
         if shifts_per_day == 1:
-            return sim_config["SHIFT_1_START"] <= h < sim_config["SHIFT_1_END"]
+            return (
+                weekday in SimulationUtils.working_days(sim_config, 1)
+                and sim_config["SHIFT_1_START"] <= h < sim_config["SHIFT_1_END"]
+            )
 
         if shifts_per_day == 2:
-            return sim_config["SHIFT_1_START"] <= h < sim_config["SHIFT_2_END"]
+            return (
+                weekday in SimulationUtils.working_days(sim_config, 2)
+                and sim_config["SHIFT_1_START"] <= h < sim_config["SHIFT_2_END"]
+            )
+
+        if shifts_per_day == 3:
+            s1, e1 = sim_config["SHIFT_1_START"], sim_config["SHIFT_1_END"]
+            s2, e2 = sim_config["SHIFT_2_START"], sim_config["SHIFT_2_END"]
+            s3, e3 = sim_config["SHIFT_3_START"], sim_config["SHIFT_3_END"]
+            if weekday in SimulationUtils.working_days(sim_config, 1) and s1 <= h < e1:
+                return True
+            if weekday in SimulationUtils.working_days(sim_config, 2) and s2 <= h < e2:
+                return True
+            if weekday in SimulationUtils.working_days(sim_config, 3):
+                return (s3 > e3 and (h >= s3 or h < e3)) or (s3 <= h < e3)
+            return False
 
         return False
 
@@ -126,18 +154,24 @@ class SimulationUtils:
         """Return active shift number (1-3) or None if outside shift hours."""
         current_dt = simulation_state["start_date"] + timedelta(minutes=env.now)
         h = current_dt.hour + current_dt.minute / 60.0
-
-        if current_dt.weekday() >= 5:
-            return None  # Weekend
+        weekday = current_dt.weekday()
 
         def _in(start, end):
             return start <= h < end
 
-        if shifts_per_day >= 1 and _in(sim_config["SHIFT_1_START"], sim_config["SHIFT_1_END"]):
+        if (
+            shifts_per_day >= 1
+            and weekday in SimulationUtils.working_days(sim_config, 1)
+            and _in(sim_config["SHIFT_1_START"], sim_config["SHIFT_1_END"])
+        ):
             return 1
-        if shifts_per_day >= 2 and _in(sim_config["SHIFT_2_START"], sim_config["SHIFT_2_END"]):
+        if (
+            shifts_per_day >= 2
+            and weekday in SimulationUtils.working_days(sim_config, 2)
+            and _in(sim_config["SHIFT_2_START"], sim_config["SHIFT_2_END"])
+        ):
             return 2
-        if shifts_per_day >= 3:
+        if shifts_per_day >= 3 and weekday in SimulationUtils.working_days(sim_config, 3):
             s3, e3 = sim_config["SHIFT_3_START"], sim_config["SHIFT_3_END"]
             if (s3 > e3 and (h >= s3 or h < e3)) or (s3 <= h < e3):
                 return 3
@@ -158,15 +192,18 @@ class SimulationUtils:
         def to_min(h: float) -> int:
             return int(h * 60)
 
-        def skip_weekend(wait: float) -> float:
-            # 1 and 2 shifts/day are Mon-Fri operations (matches is_active_shift's
-            # weekend gating) — if the computed wait lands on a Sat/Sun, roll
-            # forward to the same shift-start time on the next Monday.
+        def skip_to_working_day(wait: float, shift_num: int) -> float:
+            # If the computed wait lands on a day this shift doesn't
+            # operate on, keep rolling forward a day at a time (to the same
+            # shift-start time-of-day) until it lands on one that does.
+            # Handles arbitrary day patterns, not just a contiguous block.
+            days = SimulationUtils.working_days(sim_config, shift_num)
             landing_day = real_time + timedelta(minutes=wait)
             extra_days = 0
-            weekday = landing_day.weekday()
-            if weekday >= 5:
-                extra_days = 7 - weekday
+            while (landing_day + timedelta(days=extra_days)).weekday() not in days:
+                extra_days += 1
+                if extra_days > 7:
+                    break  # no working days configured at all — give up rather than loop forever
             return wait + extra_days * 24 * 60
 
         s1 = to_min(sim_config["SHIFT_1_START"])
@@ -175,18 +212,18 @@ class SimulationUtils:
             e1 = to_min(sim_config["SHIFT_1_END"])
             next_start = s1 + (24 * 60 if current_mins >= e1 else 0)
             wait = float((next_start - current_mins) % (24 * 60))
-            return skip_weekend(wait)
+            return skip_to_working_day(wait, 1)
 
         if shifts_per_day == 2:
             e2 = to_min(sim_config["SHIFT_2_END"])
             if current_mins < s1:
-                return skip_weekend(float(s1 - current_mins))
+                return skip_to_working_day(float(s1 - current_mins), 2)
             if current_mins >= e2:
-                return skip_weekend(float((24 * 60 - current_mins) + s1))
+                return skip_to_working_day(float((24 * 60 - current_mins) + s1), 2)
             # Time-of-day is within the shift window, but is_active_shift only
             # calls us when it already said "not active" — that only happens
-            # here on a weekend, so roll forward to Monday instead of a 0-wait.
-            return skip_weekend(0.0)
+            # here on a non-working day, so roll forward instead of a 0-wait.
+            return skip_to_working_day(0.0, 2)
 
         if shifts_per_day == 3:
             s1e = to_min(sim_config["SHIFT_1_END"])
@@ -195,19 +232,32 @@ class SimulationUtils:
             s3 = to_min(sim_config["SHIFT_3_START"])
             s3e = to_min(sim_config["SHIFT_3_END"])
 
-            in_shift = (
-                (s1 <= current_mins < s1e)
-                or (s2 <= current_mins < s2e)
-                or (current_mins >= s3)
-                or (current_mins < s3e)
+            weekday = real_time.weekday()
+            in_shift1 = weekday in SimulationUtils.working_days(sim_config, 1) and s1 <= current_mins < s1e
+            in_shift2 = weekday in SimulationUtils.working_days(sim_config, 2) and s2 <= current_mins < s2e
+            in_shift3 = weekday in SimulationUtils.working_days(sim_config, 3) and (
+                current_mins >= s3 or current_mins < s3e
             )
-            if in_shift:
+            if in_shift1 or in_shift2 or in_shift3:
                 return 0.0
+
+            # Not currently in any shift — find the soonest upcoming shift
+            # start, rolling each candidate forward to a day that shift
+            # actually operates on, then take the minimum wait.
+            candidates = []
             if current_mins < s1:
-                return float(s1 - current_mins)
+                candidates.append(skip_to_working_day(float(s1 - current_mins), 1))
+            else:
+                candidates.append(skip_to_working_day(float(s1 - current_mins) % (24 * 60), 1))
             if current_mins < s2:
-                return float(s2 - current_mins)
-            return float(s3 - current_mins)
+                candidates.append(skip_to_working_day(float(s2 - current_mins), 2))
+            else:
+                candidates.append(skip_to_working_day(float(s2 - current_mins) % (24 * 60), 2))
+            if current_mins < s3:
+                candidates.append(skip_to_working_day(float(s3 - current_mins), 3))
+            else:
+                candidates.append(skip_to_working_day(float(s3 - current_mins) % (24 * 60), 3))
+            return min(candidates)
 
         return 0.0
 

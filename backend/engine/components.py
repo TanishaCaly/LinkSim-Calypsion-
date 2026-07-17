@@ -91,7 +91,7 @@ class Queue:
 
     def __init__(self, name: str, capacity: int = float("inf")):
         self.name = name
-        self.capacity = capacity
+        self.capacity = capacity 
         self.next_components: List[Any] = []
 
     def process(self, entity: Entity, stats: SimulationStats):

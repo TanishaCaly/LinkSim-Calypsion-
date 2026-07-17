@@ -180,7 +180,7 @@ class ManufacturingSimulation:
     variant_quantities  : dict  – variant → qty to produce
     operators_data      : dict  – operator → {Skill Rating, Availability (%)}
     simulation_config   : dict  – SIM_TIME, SHIFT_DURATION, SHIFT_n_START/END, STATION_DOWNTIME
-    progress_callback   : optional callable(pct: float, msg: str)
+    progress_callback   : optional callable(pct: float, msg: str, **extra)
 
     Returns (via .run())
     --------------------
@@ -194,7 +194,7 @@ class ManufacturingSimulation:
         variant_quantities: Dict[str, int],
         operators_data: Dict[str, Any],
         simulation_config: Dict[str, Any],
-        progress_callback: Optional[Callable[[float, str], None]] = None,
+        progress_callback: Optional[Callable[..., None]] = None,
         variant_intervals: Optional[Dict[str, float]] = None,
         setup_matrix: Optional[Dict[str, Dict[str, float]]] = None,
     ):
@@ -211,7 +211,7 @@ class ManufacturingSimulation:
         self.setup_matrix = setup_matrix or {}
         self.operators_data = operators_data
         self.sim_config = simulation_config
-        self.progress_cb = progress_callback or (lambda pct, msg: None)
+        self.progress_cb = progress_callback or (lambda pct, msg, **extra: None)
 
         # Runtime state (reset on each run)
         self.env: Optional[simpy.Environment] = None
@@ -231,8 +231,23 @@ class ManufacturingSimulation:
         self._validate_config()
         self._reset_state()
         self._run_simpy()
-        self._post_process()
-        return self._collect_results()
+
+        # KPIs (utilization, throughput) are computed against the
+        # steady-state window only — SIM_TIME minus WARMUP_TIME — since
+        # busy_time/completed_jobs were only accumulated from WARMUP_TIME
+        # onward (see _perform_operation/_process_variant). Swap in the
+        # measured-window duration for post-processing, then restore the
+        # real SIM_TIME afterward so anything reporting the true simulated
+        # horizon (e.g. RunDetail.simulation_time) is unaffected.
+        full_sim_time = self.sim_config["SIM_TIME"]
+        warmup_time = self.sim_config.get("WARMUP_TIME", 0) or 0
+        self.sim_config["SIM_TIME"] = full_sim_time - warmup_time
+        try:
+            self._post_process()
+            result = self._collect_results()
+        finally:
+            self.sim_config["SIM_TIME"] = full_sim_time
+        return result
 
     def _validate_config(self):
         """
@@ -260,6 +275,28 @@ class ManufacturingSimulation:
             )
             sim_time = MAX_SIM_TIME
         self.sim_config["SIM_TIME"] = sim_time
+
+        # WARMUP_TIME — an initial stretch of simulated minutes (measured from
+        # t=0) during which jobs flow through the line as normal, but nothing
+        # is counted toward busy_time/completed_jobs/KPIs. Lets the line fill
+        # up from empty before steady-state stats start, same idea as Arena's
+        # warm-up period. Defaults to 0 (off) so existing scenarios are
+        # unaffected. Clamped to [0, SIM_TIME) — a warm-up >= SIM_TIME would
+        # leave nothing to measure.
+        warmup_time = self.sim_config.get("WARMUP_TIME", 0) or 0
+        try:
+            warmup_time = float(warmup_time)
+        except (TypeError, ValueError):
+            warmup_time = 0.0
+        if not math.isfinite(warmup_time) or warmup_time < 0:
+            warmup_time = 0.0
+        if warmup_time >= sim_time:
+            logger.warning(
+                "WARMUP_TIME %.0f >= SIM_TIME %.0f — ignoring warm-up for this run.",
+                warmup_time, sim_time,
+            )
+            warmup_time = 0.0
+        self.sim_config["WARMUP_TIME"] = warmup_time
 
         total_jobs = sum(self.variant_quantities.values()) if self.variant_quantities else 0
         if total_jobs <= 0:
@@ -503,7 +540,29 @@ class ManufacturingSimulation:
 
         self.simulation_state["in_progress_jobs"] = total_jobs
         self.progress_cb(0.5, "Running simulation…")
-        self.env.run(until=self.sim_config["SIM_TIME"])
+
+        # Run in steps rather than one single env.run(until=SIM_TIME) call so
+        # the simulation CLOCK's own progress (env.now vs SIM_TIME) can be
+        # reported as it advances, not just the coarse pre/post-run phases
+        # above and below. Each step behaves identically to one long
+        # env.run() — SimPy resumes from wherever it left off — this only
+        # adds checkpoints to report progress from, not different behavior.
+        sim_time = self.sim_config["SIM_TIME"]
+        num_steps = 100
+        step = max(1.0, sim_time / num_steps)
+        target = 0.0
+        while target < sim_time:
+            target = min(sim_time, target + step)
+            self.env.run(until=target)
+            # Second half of the progress bar (0.5-0.9) tracks simulated-time
+            # completion; the remaining phases below still own 0.9-1.0.
+            frac = target / sim_time if sim_time > 0 else 1.0
+            self.progress_cb(
+                0.5 + frac * 0.4,
+                "Running simulation…",
+                sim_time_now=target,
+                sim_time_total=sim_time,
+            )
 
         # Copy machine failure/PM counts back into station data
         for name, machine in self.resources.items():
@@ -651,7 +710,10 @@ class ManufacturingSimulation:
                                 )
 
         self.simulation_state["total_simulated_time"] = self.env.now
-        self.simulation_state["completed_jobs"] += 1
+        # Excluded from the headline "Completed Jobs" KPI during warm-up, same
+        # as the per-station counters above — see _validate_config.
+        if self.env.now >= self.sim_config.get("WARMUP_TIME", 0):
+            self.simulation_state["completed_jobs"] += 1
         self.simulation_state["in_progress_jobs"] = max(
             0, self.simulation_state["in_progress_jobs"] - 1
         )
@@ -975,21 +1037,27 @@ class ManufacturingSimulation:
         process_end = self.env.now
         self.stations_data[resource_name]["job_counts"]["completed"] += 1
         self.stations_data[resource_name]["last_job_end_time"] = process_end
-        self.stations_data[resource_name]["busy_time"] = (
-            self.stations_data[resource_name].get("busy_time", 0) + processing_time
-        )
-        # operator_busy_time = total person-minutes of labour actually performed.
-        # processing_time is wall-clock time (already divided by num_operators),
-        # so scale back up by num_operators rather than billing the nominal,
-        # pre-division duration regardless of how much processing really happened.
-        self.stations_data[resource_name]["operator_busy_time"] = (
-            self.stations_data[resource_name].get("operator_busy_time", 0)
-            + processing_time * num_operators
-        )
+        # Stats below feed utilization/throughput KPIs directly. Jobs that
+        # finish before WARMUP_TIME still flow through the line normally (so
+        # downstream stations get realistically fed) but are excluded from
+        # these counters, so KPIs reflect steady-state behaviour rather than
+        # the empty-to-full ramp-up. See _validate_config for WARMUP_TIME.
+        if process_end >= self.sim_config.get("WARMUP_TIME", 0):
+            self.stations_data[resource_name]["busy_time"] = (
+                self.stations_data[resource_name].get("busy_time", 0) + processing_time
+            )
+            # operator_busy_time = total person-minutes of labour actually performed.
+            # processing_time is wall-clock time (already divided by num_operators),
+            # so scale back up by num_operators rather than billing the nominal,
+            # pre-division duration regardless of how much processing really happened.
+            self.stations_data[resource_name]["operator_busy_time"] = (
+                self.stations_data[resource_name].get("operator_busy_time", 0)
+                + processing_time * num_operators
+            )
+            self.stations_data[resource_name]["completed_jobs_per_station"] = (
+                self.stations_data[resource_name].get("completed_jobs_per_station", 0) + 1
+            )
         self.stations_data[resource_name]["total_simulated_time_per_station"] += (process_end - process_start)
-        self.stations_data[resource_name]["completed_jobs_per_station"] = (
-            self.stations_data[resource_name].get("completed_jobs_per_station", 0) + 1
-        )
 
         self.simulation_state["current_jobs"][variant_name] = f"Completed at {resource_name}"
         self.simulation_state["running_jobs"].append(variant_name)

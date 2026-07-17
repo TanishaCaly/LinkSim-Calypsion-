@@ -71,25 +71,37 @@ def daily_failure_rate_to_per_minute(daily_failure_prob: float) -> float:
 
 # ── Per-station utilization ───────────────────────────────────────────────────
 
-def _working_days(sim_time: float, shifts_per_day: int) -> float:
+def _working_days(sim_time: float, shifts_per_day: int, start_offset: float = 0.0, working_days: Optional[List[int]] = None) -> float:
     """
     Number of calendar days within sim_time that a station actually operates.
-    1 and 2 shifts/day are Mon-Fri only (matches SimulationUtils.is_active_shift's
-    weekend gating); 0 or 3 shifts/day run every day (24/7).
+    1 and 2 shifts/day only run on that shift's configured working days
+    (Mon-Fri by default, matching SimulationUtils.working_days' gating);
+    0 or 3 shifts/day run every day (24/7) for this "available time" calc —
+    a station's own working-day pattern for shift 3 doesn't shrink its
+    available time here, matching _available_minutes_per_day's existing
+    24/7 assumption for that mode.
+
+    start_offset shifts the window's start point forward by that many minutes
+    from SIMULATION_START_DATE — needed when KPIs are measured over a window
+    that begins after WARMUP_TIME rather than at t=0, so weekday counting
+    lines up with the calendar dates the window actually covers instead of
+    always starting from Jan 1.
     """
     total_days = sim_time / MINUTES_PER_DAY
     if shifts_per_day not in (1, 2):
         return total_days
 
+    days = working_days if working_days else [0, 1, 2, 3, 4]
+    window_start = SIMULATION_START_DATE + timedelta(minutes=start_offset)
     whole_days = int(total_days)
     remainder = total_days - whole_days
-    weekdays = 0.0
+    matched_days = 0.0
     for i in range(whole_days):
-        if (SIMULATION_START_DATE + timedelta(days=i)).weekday() < 5:
-            weekdays += 1.0
-    if remainder > 0 and (SIMULATION_START_DATE + timedelta(days=whole_days)).weekday() < 5:
-        weekdays += remainder
-    return weekdays
+        if (window_start + timedelta(days=i)).weekday() in days:
+            matched_days += 1.0
+    if remainder > 0 and (window_start + timedelta(days=whole_days)).weekday() in days:
+        matched_days += remainder
+    return matched_days
 
 
 def _available_minutes_per_day(shifts_per_day: int, shift_duration: float) -> float:
@@ -115,8 +127,9 @@ def calc_station_utilization(station: dict, sim_config: dict) -> float:
     capacity = station.get("capacity", 1)
     shifts = station.get("shifts_per_day", 1)
     shift_duration = sim_config.get("SHIFT_DURATION", 480)
+    warmup_time = sim_config.get("WARMUP_TIME", 0) or 0
     per_day = _available_minutes_per_day(shifts, shift_duration)
-    available = per_day * _working_days(sim_time, shifts) * capacity
+    available = per_day * _working_days(sim_time, shifts, warmup_time, sim_config.get(f"WORKING_DAYS_{shifts}")) * capacity
     return round((busy / available * 100) if available > 0 else 0.0, 2)
 
 
@@ -134,8 +147,9 @@ def calc_operator_utilization(station: dict, sim_config: dict) -> float:
     shifts = station.get("shifts_per_day", 1)
     shift_duration = sim_config.get("SHIFT_DURATION", 480)
     operators = station.get("operator_per_station", 1) or 1
+    warmup_time = sim_config.get("WARMUP_TIME", 0) or 0
     per_day = _available_minutes_per_day(shifts, shift_duration)
-    available = per_day * _working_days(sim_time, shifts) * operators * capacity
+    available = per_day * _working_days(sim_time, shifts, warmup_time, sim_config.get(f"WORKING_DAYS_{shifts}")) * operators * capacity
     return round((busy / available * 100) if available > 0 else 0.0, 2)
 
 

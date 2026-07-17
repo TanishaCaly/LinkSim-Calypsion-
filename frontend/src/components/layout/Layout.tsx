@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useCallback, useRef, useState } from 'react'
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { LayoutDashboard, FolderOpen, GitBranch, Lightbulb, Cpu, ChevronLeft, ChevronRight, Sun, Moon, LogOut } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -12,9 +12,15 @@ const nav = [
   { to: '/insights', icon: Lightbulb, label: 'AI Insights' },
 ]
 
+const DEFAULT_SIDEBAR_WIDTH = 256
+const MIN_SIDEBAR_WIDTH = 200
+
 export default function Layout() {
   const { toast, clearToast, theme, toggleTheme } = useAppStore()
-  const [collapsed, setCollapsed] = useState(false)
+  const [collapsed, setCollapsed] = useState(true)
+  const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH)
+  const [resizing, setResizing] = useState(false)
+  const asideRef = useRef<HTMLElement>(null)
   const navigate = useNavigate()
 
   async function handleLogout() {
@@ -22,13 +28,39 @@ export default function Layout() {
     navigate('/login', { replace: true })
   }
 
+  const startResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault()
+    setResizing(true)
+    const startX = e.clientX
+    const startWidth = asideRef.current?.getBoundingClientRect().width ?? sidebarWidth
+
+    function onMouseMove(ev: MouseEvent) {
+      const raw = startWidth + (ev.clientX - startX)
+      if (raw <= 96) {
+        setCollapsed(true)
+        return
+      }
+      setCollapsed(false)
+      setSidebarWidth(Math.min(420, Math.max(MIN_SIDEBAR_WIDTH, raw)))
+    }
+    function onMouseUp() {
+      setResizing(false)
+      window.removeEventListener('mousemove', onMouseMove)
+      window.removeEventListener('mouseup', onMouseUp)
+    }
+    window.addEventListener('mousemove', onMouseMove)
+    window.addEventListener('mouseup', onMouseUp)
+  }, [sidebarWidth])
+
   return (
     <div className="flex h-screen bg-gray-50">
       {/* Sidebar */}
       <aside
+        ref={asideRef}
+        style={{ width: collapsed ? 64 : sidebarWidth }}
         className={cn(
-          'no-print relative bg-white border-r border-gray-100 flex flex-col shadow-sm transition-all duration-300',
-          collapsed ? 'w-16' : 'w-64'
+          'no-print relative bg-white border-r border-gray-100 flex flex-col shadow-sm',
+          !resizing && 'transition-all duration-300'
         )}
       >
         {/* Logo */}
@@ -49,13 +81,15 @@ export default function Layout() {
         {/* Collapse toggle — floats on the right edge, below the logo */}
         <button
           onClick={() => setCollapsed(c => !c)}
-          className="absolute -right-3 top-20 w-6 h-6 rounded-full bg-white border border-gray-200 shadow-sm flex items-center justify-center hover:bg-gray-50 transition-colors z-10"
-          title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          className="group/toggle absolute -right-3 top-20 w-6 h-6 rounded-full bg-white border border-gray-200 shadow-sm flex items-center justify-center hover:bg-gray-50 transition-colors z-30"
         >
           {collapsed
             ? <ChevronRight className="h-3 w-3 text-gray-500" />
             : <ChevronLeft className="h-3 w-3 text-gray-500" />
           }
+          <span className="pointer-events-none absolute left-full ml-2 whitespace-nowrap rounded-lg bg-white text-gray-700 text-xs font-medium px-3 py-2 shadow-lg border border-gray-100 opacity-0 scale-95 origin-left transition-all duration-150 group-hover/toggle:opacity-100 group-hover/toggle:scale-100 z-30">
+            {collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          </span>
         </button>
 
         {/* Nav */}
@@ -67,14 +101,13 @@ export default function Layout() {
               end={to === '/'}
               className={({ isActive }) =>
                 cn(
-                  'relative flex items-center gap-3 py-3 rounded-xl text-sm font-medium transition-all duration-150',
+                  'group relative flex items-center gap-3 py-3 rounded-xl text-sm font-medium transition-all duration-150',
                   collapsed ? 'justify-center px-0' : 'px-4',
                   isActive
                     ? 'bg-blue-50 text-blue-700'
                     : 'text-gray-500 hover:bg-gray-50 hover:text-gray-800'
                 )
               }
-              title={collapsed ? label : undefined}
             >
               {({ isActive }) => (
                 <>
@@ -83,6 +116,11 @@ export default function Layout() {
                   )}
                   <Icon className={cn('h-4 w-4 shrink-0', isActive ? 'text-blue-600' : 'text-gray-400')} />
                   {!collapsed && label}
+                  {collapsed && (
+                    <span className="pointer-events-none absolute left-full ml-3 whitespace-nowrap rounded-lg bg-white text-gray-700 text-xs font-medium px-3 py-2 shadow-lg border border-gray-100 opacity-0 scale-95 origin-left transition-all duration-150 group-hover:opacity-100 group-hover:scale-100 z-20">
+                      {label}
+                    </span>
+                  )}
                 </>
               )}
             </NavLink>
@@ -127,6 +165,30 @@ export default function Layout() {
             </div>
           </div>
         )}
+
+        {/* Resize handle — drag to set a custom width. Split around the collapse-toggle button (top-20 to ~104px) so it stays clickable. Available even when collapsed so it can be dragged back open. */}
+        <div
+          onMouseDown={startResize}
+          draggable={false}
+          className="absolute top-0 -right-1.5 w-3 cursor-col-resize z-20 select-none"
+          style={{ height: 80 }}
+        />
+        <div
+          onMouseDown={startResize}
+          draggable={false}
+          className="absolute -right-1.5 bottom-0 w-3 cursor-col-resize z-20 flex items-center justify-center group/handle select-none"
+          style={{ top: 104 }}
+        >
+          <div
+            className={cn(
+              'w-1 h-10 rounded-full bg-gray-200 group-hover/handle:bg-blue-300 transition-colors',
+              resizing && 'bg-blue-400'
+            )}
+          />
+          <span className="pointer-events-none absolute left-full ml-2 whitespace-nowrap rounded-lg bg-white text-gray-700 text-xs font-medium px-3 py-2 shadow-lg border border-gray-100 opacity-0 scale-95 origin-left transition-all duration-150 group-hover/handle:opacity-100 group-hover/handle:scale-100 z-30">
+            Drag to resize
+          </span>
+        </div>
       </aside>
 
       {/* Main */}

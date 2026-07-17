@@ -177,6 +177,15 @@ function PropertyEditor({
     { key: 'operators', label: 'Operators',        type: 'number' },
   ]
 
+  // "Assembly Count" only makes sense on stations built from the Assembly
+  // palette item. Keyed off stationType (set once at creation, restored from
+  // the saved scenario) rather than the label, so renaming the station in
+  // the Name field doesn't hide this field. Falls back to a label check for
+  // scenarios saved before stationType existed (no persisted type to read).
+  const isAssembly = node.data.stationType
+    ? node.data.stationType === 'Assembly'
+    : baseStationName(node.data.label).startsWith('Assembly')
+
   // Distinct destination STATIONS (base name, so parallel-machine boxes of the
   // same station don't count as separate branches) this node's edges lead to.
   // More than one distinct destination = this station needs an "Exit
@@ -189,6 +198,18 @@ function PropertyEditor({
       .map((n) => baseStationName(n.data.label))
   ))
   const hasBranch = destinationBases.length > 1
+
+  // Distinct upstream STATIONS feeding this node — the "Assembly type/table"
+  // rows for an Assembly station: one row per incoming station, with a
+  // quantity-needed field. Mirrors destinationBases but walks edges backward.
+  const sourceBases = Array.from(new Set(
+    edges
+      .filter((e) => e.target === node.id)
+      .map((e) => nodes.find((n) => n.id === e.source))
+      .filter((n): n is Node<StationNodeData> => !!n)
+      .map((n) => baseStationName(n.data.label))
+  ))
+  const assemblyInputs = node.data.assemblyInputs ?? {}
 
   const routingMode = node.data.routingMode ?? 'round_robin'
   const routingWeights = node.data.routingWeights ?? {}
@@ -244,6 +265,67 @@ function PropertyEditor({
             />
           </div>
         ))}
+
+        {/* Assembly count — only relevant on stations built from the
+            Assembly palette item: how many input sub-parts combine into
+            one assembled unit. Config-only for now; not yet read by the
+            simulation engine. */}
+        {isAssembly && (
+          <div>
+            <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+              Number of Assemblies
+            </label>
+            <Input
+              type="number"
+              min={1}
+              value={String(node.data.assemblyCount ?? 1)}
+              onChange={(e) => {
+                const raw = e.target.value
+                if (raw === '') return
+                const parsed = Number(raw)
+                if (Number.isNaN(parsed)) return
+                onChange(node.id, { assemblyCount: parsed })
+              }}
+              className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+            />
+            <p className="text-[10px] text-gray-400 mt-1">Sub-parts required to produce one assembled unit.</p>
+          </div>
+        )}
+
+        {/* Assembly type/table — quantity of each upstream station's output
+            needed per assembled unit. One row per station actually connected
+            into this node on the canvas; config-only, same as Assembly Count. */}
+        {isAssembly && (
+          <div>
+            <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+              Assembly Table
+            </label>
+            {sourceBases.length > 0 ? (
+              <div className="space-y-1.5">
+                {sourceBases.map((src) => (
+                  <div key={src} className="flex items-center gap-2">
+                    <span className="text-[11px] text-gray-500 flex-1 truncate">{src}</span>
+                    <Input
+                      type="number"
+                      min={0}
+                      value={String(assemblyInputs[src] ?? 1)}
+                      onChange={(e) => {
+                        const raw = e.target.value
+                        if (raw === '') return
+                        const parsed = Number(raw)
+                        if (Number.isNaN(parsed)) return
+                        onChange(node.id, { assemblyInputs: { ...assemblyInputs, [src]: parsed } })
+                      }}
+                      className="h-7 w-16 text-xs rounded-lg border-gray-200 bg-gray-50 focus:bg-white"
+                    />
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-[10px] text-gray-400">Connect one or more stations into this one to list them here.</p>
+            )}
+          </div>
+        )}
 
         {/* Parallel machines — capacity is derived from the number of "Name #N"
             boxes for this station, so it's controlled here instead of a raw field. */}
@@ -543,9 +625,12 @@ function buildEditableGraph(
           position: { x: i * COL_GAP + 40, y: BASE_Y - stackHeight / 2 + rowCursor * ROW_GAP },
           data: {
             label: capacity > 1 ? `${resourceName} #${m + 1}` : resourceName,
+            stationType: cfg?.['Station Type'],
             capacity,
             cycleTime: step.duration,
             operators: cfg?.operator_per_station ?? 1,
+            assemblyCount: cfg?.['Assembly Count'],
+            assemblyInputs: cfg?.['Assembly Inputs'],
           },
         })
         rowCursor += 1
@@ -824,7 +909,7 @@ export default function Canvas() {
           id: `station_${id}`,
           type: 'station',
           position: { x: nds.length > 0 ? rightmostX + 220 : 80, y: avgY },
-          data: { label, capacity: 1, cycleTime: 30, operators: 1 },
+          data: { label, stationType: label, capacity: 1, cycleTime: 30, operators: 1 },
         },
       ]
     })
@@ -917,6 +1002,9 @@ export default function Canvas() {
         stationsData[base] = {
           capacity: capacityCount[base], shifts_per_day: 1,
           operator_per_station: n.data.operators,
+          ...(n.data.stationType !== undefined ? { 'Station Type': n.data.stationType } : {}),
+          ...(n.data.assemblyCount !== undefined ? { 'Assembly Count': n.data.assemblyCount } : {}),
+          ...(n.data.assemblyInputs !== undefined ? { 'Assembly Inputs': n.data.assemblyInputs } : {}),
           'Failure rate': 0, 'Repair Time': 10, 'PM Schedule': 'Monthly',
           'Material Shortage Probability (%)': 0, 'Rework Probability (%)': 0,
           shift1: 'Op1', shift2: '', shift3: '', STATION_DOWNTIME: 0,
@@ -1519,13 +1607,38 @@ export default function Canvas() {
                 <p className="text-[11px] text-gray-400 mb-4">Run a simulation to see utilization data.</p>
               )}
 
+              {activeRun && selectedFlowNode.data.jobs !== undefined && (
+                <div className="bg-blue-50 border border-blue-100 rounded-lg p-2 text-center mb-4">
+                  <p className="text-sm font-bold text-blue-700">{selectedFlowNode.data.jobs}</p>
+                  <p className="text-[9px] text-blue-600">
+                    Jobs completed{activeRun.status !== 'completed' ? ' so far' : ''}
+                  </p>
+                </div>
+              )}
+
               {activeRun?.status === 'completed' && (
                 <>
                   <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">
                     Jobs processed ({selectedFlowNodeJobs.length})
                   </p>
-                  <div className="space-y-1.5">
-                    {selectedFlowNodeJobs.slice(0, 50).map((j, i) => (
+                  {selectedFlowNodeJobs.length > 0 && (
+                    <div className="grid grid-cols-2 gap-2 mb-3">
+                      <div className="bg-green-50 border border-green-100 rounded-lg p-2 text-center">
+                        <p className="text-sm font-bold text-green-700">
+                          {selectedFlowNodeJobs.filter(j => (j.status ?? 'Completed') === 'Completed').length}
+                        </p>
+                        <p className="text-[9px] text-green-600">Completed</p>
+                      </div>
+                      <div className="bg-amber-50 border border-amber-100 rounded-lg p-2 text-center">
+                        <p className="text-sm font-bold text-amber-700">
+                          {selectedFlowNodeJobs.filter(j => j.status === 'In Progress').length}
+                        </p>
+                        <p className="text-[9px] text-amber-600">In progress</p>
+                      </div>
+                    </div>
+                  )}
+                  <div className="space-y-1.5 max-h-80 overflow-y-auto pr-1">
+                    {selectedFlowNodeJobs.map((j, i) => (
                       <div key={i} className="flex items-center justify-between text-xs border border-gray-100 rounded-lg px-2 py-1.5">
                         <span className="text-gray-600 truncate">{j.job_id ?? '—'}</span>
                         <span
@@ -1541,9 +1654,6 @@ export default function Canvas() {
                     ))}
                     {selectedFlowNodeJobs.length === 0 && (
                       <p className="text-[11px] text-gray-400">No jobs recorded at this station.</p>
-                    )}
-                    {selectedFlowNodeJobs.length > 50 && (
-                      <p className="text-[10px] text-gray-400 mt-1">Showing first 50 of {selectedFlowNodeJobs.length}. See Job Trace for the full list.</p>
                     )}
                   </div>
                 </>

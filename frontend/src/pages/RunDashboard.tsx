@@ -388,6 +388,13 @@ function AvgBufferBlockedCard({ stats }: { stats: StationStat[] }) {
 function BottleneckCard({ bottleneck, stats }: { bottleneck: StationStat | null; stats: StationStat[] }) {
   const [open, setOpen] = useState(false)
   const sorted = [...stats].sort((a, b) => b.station_utilization - a.station_utilization)
+  // More than one station can cross the bottleneck threshold at once — the
+  // headline card names the single busiest (kpi_bottleneck_station), but
+  // when others are also at/above it, say so instead of implying there's
+  // only ever one. Full ranked list is still one click away in the modal.
+  const otherBottlenecks = sorted.filter(
+    s => s.station_utilization >= 85 && s.station_name !== bottleneck?.station_name
+  )
 
   return (
     <div className="relative h-full">
@@ -406,7 +413,10 @@ function BottleneckCard({ bottleneck, stats }: { bottleneck: StationStat | null;
               >
                 {bottleneck?.station_name ?? '—'}
               </p>
-              <p className="text-xs text-gray-400 mt-1">{bottleneck ? `${bottleneck.station_utilization.toFixed(1)}% util.` : 'no bottleneck'}</p>
+              <p className="text-xs text-gray-400 mt-1">
+                {bottleneck ? `${bottleneck.station_utilization.toFixed(1)}% util.` : 'no bottleneck'}
+                {otherBottlenecks.length > 0 && ` · +${otherBottlenecks.length} more`}
+              </p>
             </div>
             <div className="p-2 rounded-lg bg-blue-50 shrink-0"><Zap className="h-4 w-4 text-blue-500" /></div>
           </div>
@@ -430,6 +440,7 @@ function BottleneckCard({ bottleneck, stats }: { bottleneck: StationStat | null;
               <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Bottleneck</p><p className="text-sm font-bold text-red-600">{bottleneck?.station_name ?? '—'}</p></div>
               <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Peak Util</p><p className="text-sm font-bold text-gray-800">{bottleneck?.station_utilization.toFixed(1)}%</p></div>
               <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Failures</p><p className="text-sm font-bold text-gray-800">{bottleneck?.failure_breakdowns ?? 0}</p></div>
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Stations ≥85%</p><p className="text-sm font-bold text-gray-800">{sorted.filter(s => s.station_utilization >= 85).length}</p></div>
             </div>
             <div className="flex items-center gap-3 px-6 py-2 border-b border-gray-100">
               <span className="text-[10px] font-bold text-gray-400 uppercase w-6">#</span>
@@ -494,7 +505,7 @@ function ThroughputCard({ value, sub, stats }: { value: string; sub: string; sta
           <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => setOpen(false)} />
 
           {/* Panel */}
-          <div className="relative bg-white rounded-2xl shadow-2xl w-[640px] max-h-[80vh] flex flex-col overflow-hidden">
+          <div className="relative bg-white rounded-2xl shadow-2xl w-[720px] max-h-[80vh] flex flex-col overflow-hidden">
             {/* Header */}
             <div className="flex items-center justify-between px-6 py-5 border-b border-gray-100 bg-gradient-to-r from-blue-50 to-indigo-50">
               <div className="flex items-center gap-3">
@@ -515,7 +526,7 @@ function ThroughputCard({ value, sub, stats }: { value: string; sub: string; sta
             <div className="flex items-center gap-6 px-6 py-3 bg-gray-50 border-b border-gray-100">
               <div>
                 <p className="text-[10px] text-gray-400 uppercase tracking-widest">Total</p>
-                <p className="text-sm font-bold text-gray-800">{total.toFixed(2)} /hr</p>
+                <p className="text-sm font-bold text-gray-800">{total.toFixed(4)} /hr</p>
               </div>
               <div>
                 <p className="text-[10px] text-gray-400 uppercase tracking-widest">Stations</p>
@@ -531,9 +542,11 @@ function ThroughputCard({ value, sub, stats }: { value: string; sub: string; sta
             <div className="flex items-center gap-3 px-6 py-2 border-b border-gray-100">
               <span className="text-[10px] font-bold text-gray-400 uppercase w-6">#</span>
               <span className="text-[10px] font-bold text-gray-400 uppercase flex-1">Station</span>
-              <span className="text-[10px] font-bold text-gray-400 uppercase w-36 text-center">Rate vs Best</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-24 text-center">Rate vs Best</span>
               <span className="text-[10px] font-bold text-gray-400 uppercase w-14 text-right">% of Max</span>
-              <span className="text-[10px] font-bold text-gray-400 uppercase w-20 text-right">Jobs/hr</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-20 text-right">Jobs/month</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-20 text-right">Jobs/day</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-24 text-right">Jobs/hr</span>
             </div>
 
             {/* Rows */}
@@ -547,7 +560,7 @@ function ThroughputCard({ value, sub, stats }: { value: string; sub: string; sta
                   >
                     <span className="text-xs font-bold text-gray-300 w-6 tabular-nums shrink-0">{i + 1}</span>
                     <span className="text-sm text-gray-800 font-medium flex-1">{s.station_name}</span>
-                    <div className="w-36 h-2.5 bg-gray-100 rounded-full overflow-hidden shrink-0">
+                    <div className="w-24 h-2.5 bg-gray-100 rounded-full overflow-hidden shrink-0">
                       <div
                         className="h-full rounded-full bg-blue-400 transition-all"
                         style={{ width: `${pct}%` }}
@@ -556,8 +569,14 @@ function ThroughputCard({ value, sub, stats }: { value: string; sub: string; sta
                     <span className="text-xs font-semibold tabular-nums w-14 text-right text-gray-500">
                       {pct.toFixed(0)}%
                     </span>
-                    <span className="text-sm font-bold text-blue-700 tabular-nums w-20 text-right">
-                      {s.throughput.toFixed(2)}
+                    <span className="text-sm font-bold text-gray-600 tabular-nums w-20 text-right">
+                      {(s.throughput * 24 * 30).toFixed(1)}
+                    </span>
+                    <span className="text-sm font-bold text-gray-600 tabular-nums w-20 text-right">
+                      {(s.throughput * 24).toFixed(2)}
+                    </span>
+                    <span className="text-sm font-bold text-blue-700 tabular-nums w-24 text-right">
+                      {s.throughput.toFixed(4)}
                     </span>
                   </div>
                 )
@@ -892,10 +911,189 @@ interface SimConfigDialogProps {
   onClose: () => void
 }
 
+// Engine defaults from backend/parsers/yaml_parser.py — used whenever a
+// scenario/override hasn't set its own SHIFT_n_START/END.
+const SHIFT_DEFAULTS = {
+  SHIFT_1_START: 6, SHIFT_1_END: 14,
+  SHIFT_2_START: 14, SHIFT_2_END: 22,
+  SHIFT_3_START: 22, SHIFT_3_END: 6,
+}
+
+const CALENDAR_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+function fmtHour(h: number): string {
+  const hh = Math.floor(h) % 24
+  const period = hh < 12 ? 'am' : 'pm'
+  const display = hh % 12 === 0 ? 12 : hh % 12
+  return `${display}${period}`
+}
+
+const HOUR_OPTIONS = Array.from({ length: 24 }, (_, h) => h)
+
+// Python weekday() numbering used by the backend: Monday=0 ... Sunday=6.
+// Matches SimulationUtils.working_days' fallback when a shift has no
+// explicit WORKING_DAYS_n set — Shift 1/2 default to Mon-Fri, Shift 3
+// defaults to every day, same as the engine's original assumption.
+const DEFAULT_WORKING_DAYS: Record<1 | 2 | 3, number[]> = {
+  1: [0, 1, 2, 3, 4],
+  2: [0, 1, 2, 3, 4],
+  3: [0, 1, 2, 3, 4, 5, 6],
+}
+
+interface ShiftHours {
+  SHIFT_1_START: number; SHIFT_1_END: number
+  SHIFT_2_START: number; SHIFT_2_END: number
+  SHIFT_3_START: number; SHIFT_3_END: number
+}
+
+type ShiftWorkingDays = Record<1 | 2 | 3, number[]>
+
+/**
+ * Editable weekly view of the three shift windows this scenario uses.
+ * Each shift has its own independent working-days pattern — no shift is
+ * special-cased to always run every day. Double-click a cell to toggle
+ * that shift on/off for that day. A station's own "Shifts/Day" setting
+ * (Stations tab) decides how many of these shifts it actually observes —
+ * 0 ignores this calendar entirely and runs 24/7.
+ */
+function ShiftCalendar({
+  hours, onChange, workingDays, onWorkingDaysChange,
+}: {
+  hours: ShiftHours
+  onChange: (patch: Partial<ShiftHours>) => void
+  workingDays: ShiftWorkingDays
+  onWorkingDaysChange: (shiftNum: 1 | 2 | 3, days: number[]) => void
+}) {
+  const shifts = [
+    { num: 1 as const, label: 'Shift 1', startKey: 'SHIFT_1_START' as const, endKey: 'SHIFT_1_END' as const, color: 'bg-blue-400' },
+    { num: 2 as const, label: 'Shift 2', startKey: 'SHIFT_2_START' as const, endKey: 'SHIFT_2_END' as const, color: 'bg-indigo-400' },
+    { num: 3 as const, label: 'Shift 3', startKey: 'SHIFT_3_START' as const, endKey: 'SHIFT_3_END' as const, color: 'bg-violet-400' },
+  ]
+
+  const toggleDay = (shiftNum: 1 | 2 | 3, dayIdx: number) => {
+    const days = workingDays[shiftNum]
+    onWorkingDaysChange(
+      shiftNum,
+      days.includes(dayIdx) ? days.filter(d => d !== dayIdx) : [...days, dayIdx].sort()
+    )
+  }
+
+  return (
+    <div>
+      <label className="text-xs font-semibold text-gray-400 uppercase tracking-widest block mb-2">
+        Shift Calendar
+      </label>
+      <div className="border border-gray-200 rounded-xl bg-gray-50 p-3">
+        <div className="grid gap-1.5 items-center" style={{ gridTemplateColumns: '64px repeat(7, 1fr)' }}>
+          <div />
+          {CALENDAR_DAYS.map(d => (
+            <div key={d} className="text-[10px] font-bold text-gray-400 text-center uppercase">{d}</div>
+          ))}
+          {shifts.map(s => (
+            <FragmentRow
+              key={s.label}
+              label={s.label}
+              color={s.color}
+              start={hours[s.startKey]}
+              end={hours[s.endKey]}
+              days={workingDays[s.num]}
+              onToggleDay={dayIdx => toggleDay(s.num, dayIdx)}
+            />
+          ))}
+        </div>
+
+        <div className="mt-3 pt-3 border-t border-gray-200 space-y-2">
+          {shifts.map(s => (
+            <div key={s.label} className="flex items-center gap-2">
+              <span className="text-[11px] text-gray-500 font-medium w-14 shrink-0">{s.label}</span>
+              <select
+                value={hours[s.startKey]}
+                onChange={e => onChange({ [s.startKey]: Number(e.target.value) } as Partial<ShiftHours>)}
+                className="h-7 text-xs text-gray-800 bg-white border border-gray-200 rounded-md px-1.5"
+              >
+                {HOUR_OPTIONS.map(h => <option key={h} value={h}>{fmtHour(h)}</option>)}
+              </select>
+              <span className="text-xs text-gray-400">–</span>
+              <select
+                value={hours[s.endKey]}
+                onChange={e => onChange({ [s.endKey]: Number(e.target.value) } as Partial<ShiftHours>)}
+                className="h-7 text-xs text-gray-800 bg-white border border-gray-200 rounded-md px-1.5"
+              >
+                {HOUR_OPTIONS.map(h => <option key={h} value={h}>{fmtHour(h)}</option>)}
+              </select>
+            </div>
+          ))}
+        </div>
+
+        <p className="text-[11px] text-gray-400 mt-2.5 leading-relaxed">
+          Double-click a day in the calendar to turn that shift on/off for that day — each shift keeps its own
+          schedule. A station's own "Shifts/Day" setting decides how many of these it uses — 0 means 24/7,
+          ignoring this calendar.
+        </p>
+      </div>
+    </div>
+  )
+}
+
+function FragmentRow({
+  label, color, start, end, days, onToggleDay,
+}: {
+  label: string
+  color: string
+  start: number
+  end: number
+  days: number[]
+  onToggleDay: (dayIdx: number) => void
+}) {
+  return (
+    <>
+      <div className="text-[11px] text-gray-500 font-medium flex items-center">{label}</div>
+      {CALENDAR_DAYS.map((d, i) => {
+        const active = days.includes(i)
+        return (
+          <div key={d} className="relative group/cell">
+            <div
+              onDoubleClick={() => onToggleDay(i)}
+              className={`h-6 rounded-md cursor-pointer select-none transition-colors ${active ? `${color} hover:brightness-95` : 'bg-gray-100 hover:bg-gray-200'}`}
+            />
+            <span className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-2 whitespace-nowrap rounded-lg bg-white text-gray-700 text-xs font-medium px-3 py-2 shadow-lg border border-gray-100 opacity-0 scale-95 origin-bottom transition-all duration-150 group-hover/cell:opacity-100 group-hover/cell:scale-100 z-30">
+              {active ? `${fmtHour(start)}–${fmtHour(end)}` : 'Off'} · double-click to toggle
+            </span>
+          </div>
+        )
+      })}
+    </>
+  )
+}
+
 function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDialogProps) {
   const [custom, setCustom] = useState(String(value.SIM_TIME ?? 10080))
+  const [warmup, setWarmup] = useState(String(value.WARMUP_TIME ?? 0))
   const [reps, setReps] = useState(String(value.num_replications ?? 1))
   const [activePreset, setActivePreset] = useState<number | null>(null)
+  const [shiftHours, setShiftHours] = useState<ShiftHours>({
+    SHIFT_1_START: value.SHIFT_1_START ?? SHIFT_DEFAULTS.SHIFT_1_START,
+    SHIFT_1_END: value.SHIFT_1_END ?? SHIFT_DEFAULTS.SHIFT_1_END,
+    SHIFT_2_START: value.SHIFT_2_START ?? SHIFT_DEFAULTS.SHIFT_2_START,
+    SHIFT_2_END: value.SHIFT_2_END ?? SHIFT_DEFAULTS.SHIFT_2_END,
+    SHIFT_3_START: value.SHIFT_3_START ?? SHIFT_DEFAULTS.SHIFT_3_START,
+    SHIFT_3_END: value.SHIFT_3_END ?? SHIFT_DEFAULTS.SHIFT_3_END,
+  })
+  const [workingDays, setWorkingDays] = useState<ShiftWorkingDays>({
+    1: (value.WORKING_DAYS_1 as number[] | undefined) ?? DEFAULT_WORKING_DAYS[1],
+    2: (value.WORKING_DAYS_2 as number[] | undefined) ?? DEFAULT_WORKING_DAYS[2],
+    3: (value.WORKING_DAYS_3 as number[] | undefined) ?? DEFAULT_WORKING_DAYS[3],
+  })
+
+  // Freeze the page behind the dialog — without this, the underlying
+  // dashboard's own horizontal/vertical scrollbars stay live and visible
+  // (and scrollable) while this modal is open.
+  useEffect(() => {
+    if (!open) return
+    const prevOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => { document.body.style.overflow = prevOverflow }
+  }, [open])
 
   if (!open) return null
 
@@ -903,7 +1101,12 @@ function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDialogProp
     onChange({
       ...value,
       SIM_TIME: Number(custom),
+      WARMUP_TIME: Math.max(0, Number(warmup) || 0),
       num_replications: Math.max(1, Math.min(30, Number(reps) || 1)),
+      ...shiftHours,
+      WORKING_DAYS_1: workingDays[1],
+      WORKING_DAYS_2: workingDays[2],
+      WORKING_DAYS_3: workingDays[3],
     })
     onClose()
   }
@@ -911,10 +1114,10 @@ function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDialogProp
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-lg z-10 overflow-hidden">
+      <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[85vh] z-10 flex flex-col overflow-hidden">
 
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-5 border-b border-gray-100">
+        <div className="flex items-center justify-between px-6 py-5 border-b border-gray-100 shrink-0">
           <div className="flex items-center gap-3">
             <div className="w-8 h-8 rounded-lg bg-blue-50 flex items-center justify-center">
               <Settings className="h-4 w-4 text-blue-600" />
@@ -926,7 +1129,7 @@ function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDialogProp
           </button>
         </div>
 
-        <div className="px-6 py-5 space-y-5">
+        <div className="px-6 py-5 space-y-5 overflow-y-auto overflow-x-hidden [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-blue-200 [&::-webkit-scrollbar-thumb]:rounded-full">
           {/* Presets */}
           <div>
             <p className="text-xs font-semibold text-gray-400 uppercase tracking-widest mb-3">Duration Presets</p>
@@ -978,6 +1181,54 @@ function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDialogProp
             </p>
           </div>
 
+          {/* Warm-up Time */}
+          <div>
+            <label className="text-xs font-semibold text-gray-400 uppercase tracking-widest block mb-2">
+              Warm-up Time (minutes)
+            </label>
+            <div className="flex items-center border border-gray-200 rounded-xl bg-gray-50 focus-within:border-blue-400 focus-within:bg-white transition-colors overflow-hidden">
+              <button
+                type="button"
+                onClick={() => setWarmup(v => String(Math.max(0, Number(v) - 60)))}
+                className="px-3 py-2.5 text-blue-500 hover:bg-blue-50 hover:text-blue-700 text-lg font-bold transition-colors select-none"
+              >−</button>
+              <input
+                type="number"
+                min={0}
+                max={Math.max(0, Number(custom) - 60)}
+                value={warmup}
+                onChange={e => setWarmup(e.target.value)}
+                className="flex-1 text-center text-sm text-gray-900 bg-transparent focus:outline-none [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+              />
+              <button
+                type="button"
+                onClick={() => setWarmup(v => String(Math.min(Math.max(0, Number(custom) - 60), Number(v) + 60)))}
+                className="px-3 py-2.5 text-blue-500 hover:bg-blue-50 hover:text-blue-700 text-lg font-bold transition-colors select-none"
+              >+</button>
+            </div>
+            <p className="text-xs text-gray-400 mt-1.5">
+              {Number(warmup) > 0
+                ? `First ${(Number(warmup) / 60).toFixed(1)} hours excluded from utilization/throughput — lets the line fill up before measuring steady-state.`
+                : 'Off by default. Set a value to exclude the initial ramp-up period from KPIs.'}
+            </p>
+          </div>
+
+          {/* Shift Calendar — editable view of the shift windows this run
+              uses. Each shift has its own independent working-days pattern
+              (double-click a cell to toggle), no shift is special-cased to
+              always run every day. Each station's own "Shifts/Day" setting
+              (Stations tab) decides which of these shifts actually apply
+              to it: 0 = 24/7 regardless of this calendar, 1 = Shift 1 only,
+              2 = Shifts 1-2, 3 = all three. Values shown fall back to the
+              engine defaults (6am-2pm / 2pm-10pm / 10pm-6am, Mon-Fri for
+              Shift 1/2 and every day for Shift 3) when not yet configured. */}
+          <ShiftCalendar
+            hours={shiftHours}
+            onChange={patch => setShiftHours(h => ({ ...h, ...patch }))}
+            workingDays={workingDays}
+            onWorkingDaysChange={(shiftNum, days) => setWorkingDays(w => ({ ...w, [shiftNum]: days }))}
+          />
+
           {/* Replications */}
           <div>
             <label className="text-xs font-semibold text-gray-400 uppercase tracking-widest block mb-2">
@@ -1008,7 +1259,7 @@ function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDialogProp
         </div>
 
         {/* Footer */}
-        <div className="flex gap-3 px-6 pb-6">
+        <div className="flex gap-3 px-6 py-4 border-t border-gray-100 shrink-0">
           <Button variant="outline" className="flex-1 rounded-xl border-gray-200 text-gray-600 hover:border-blue-300 hover:text-blue-600" onClick={onClose}>Cancel</Button>
           <Button className="flex-1 rounded-xl bg-blue-600 hover:bg-blue-700 shadow-sm" onClick={apply}>Apply</Button>
         </div>
@@ -1082,16 +1333,26 @@ function JobTraceTable({
   result, isExpanded, onExpandToggle,
 }: { result: Record<string, unknown>; isExpanded?: boolean; onExpandToggle?: () => void }) {
   const [search, setSearch] = useState('')
+  const [stationFilter, setStationFilter] = useState('')
+  const [statusFilter, setStatusFilter] = useState('')
+  const [delayedOnly, setDelayedOnly] = useState(false)
   const rawLog = result?.completion_log as Record<string, unknown[]> | undefined
   const allRows = rawLog ? parseJobTrace(rawLog) : []
   const expanded = isExpanded ?? false
 
-  const filtered = search.trim()
-    ? allRows.filter(r =>
-        r.jobId.toLowerCase().includes(search.toLowerCase()) ||
-        r.station.toLowerCase().includes(search.toLowerCase())
-      )
-    : allRows
+  const stations = Array.from(new Set(allRows.map(r => r.station))).sort()
+  const statuses = Array.from(new Set(allRows.map(r => r.status))).sort()
+
+  const filtered = allRows.filter(r => {
+    if (search.trim()) {
+      const q = search.toLowerCase()
+      if (!r.jobId.toLowerCase().includes(q) && !r.station.toLowerCase().includes(q)) return false
+    }
+    if (stationFilter && r.station !== stationFilter) return false
+    if (statusFilter && r.status !== statusFilter) return false
+    if (delayedOnly && (r.delayReason === 'No delay' || r.delayReason === '—')) return false
+    return true
+  })
 
   if (allRows.length === 0) {
     return <p className="text-sm text-gray-400 py-8 text-center">No job trace data for this run.</p>
@@ -1099,17 +1360,51 @@ function JobTraceTable({
 
   const tableContent = (
     <div>
-      <div className="flex items-center gap-2 mb-3">
+      <div className="flex items-center flex-wrap gap-2 mb-3">
         <div className="relative flex-1 max-w-xs">
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-gray-400" />
           <input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Filter by Job ID or Station…"
-            className="w-full pl-8 pr-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400"
+            className="w-full pl-8 pr-3 py-1.5 text-sm text-gray-800 bg-white border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400"
           />
         </div>
-        <span className="text-xs text-gray-400">{filtered.length} of {allRows.length} rows</span>
+        <select
+          value={stationFilter}
+          onChange={(e) => setStationFilter(e.target.value)}
+          className="h-8 text-sm text-gray-700 bg-white border border-gray-200 rounded-lg px-2.5 focus:outline-none focus:ring-2 focus:ring-blue-400"
+        >
+          <option value="">All stations</option>
+          {stations.map(s => <option key={s} value={s}>{s}</option>)}
+        </select>
+        <select
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value)}
+          className="h-8 text-sm text-gray-700 bg-white border border-gray-200 rounded-lg px-2.5 focus:outline-none focus:ring-2 focus:ring-blue-400"
+        >
+          <option value="">All status</option>
+          {statuses.map(s => <option key={s} value={s}>{s}</option>)}
+        </select>
+        <button
+          onClick={() => setDelayedOnly(v => !v)}
+          className={`h-8 text-sm px-3 rounded-lg border transition-colors ${
+            delayedOnly
+              ? 'text-amber-700 bg-amber-50 border-amber-300'
+              : 'text-gray-700 bg-white border-gray-200 hover:border-gray-300'
+          }`}
+        >
+          Delayed only
+        </button>
+        {(search.trim() || stationFilter || statusFilter || delayedOnly) && (
+          <button
+            onClick={() => { setSearch(''); setStationFilter(''); setStatusFilter(''); setDelayedOnly(false) }}
+            className="h-8 text-sm font-medium px-3 rounded-lg text-gray-400 hover:text-gray-600 transition-colors"
+          >
+            Clear
+          </button>
+        )}
+        <span className="text-xs text-gray-400 ml-auto">{filtered.length} of {allRows.length} rows</span>
       </div>
       <div className={`overflow-auto rounded-xl border border-gray-100 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-blue-200 [&::-webkit-scrollbar-thumb]:rounded-full ${expanded ? 'max-h-[calc(100vh-260px)]' : 'max-h-[600px]'}`}>
         <table className="w-full text-sm">
@@ -1956,7 +2251,7 @@ export default function RunDashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeScenario?.id])
 
-  const [progress, setProgress] = useState<{ pct: number; msg: string } | null>(null)
+  const [progress, setProgress] = useState<{ pct: number; msg: string; simTimeNow?: number; simTimeTotal?: number } | null>(null)
   const [historyCollapsed, setHistoryCollapsed] = useState(false)
   const [historyWidth, setHistoryWidth] = useState(224) // matches the old fixed w-56
   const isResizingHistory = useRef(false)
@@ -1998,7 +2293,7 @@ export default function RunDashboard() {
       try {
         const evt = JSON.parse(e.data)
         if (evt.type === 'progress') {
-          setProgress({ pct: evt.pct, msg: evt.msg })
+          setProgress({ pct: evt.pct, msg: evt.msg, simTimeNow: evt.sim_time_now, simTimeTotal: evt.sim_time_total })
         } else if (evt.type === 'done' || evt.type === 'error') {
           setProgress(null)
           stopStream()
@@ -2093,7 +2388,7 @@ export default function RunDashboard() {
   const simTime = displayRun?.simulation_time ?? 0
   const completedJobs = displayRun?.completed_jobs ?? 0
   const inProgressJobs = displayRun?.in_progress_jobs ?? 0
-  const throughput = displayRun?.kpi_throughput != null ? displayRun.kpi_throughput.toFixed(2) : '—'
+  const throughput = displayRun?.kpi_throughput != null ? displayRun.kpi_throughput.toFixed(4) : '—'
   const avgUtil = displayRun?.kpi_avg_utilization ?? 0
   const peakUtil = displayRun?.kpi_peak_utilization ?? 0
   const bottleneck = displayRun?.kpi_bottleneck_station
@@ -2122,13 +2417,15 @@ export default function RunDashboard() {
           {/* Collapse toggle */}
           <button
             onClick={() => setHistoryCollapsed(c => !c)}
-            className="absolute -right-3 top-5 w-6 h-6 rounded-full bg-white border border-gray-200 shadow-sm flex items-center justify-center hover:bg-gray-50 transition-colors z-10"
-            title={historyCollapsed ? 'Expand run history' : 'Collapse run history'}
+            className="group/toggle absolute -right-3 top-5 w-6 h-6 rounded-full bg-white border border-gray-200 shadow-sm flex items-center justify-center hover:bg-gray-50 transition-colors z-30"
           >
             {historyCollapsed
               ? <ChevronRight className="h-3 w-3 text-gray-500" />
               : <ChevronLeft className="h-3 w-3 text-gray-500" />
             }
+            <span className="pointer-events-none absolute left-full ml-2 whitespace-nowrap rounded-lg bg-white text-gray-700 text-xs font-medium px-3 py-2 shadow-lg border border-gray-100 opacity-0 scale-95 origin-left transition-all duration-150 group-hover/toggle:opacity-100 group-hover/toggle:scale-100 z-30">
+              {historyCollapsed ? 'Expand run history' : 'Collapse run history'}
+            </span>
           </button>
 
           {/* Drag-to-resize handle — starts below the collapse button so the
@@ -2136,10 +2433,13 @@ export default function RunDashboard() {
           {!historyCollapsed && (
             <div
               onMouseDown={startHistoryResize}
-              className="absolute right-0 top-12 bottom-0 w-1.5 -mr-px cursor-col-resize z-10 group"
-              title="Drag to resize"
+              draggable={false}
+              className="absolute -right-1.5 top-12 bottom-0 w-3 cursor-col-resize z-20 select-none flex justify-center group/handle"
             >
-              <div className="w-full h-full bg-transparent group-hover:bg-blue-300 transition-colors" />
+              <div className="w-1 h-10 mt-4 rounded-full bg-gray-200 group-hover/handle:bg-blue-300 transition-colors" />
+              <span className="pointer-events-none absolute left-full ml-2 top-4 whitespace-nowrap rounded-lg bg-white text-gray-700 text-xs font-medium px-3 py-2 shadow-lg border border-gray-100 opacity-0 scale-95 origin-left transition-all duration-150 group-hover/handle:opacity-100 group-hover/handle:scale-100 z-30">
+                Drag to resize
+              </span>
             </div>
           )}
 
@@ -2235,6 +2535,11 @@ export default function RunDashboard() {
                   <span className="text-sm font-bold text-blue-700">{progress.pct.toFixed(0)}%</span>
                 </div>
                 <Progress value={progress.pct} className="h-2" />
+                {progress.simTimeNow != null && progress.simTimeTotal != null && progress.simTimeTotal > 0 && (
+                  <p className="text-xs text-blue-600 mt-2 tabular-nums">
+                    Simulated time: {(progress.simTimeNow / 1440).toFixed(1)} / {(progress.simTimeTotal / 1440).toFixed(1)} days
+                  </p>
+                )}
               </CardContent>
             </Card>
           )}
