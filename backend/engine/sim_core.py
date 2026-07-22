@@ -855,6 +855,12 @@ class ManufacturingSimulation:
                         used = 0 if is_start else (self.env.now % self.sim_config.get("ACTIVE_PROCESSING_TIME", 480))
                         avail = max(0.0, self.sim_config.get("ACTIVE_PROCESSING_TIME", 480) - used)
                         chunk = min(setup_time_remaining, avail) if avail > 0 else setup_time_remaining
+                        # Cap at the next break so a break shorter than this
+                        # chunk still actually pauses it — otherwise a single
+                        # env.timeout() could run straight through a break
+                        # with no intermediate is_active_shift check.
+                        until_break = SimulationUtils.minutes_until_next_break(shift_cfg, real_time, shifts_per_day)
+                        chunk = min(chunk, until_break)
                         yield self.env.timeout(chunk)
                         setup_time_remaining -= chunk
                         setup_time_remaining = max(0.0, setup_time_remaining)
@@ -936,6 +942,13 @@ class ManufacturingSimulation:
                         if cycle_time <= 0:
                             break
                         chunk = min(cycle_time, available)
+                        # Cap at the next break so a break shorter than this
+                        # chunk still actually pauses processing — otherwise
+                        # a single env.timeout() could run straight through a
+                        # break with no intermediate is_active_shift check.
+                        chunk_real_time = start_date + timedelta(minutes=self.env.now)
+                        until_break = SimulationUtils.minutes_until_next_break(shift_cfg, chunk_real_time, shifts_per_day)
+                        chunk = min(chunk, until_break)
                         if chunk <= 0:
                             break
                         yield self.env.timeout(chunk)
@@ -1013,6 +1026,10 @@ class ManufacturingSimulation:
                         used = 0 if is_start else (self.env.now % self.sim_config.get("ACTIVE_PROCESSING_TIME", 480))
                         avail = max(0.0, self.sim_config.get("ACTIVE_PROCESSING_TIME", 480) - used)
                         chunk = min(rework_time, avail) if avail > 0 else rework_time
+                        # Cap at the next break, same reasoning as the setup
+                        # and main processing chunks above.
+                        until_break = SimulationUtils.minutes_until_next_break(shift_cfg, real_time, shifts_per_day)
+                        chunk = min(chunk, until_break)
                         yield self.env.timeout(chunk)
                         processing_time += chunk
                         rework_time -= chunk

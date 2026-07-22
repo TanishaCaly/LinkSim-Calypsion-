@@ -109,8 +109,48 @@ class SimulationUtils:
         return [0, 1, 2, 3, 4] if shift_num in (1, 2) else [0, 1, 2, 3, 4, 5, 6]
 
     @staticmethod
+    def breaks(sim_config: dict, shift_num: int) -> List[Tuple[float, float]]:
+        """
+        List of (start_hour, end_hour) break windows configured for the
+        given shift (1, 2, or 3) — e.g. a lunch break. A shift can have any
+        number of breaks. Defaults to none when BREAKS_n isn't set, so
+        scenarios saved before this field existed behave exactly as before.
+        """
+        raw = sim_config.get(f"BREAKS_{shift_num}")
+        if not raw:
+            return []
+        return [(float(b["start"]), float(b["start"]) + float(b["duration"]) / 60.0) for b in raw]
+
+    @staticmethod
+    def _in_break(h: float, break_windows: List[Tuple[float, float]]) -> bool:
+        """True if hour-of-day h falls inside any of the given break windows."""
+        return any(bs <= h < be for bs, be in break_windows)
+
+    @staticmethod
+    def minutes_until_next_break(sim_config: dict, real_time: datetime, shifts_per_day: int) -> float:
+        """
+        Minutes from real_time until the next break starts, for whichever
+        shift(s) are relevant given shifts_per_day — or float('inf') if none
+        is coming up. Lets the main processing loop cap how long a single
+        uninterrupted processing chunk can run for, so a break shorter than
+        one job's remaining cycle time still actually pauses that job,
+        instead of the whole chunk silently running through it in one
+        env.timeout() with no intermediate is_active_shift check.
+        """
+        if shifts_per_day == 0:
+            return float("inf")
+        h = real_time.hour + real_time.minute / 60.0
+        shift_nums = (1, 2, 3) if shifts_per_day == 3 else (shifts_per_day,)
+        soonest = float("inf")
+        for shift_num in shift_nums:
+            for bs, _be in SimulationUtils.breaks(sim_config, shift_num):
+                if bs >= h:
+                    soonest = min(soonest, (bs - h) * 60.0)
+        return soonest
+
+    @staticmethod
     def is_active_shift(sim_config: dict, real_time: datetime, shifts_per_day: int) -> bool:
-        """True if real_time falls within an active shift window."""
+        """True if real_time falls within an active shift window (and not on a break)."""
         h = real_time.hour + real_time.minute / 60.0
 
         if shifts_per_day == 0:
@@ -122,24 +162,33 @@ class SimulationUtils:
             return (
                 weekday in SimulationUtils.working_days(sim_config, 1)
                 and sim_config["SHIFT_1_START"] <= h < sim_config["SHIFT_1_END"]
+                and not SimulationUtils._in_break(h, SimulationUtils.breaks(sim_config, 1))
             )
 
         if shifts_per_day == 2:
             return (
                 weekday in SimulationUtils.working_days(sim_config, 2)
                 and sim_config["SHIFT_1_START"] <= h < sim_config["SHIFT_2_END"]
+                and not SimulationUtils._in_break(h, SimulationUtils.breaks(sim_config, 2))
             )
 
         if shifts_per_day == 3:
             s1, e1 = sim_config["SHIFT_1_START"], sim_config["SHIFT_1_END"]
             s2, e2 = sim_config["SHIFT_2_START"], sim_config["SHIFT_2_END"]
             s3, e3 = sim_config["SHIFT_3_START"], sim_config["SHIFT_3_END"]
-            if weekday in SimulationUtils.working_days(sim_config, 1) and s1 <= h < e1:
+            if (
+                weekday in SimulationUtils.working_days(sim_config, 1) and s1 <= h < e1
+                and not SimulationUtils._in_break(h, SimulationUtils.breaks(sim_config, 1))
+            ):
                 return True
-            if weekday in SimulationUtils.working_days(sim_config, 2) and s2 <= h < e2:
+            if (
+                weekday in SimulationUtils.working_days(sim_config, 2) and s2 <= h < e2
+                and not SimulationUtils._in_break(h, SimulationUtils.breaks(sim_config, 2))
+            ):
                 return True
             if weekday in SimulationUtils.working_days(sim_config, 3):
-                return (s3 > e3 and (h >= s3 or h < e3)) or (s3 <= h < e3)
+                in_window = (s3 > e3 and (h >= s3 or h < e3)) or (s3 <= h < e3)
+                return in_window and not SimulationUtils._in_break(h, SimulationUtils.breaks(sim_config, 3))
             return False
 
         return False
@@ -163,17 +212,20 @@ class SimulationUtils:
             shifts_per_day >= 1
             and weekday in SimulationUtils.working_days(sim_config, 1)
             and _in(sim_config["SHIFT_1_START"], sim_config["SHIFT_1_END"])
+            and not SimulationUtils._in_break(h, SimulationUtils.breaks(sim_config, 1))
         ):
             return 1
         if (
             shifts_per_day >= 2
             and weekday in SimulationUtils.working_days(sim_config, 2)
             and _in(sim_config["SHIFT_2_START"], sim_config["SHIFT_2_END"])
+            and not SimulationUtils._in_break(h, SimulationUtils.breaks(sim_config, 2))
         ):
             return 2
         if shifts_per_day >= 3 and weekday in SimulationUtils.working_days(sim_config, 3):
             s3, e3 = sim_config["SHIFT_3_START"], sim_config["SHIFT_3_END"]
-            if (s3 > e3 and (h >= s3 or h < e3)) or (s3 <= h < e3):
+            in_window = (s3 > e3 and (h >= s3 or h < e3)) or (s3 <= h < e3)
+            if in_window and not SimulationUtils._in_break(h, SimulationUtils.breaks(sim_config, 3)):
                 return 3
         return None
 
@@ -191,6 +243,24 @@ class SimulationUtils:
 
         def to_min(h: float) -> int:
             return int(h * 60)
+
+        h = real_time.hour + real_time.minute / 60.0
+        weekday0 = real_time.weekday()
+
+        # If the reason is_active_shift said "not active" is that we're
+        # currently on a break (not off-shift entirely), the wait is just
+        # until that break ends — much shorter than rolling to the next
+        # shift/working day, and shouldn't fall through to that logic.
+        for shift_num, start_key, end_key in ((1, "SHIFT_1_START", "SHIFT_1_END"), (2, "SHIFT_2_START", "SHIFT_2_END"), (3, "SHIFT_3_START", "SHIFT_3_END")):
+            if shift_num > shifts_per_day:
+                continue
+            s, e = sim_config[start_key], sim_config[end_key]
+            in_window = (s > e and (h >= s or h < e)) or (s <= h < e)
+            if not in_window or weekday0 not in SimulationUtils.working_days(sim_config, shift_num):
+                continue
+            for bs, be in SimulationUtils.breaks(sim_config, shift_num):
+                if bs <= h < be:
+                    return float(to_min(be) - to_min(h))
 
         def skip_to_working_day(wait: float, shift_num: int) -> float:
             # If the computed wait lands on a day this shift doesn't

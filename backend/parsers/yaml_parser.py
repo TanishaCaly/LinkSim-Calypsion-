@@ -113,11 +113,20 @@ _SIM_CONFIG_DEFAULTS = {
     "SHIFT_3_END": 6.0,
     "STATION_DOWNTIME": 0,
     "ACTIVE_PROCESSING_TIME": 480,
+    # One default break per shift, roughly mid-shift, so a run has a
+    # realistic rest/lunch break out of the box even if the user never
+    # opens Simulation Config to add one. A scenario/override that sets its
+    # own BREAKS_n replaces this entirely — see SimulationUtils.breaks().
+    "BREAKS_1": [{"start": 10.0, "duration": 30}],
+    "BREAKS_2": [{"start": 18.0, "duration": 30}],
+    "BREAKS_3": [{"start": 2.0, "duration": 30}],
 }
 
 
 def _coerce_sim_config(cfg: Dict) -> Dict[str, Any]:
-    result = dict(_SIM_CONFIG_DEFAULTS)
+    # Deep-copy list/dict defaults (e.g. BREAKS_n) so nothing downstream can
+    # accidentally mutate the shared _SIM_CONFIG_DEFAULTS across runs.
+    result = {k: (list(v) if isinstance(v, list) else v) for k, v in _SIM_CONFIG_DEFAULTS.items()}
     result.update({k: float(v) if isinstance(v, (int, float)) else v for k, v in cfg.items()})
     # Ensure SIM_TIME and SHIFT_DURATION are floats
     for key in ("SIM_TIME", "SHIFT_DURATION"):

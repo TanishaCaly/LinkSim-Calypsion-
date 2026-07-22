@@ -843,19 +843,20 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-gray-100">
-                      {['Variant', 'Operation', 'Station / Resource', 'Exit Controller (branching)', 'Duration (min)', 'Repair Time', 'Setup Time', ''].map(h => (
+                      {['Variant', 'Operation', 'Station / Resource', 'Exit Controller (branching)', 'Duration (min)', 'Station Availability (Shifts/Day)', 'Repair Time', 'Setup Time', ''].map(h => (
                         <th key={h} className="text-left text-[10px] font-bold text-gray-400 uppercase tracking-widest pb-3 pr-4 whitespace-nowrap">{h}</th>
                       ))}
                     </tr>
                   </thead>
                   <tbody>
                     {flowRows.map((row, i) => {
-                      // Repair Time / Setup Time are per-STATION properties
-                      // (one physical machine, shared across every variant
-                      // that passes through it) — editing them here writes
-                      // through to the matching row in stationRows, the same
-                      // underlying data the Stations tab saves, rather than
-                      // storing a separate per-flow-step copy.
+                      // Station Availability (shifts_per_day) / Repair Time /
+                      // Setup Time are per-STATION properties (one physical
+                      // machine, shared across every variant that passes
+                      // through it) — editing them here writes through to the
+                      // matching row in stationRows, the same underlying data
+                      // the Stations tab saves, rather than storing a
+                      // separate per-flow-step copy.
                       const stationIdx = stationRows.findIndex((s) => s.name === row.resource)
                       const stationCfg = stationIdx >= 0 ? stationRows[stationIdx].cfg : null
                       const stationNum = (field: string) => (
@@ -995,6 +996,7 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                             className="h-8 text-sm w-24"
                           />
                         </td>
+                        <td className="py-1.5 pr-4">{stationNum('shifts_per_day')}</td>
                         <td className="py-1.5 pr-4">{stationNum('Repair Time')}</td>
                         <td className="py-1.5 pr-4">{stationNum('Setup time')}</td>
                         <td className="py-1.5 pr-4">
@@ -1011,7 +1013,7 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                     })}
                     {flowRows.length === 0 && (
                       <tr>
-                        <td colSpan={8} className="py-6 text-center text-gray-400 text-sm">
+                        <td colSpan={9} className="py-6 text-center text-gray-400 text-sm">
                           No process flow steps yet — add one below.
                         </td>
                       </tr>

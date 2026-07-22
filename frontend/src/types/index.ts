@@ -58,6 +58,9 @@ export interface SimConfig {
   WORKING_DAYS_1?: number[]
   WORKING_DAYS_2?: number[]
   WORKING_DAYS_3?: number[]
+  BREAKS_1?: { start: number; duration: number }[]
+  BREAKS_2?: { start: number; duration: number }[]
+  BREAKS_3?: { start: number; duration: number }[]
   STATION_DOWNTIME: number
   ACTIVE_PROCESSING_TIME: number
 }

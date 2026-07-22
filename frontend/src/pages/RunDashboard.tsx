@@ -475,11 +475,31 @@ function BottleneckCard({ bottleneck, stats }: { bottleneck: StationStat | null;
 
 // ─── Throughput popup card ────────────────────────────────────────────────────
 
+type ThroughputSort = 'throughput_desc' | 'throughput_asc' | 'name_asc' | 'name_desc'
+
 function ThroughputCard({ value, sub, stats }: { value: string; sub: string; stats: StationStat[] }) {
   const [open, setOpen] = useState(false)
-  const sorted = [...stats].sort((a, b) => b.throughput - a.throughput)
-  const maxTp = sorted[0]?.throughput || 1
+  const [search, setSearch] = useState('')
+  const [sortBy, setSortBy] = useState<ThroughputSort>('throughput_desc')
+
+  // maxTp/total/Top Station always reflect ALL stations regardless of the
+  // search filter below — the summary strip describes the whole run, not
+  // just the currently-filtered view.
+  const byThroughputDesc = [...stats].sort((a, b) => b.throughput - a.throughput)
+  const maxTp = byThroughputDesc[0]?.throughput || 1
   const total = stats.reduce((s, x) => s + x.throughput, 0)
+
+  const filtered = search.trim()
+    ? stats.filter(s => s.station_name.toLowerCase().includes(search.trim().toLowerCase()))
+    : stats
+  const sorted = [...filtered].sort((a, b) => {
+    switch (sortBy) {
+      case 'throughput_asc': return a.throughput - b.throughput
+      case 'name_asc': return a.station_name.localeCompare(b.station_name)
+      case 'name_desc': return b.station_name.localeCompare(a.station_name)
+      default: return b.throughput - a.throughput
+    }
+  })
 
   return (
     <div className="relative h-full">
@@ -534,8 +554,40 @@ function ThroughputCard({ value, sub, stats }: { value: string; sub: string; sta
               </div>
               <div>
                 <p className="text-[10px] text-gray-400 uppercase tracking-widest">Top Station</p>
-                <p className="text-sm font-bold text-blue-600">{sorted[0]?.station_name ?? '—'}</p>
+                <p className="text-sm font-bold text-blue-600">{byThroughputDesc[0]?.station_name ?? '—'}</p>
               </div>
+            </div>
+
+            {/* Search + sort */}
+            <div className="flex items-center gap-2 px-6 py-2.5 border-b border-gray-100">
+              <div className="relative flex-1 max-w-xs">
+                <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-gray-400" />
+                <input
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="Filter by station…"
+                  className="w-full pl-8 pr-3 py-1.5 text-sm text-gray-800 bg-white border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400"
+                />
+              </div>
+              <select
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as ThroughputSort)}
+                className="h-8 text-sm text-gray-700 bg-white border border-gray-200 rounded-lg px-2.5 focus:outline-none focus:ring-2 focus:ring-blue-400"
+              >
+                <option value="throughput_desc">Throughput: high to low</option>
+                <option value="throughput_asc">Throughput: low to high</option>
+                <option value="name_asc">Station: A to Z</option>
+                <option value="name_desc">Station: Z to A</option>
+              </select>
+              {(search.trim() || sortBy !== 'throughput_desc') && (
+                <button
+                  onClick={() => { setSearch(''); setSortBy('throughput_desc') }}
+                  className="h-8 text-sm font-medium px-3 rounded-lg text-gray-400 hover:text-gray-600 transition-colors"
+                >
+                  Clear
+                </button>
+              )}
+              <span className="text-xs text-gray-400 ml-auto">{sorted.length} of {stats.length} stations</span>
             </div>
 
             {/* Column headers */}
@@ -948,6 +1000,18 @@ interface ShiftHours {
 
 type ShiftWorkingDays = Record<1 | 2 | 3, number[]>
 
+interface BreakWindow { start: number; duration: number }
+type ShiftBreaks = Record<1 | 2 | 3, BreakWindow[]>
+
+// Matches backend/parsers/yaml_parser.py's _SIM_CONFIG_DEFAULTS — one
+// default break per shift so a run has a realistic rest/lunch break out of
+// the box, even before the user opens this dialog.
+const DEFAULT_BREAKS: ShiftBreaks = {
+  1: [{ start: 10, duration: 30 }],
+  2: [{ start: 18, duration: 30 }],
+  3: [{ start: 2, duration: 30 }],
+}
+
 /**
  * Editable weekly view of the three shift windows this scenario uses.
  * Each shift has its own independent working-days pattern — no shift is
@@ -957,17 +1021,19 @@ type ShiftWorkingDays = Record<1 | 2 | 3, number[]>
  * 0 ignores this calendar entirely and runs 24/7.
  */
 function ShiftCalendar({
-  hours, onChange, workingDays, onWorkingDaysChange,
+  hours, onChange, workingDays, onWorkingDaysChange, breaks, onBreaksChange,
 }: {
   hours: ShiftHours
   onChange: (patch: Partial<ShiftHours>) => void
   workingDays: ShiftWorkingDays
   onWorkingDaysChange: (shiftNum: 1 | 2 | 3, days: number[]) => void
+  breaks: ShiftBreaks
+  onBreaksChange: (shiftNum: 1 | 2 | 3, windows: BreakWindow[]) => void
 }) {
   const shifts = [
-    { num: 1 as const, label: 'Shift 1', startKey: 'SHIFT_1_START' as const, endKey: 'SHIFT_1_END' as const, color: 'bg-blue-400' },
-    { num: 2 as const, label: 'Shift 2', startKey: 'SHIFT_2_START' as const, endKey: 'SHIFT_2_END' as const, color: 'bg-indigo-400' },
-    { num: 3 as const, label: 'Shift 3', startKey: 'SHIFT_3_START' as const, endKey: 'SHIFT_3_END' as const, color: 'bg-violet-400' },
+    { num: 1 as const, label: 'Shift 1', startKey: 'SHIFT_1_START' as const, endKey: 'SHIFT_1_END' as const, color: 'bg-green-400' },
+    { num: 2 as const, label: 'Shift 2', startKey: 'SHIFT_2_START' as const, endKey: 'SHIFT_2_END' as const, color: 'bg-green-400' },
+    { num: 3 as const, label: 'Shift 3', startKey: 'SHIFT_3_START' as const, endKey: 'SHIFT_3_END' as const, color: 'bg-green-400' },
   ]
 
   const toggleDay = (shiftNum: 1 | 2 | 3, dayIdx: number) => {
@@ -1025,6 +1091,53 @@ function ShiftCalendar({
           ))}
         </div>
 
+        <div className="mt-3 pt-3 border-t border-gray-200 space-y-3">
+          <p className="text-[11px] text-gray-500 font-medium">Breaks (e.g. lunch)</p>
+          {shifts.map(s => (
+            <div key={s.label} className="space-y-1.5">
+              <span className="text-[11px] text-gray-500 font-medium">{s.label}</span>
+              {breaks[s.num].map((bw, bi) => (
+                <div key={bi} className="flex items-center gap-2 pl-2">
+                  <select
+                    value={bw.start}
+                    onChange={e => {
+                      const next = breaks[s.num].map((w, i) => i === bi ? { ...w, start: Number(e.target.value) } : w)
+                      onBreaksChange(s.num, next)
+                    }}
+                    className="h-7 text-xs text-gray-800 bg-white border border-gray-200 rounded-md px-1.5"
+                  >
+                    {HOUR_OPTIONS.map(h => <option key={h} value={h}>{fmtHour(h)}</option>)}
+                  </select>
+                  <span className="text-xs text-gray-400">for</span>
+                  <BreakDurationInput
+                    value={bw.duration}
+                    onCommit={parsed => {
+                      const next = breaks[s.num].map((w, i) => i === bi ? { ...w, duration: parsed } : w)
+                      onBreaksChange(s.num, next)
+                    }}
+                  />
+                  <span className="text-xs text-gray-400">min</span>
+                  <button
+                    type="button"
+                    onClick={() => onBreaksChange(s.num, breaks[s.num].filter((_, i) => i !== bi))}
+                    className="text-gray-300 hover:text-red-500 transition-colors ml-1"
+                    aria-label="Remove break"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              ))}
+              <button
+                type="button"
+                onClick={() => onBreaksChange(s.num, [...breaks[s.num], { start: 12, duration: 30 }])}
+                className="pl-2 text-[11px] font-medium text-blue-600 hover:text-blue-700"
+              >
+                + Add break
+              </button>
+            </div>
+          ))}
+        </div>
+
         <p className="text-[11px] text-gray-400 mt-2.5 leading-relaxed">
           Double-click a day in the calendar to turn that shift on/off for that day — each shift keeps its own
           schedule. A station's own "Shifts/Day" setting decides how many of these it uses — 0 means 24/7,
@@ -1032,6 +1145,33 @@ function ShiftCalendar({
         </p>
       </div>
     </div>
+  )
+}
+
+/**
+ * Break duration input as an uncontrolled-feeling text field: keeps its own
+ * draft string while typing (so backspacing to empty actually works instead
+ * of a controlled numeric value snapping back every keystroke), and only
+ * commits a real number — clamped to >= 1 — on blur.
+ */
+function BreakDurationInput({ value, onCommit }: { value: number; onCommit: (parsed: number) => void }) {
+  const [draft, setDraft] = useState(String(value))
+
+  useEffect(() => { setDraft(String(value)) }, [value])
+
+  return (
+    <input
+      type="number"
+      min={1}
+      value={draft}
+      onChange={e => setDraft(e.target.value)}
+      onBlur={() => {
+        const parsed = Math.max(1, Number(draft) || 1)
+        setDraft(String(parsed))
+        onCommit(parsed)
+      }}
+      className="h-7 w-16 text-xs text-gray-800 bg-white border border-gray-200 rounded-md px-1.5 [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+    />
   )
 }
 
@@ -1057,7 +1197,7 @@ function FragmentRow({
               className={`h-6 rounded-md cursor-pointer select-none transition-colors ${active ? `${color} hover:brightness-95` : 'bg-gray-100 hover:bg-gray-200'}`}
             />
             <span className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-2 whitespace-nowrap rounded-lg bg-white text-gray-700 text-xs font-medium px-3 py-2 shadow-lg border border-gray-100 opacity-0 scale-95 origin-bottom transition-all duration-150 group-hover/cell:opacity-100 group-hover/cell:scale-100 z-30">
-              {active ? `${fmtHour(start)}–${fmtHour(end)}` : 'Off'} · double-click to toggle
+              {active ? `${fmtHour(start)}–${fmtHour(end)}` : 'Off'}
             </span>
           </div>
         )
@@ -1084,6 +1224,11 @@ function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDialogProp
     2: (value.WORKING_DAYS_2 as number[] | undefined) ?? DEFAULT_WORKING_DAYS[2],
     3: (value.WORKING_DAYS_3 as number[] | undefined) ?? DEFAULT_WORKING_DAYS[3],
   })
+  const [breaks, setBreaks] = useState<ShiftBreaks>({
+    1: (value.BREAKS_1 as BreakWindow[] | undefined) ?? DEFAULT_BREAKS[1],
+    2: (value.BREAKS_2 as BreakWindow[] | undefined) ?? DEFAULT_BREAKS[2],
+    3: (value.BREAKS_3 as BreakWindow[] | undefined) ?? DEFAULT_BREAKS[3],
+  })
 
   // Freeze the page behind the dialog — without this, the underlying
   // dashboard's own horizontal/vertical scrollbars stay live and visible
@@ -1107,6 +1252,9 @@ function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDialogProp
       WORKING_DAYS_1: workingDays[1],
       WORKING_DAYS_2: workingDays[2],
       WORKING_DAYS_3: workingDays[3],
+      BREAKS_1: breaks[1],
+      BREAKS_2: breaks[2],
+      BREAKS_3: breaks[3],
     })
     onClose()
   }
@@ -1227,6 +1375,8 @@ function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDialogProp
             onChange={patch => setShiftHours(h => ({ ...h, ...patch }))}
             workingDays={workingDays}
             onWorkingDaysChange={(shiftNum, days) => setWorkingDays(w => ({ ...w, [shiftNum]: days }))}
+            breaks={breaks}
+            onBreaksChange={(shiftNum, windows) => setBreaks(b => ({ ...b, [shiftNum]: windows }))}
           />
 
           {/* Replications */}
