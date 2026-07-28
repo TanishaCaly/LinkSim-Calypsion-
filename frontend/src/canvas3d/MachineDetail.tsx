@@ -61,7 +61,11 @@ export default function MachineDetail({ machine, stationConfig, operators, onClo
             </div>
             <div className="flex justify-between text-sm">
               <span className="text-gray-500">Shifts / Day</span>
-              <span className="font-medium text-gray-900">{stationConfig?.shifts_per_day ?? '—'}</span>
+              <span className="font-medium text-gray-900">
+                {Array.isArray(stationConfig?.shifts_per_day)
+                  ? (stationConfig.shifts_per_day.length ? stationConfig.shifts_per_day.map((n) => `Shift ${n}`).join(', ') : '—')
+                  : stationConfig?.shifts_per_day ?? '—'}
+              </span>
             </div>
             <div className="flex justify-between text-sm">
               <span className="text-gray-500">Failure Rate</span>

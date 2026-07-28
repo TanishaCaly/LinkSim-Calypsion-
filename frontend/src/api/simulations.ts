@@ -6,6 +6,17 @@ export interface SimConfigOverride {
   WARMUP_TIME?: number
   SHIFT_DURATION?: number
   num_replications?: number
+  // ISO datetime string (e.g. "2026-07-25T06:00:00") — the real calendar
+  // date/time the simulation clock starts at. Anchors WORKING_DAYS_n
+  // weekday logic to actual calendar weekdays. Set via the Simulation
+  // Timer button; falls back to the engine's default when unset.
+  SIMULATION_START_DATE?: string
+  // Purely cosmetic display names (e.g. "Morning" instead of "Shift 1"),
+  // sent through as inert extra keys — the engine still keys everything by
+  // shift number (SHIFT_1_START, WORKING_DAYS_1, BREAKS_1, ...) underneath.
+  SHIFT_1_NAME?: string
+  SHIFT_2_NAME?: string
+  SHIFT_3_NAME?: string
   [key: string]: unknown
 }
 

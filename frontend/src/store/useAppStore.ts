@@ -10,6 +10,12 @@ interface AppStore {
   activeRun: RunDetail | null
   setActiveRun: (r: RunDetail | null) => void
 
+  // Set by the Run Dashboard's Reset button; tells Canvas's View Flow to show
+  // a blank Build canvas instead of the real scenario's stations, until the
+  // user actually triggers a fresh run (which clears it again).
+  justReset: boolean
+  setJustReset: (v: boolean) => void
+
   // Polling interval ID
   pollingId: ReturnType<typeof setInterval> | null
   setPollingId: (id: ReturnType<typeof setInterval> | null) => void
@@ -42,6 +48,9 @@ export const useAppStore = create<AppStore>((set) => ({
 
   activeRun: null,
   setActiveRun: (r) => set({ activeRun: r }),
+
+  justReset: false,
+  setJustReset: (v) => set({ justReset: v }),
 
   pollingId: null,
   setPollingId: (id) => set({ pollingId: id }),

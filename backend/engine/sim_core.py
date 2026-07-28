@@ -326,13 +326,30 @@ class ManufacturingSimulation:
     # SimPy execution
     # ------------------------------------------------------------------
 
+    def _resolve_start_date(self) -> datetime:
+        """
+        The real calendar date/time the simulation clock starts at (env.now=0
+        maps to this). Anchors weekday-of-week logic (WORKING_DAYS_n) to real
+        weekdays — e.g. so "Monday" in the shift calendar lines up with an
+        actual Monday once a user picks a start date via the Simulation Timer.
+        Falls back to the engine's original fixed default when unset, so
+        scenarios saved before this field existed behave exactly as before.
+        """
+        raw = self.sim_config.get("SIMULATION_START_DATE")
+        if raw:
+            try:
+                return datetime.fromisoformat(str(raw))
+            except ValueError:
+                logger.warning("Invalid SIMULATION_START_DATE %r — using default.", raw)
+        return datetime(2025, 1, 1, 6, 0, 0)
+
     def _reset_state(self):
         self.env = simpy.Environment()
         self.job_log = {}
         self.completion_log = {}
         self.bottleneck_store = {}
         self.simulation_state = {
-            "start_date": datetime(2025, 1, 1, 6, 0, 0),
+            "start_date": self._resolve_start_date(),
             "total_simulated_time": 0,
             "completed_jobs": 0,
             "in_progress_jobs": 0,
@@ -730,7 +747,7 @@ class ManufacturingSimulation:
         variant_type: str,
         operation: str,
         num_operators: int,
-        shifts_per_day: int,
+        shifts_per_day: Any,
         duration: float,
         on_machine_acquired: Optional[Callable[[], None]] = None,
     ):
@@ -1082,7 +1099,7 @@ class ManufacturingSimulation:
 
         # Completion log
         total_shift_min = (
-            self.stations_data[resource_name]["shifts_per_day"]
+            len(SimulationUtils.active_shift_set(self.stations_data[resource_name]["shifts_per_day"]))
             * self.sim_config.get("SHIFT_DURATION", 480)
         )
         pcts = self._calc_pcts(
@@ -1373,7 +1390,7 @@ class ManufacturingSimulation:
         self,
         variant_name: str,
         station: str,
-        shifts_per_day: int,
+        shifts_per_day: Any,
         event: str,
         start: float,
         end: float,

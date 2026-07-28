@@ -47,6 +47,7 @@ interface FlowNodeData {
   machineCount?: number   // total parallel machines for this station
   utilization?: number
   jobs?: number
+  stationType?: string
 }
 
 function FlowNode({ data, selected }: { data: FlowNodeData; selected: boolean }) {
@@ -54,6 +55,14 @@ function FlowNode({ data, selected }: { data: FlowNodeData; selected: boolean })
   const hasUtil = data.utilization !== undefined
   const border = selected ? '#3b82f6' : utilBorder(u)
   const topColor = utilColor(u)
+  // Station type gets its own labeled header band (below), kept fully
+  // separate from utilization health (which owns the border/thin
+  // stripe/progress-bar colors) — a named band reads unambiguously
+  // regardless of how similar two type colors might look as a small swatch.
+  // baseStationName strips a " #2" parallel-machine suffix before inferring,
+  // since that suffix isn't part of the station's name.
+  const inferredType = inferStationType(baseStationName(data.resource), data.stationType)
+  const typeHex = STATION_TYPE_HEX[inferredType] || DEFAULT_STATION_HEX
 
   return (
     <div
@@ -62,7 +71,16 @@ function FlowNode({ data, selected }: { data: FlowNodeData; selected: boolean })
     >
       <Handle type="target" position={Position.Left} style={{ background: '#94a3b8', width: 8, height: 8 }} />
 
-      {/* Top colour stripe */}
+      {/* Station type header band — colored bar with the type spelled out,
+          e.g. "ASSEMBLY" in green, "INSPECTION" in purple. */}
+      <div
+        className="text-[9px] font-bold text-white text-center uppercase tracking-wider py-1"
+        style={{ background: typeHex }}
+      >
+        {inferredType}
+      </div>
+
+      {/* Utilization health stripe — separate signal, separate bar */}
       <div style={{ height: 4, background: topColor }} />
 
       <div className="px-4 py-3">
@@ -115,12 +133,57 @@ function FlowNode({ data, selected }: { data: FlowNodeData; selected: boolean })
 
 // ─── BUILD MODE node ──────────────────────────────────────────────────────────
 
+// Station-type color coding — matches the shop-floor convention the user
+// specified (Station=green, Buffer/Queue=brown, Assembly=pink), with
+// Inspection/Packaging kept as they were (purple/orange). "Buffer" is a
+// queue/buffer-like station (name contains "Queue"), not a real Object
+// Palette item — inferred purely from naming, same as the others below.
+// Falls back to green (plain Station) for legacy nodes with no stationType
+// set and no recognizable keyword.
+const STATION_TYPE_COLORS: Record<string, { border: string; dot: string; handle: string }> = {
+  Station:    { border: 'border-green-400',  dot: 'bg-green-500',  handle: '!bg-green-400' },
+  Buffer:     { border: 'border-amber-700',  dot: 'bg-amber-700',  handle: '!bg-amber-700' },
+  Assembly:   { border: 'border-pink-400',   dot: 'bg-pink-500',   handle: '!bg-pink-400' },
+  Inspection: { border: 'border-purple-400', dot: 'bg-purple-500', handle: '!bg-purple-400' },
+  Packaging:  { border: 'border-orange-400', dot: 'bg-orange-500', handle: '!bg-orange-400' },
+}
+const DEFAULT_STATION_COLOR = STATION_TYPE_COLORS.Station
+
+// Same station-type color coding as hex values, for contexts that can't use
+// Tailwind classes directly (e.g. React Flow's MiniMap nodeColor prop).
+const STATION_TYPE_HEX: Record<string, string> = {
+  Station: '#22c55e', Buffer: '#b45309', Assembly: '#ec4899', Inspection: '#a855f7', Packaging: '#fb923c',
+}
+const DEFAULT_STATION_HEX = STATION_TYPE_HEX.Station
+
+/**
+ * Infer a station's palette type for color-coding when stationType isn't
+ * set — which is EVERY station in a scenario imported from Excel/YAML,
+ * since 'Station Type' is a Canvas-only concept never written by the
+ * parsers. Falls back to keyword-matching the station's name, the same
+ * pattern already used for isAssembly below, extended to Buffer/Inspection/
+ * Packaging too. Defaults to 'Station' (the common case — a plain
+ * processing station) when no special keyword matches, rather than an
+ * "unknown" color, since that's what almost every unmatched name actually is.
+ */
+function inferStationType(label: string, stationType?: string): string {
+  if (stationType) return stationType
+  const name = label.toLowerCase()
+  if (name.startsWith('assembly')) return 'Assembly'
+  if (/queue|buffer/.test(name)) return 'Buffer'
+  if (/(inspect|^qa|_qa|^vt|_vt|^rt|_rt|quality)/.test(name)) return 'Inspection'
+  if (/(pack|dispatch)/.test(name)) return 'Packaging'
+  return 'Station'
+}
+
 function StationNode({ data, selected }: { data: StationNodeData; selected: boolean }) {
+  const inferredType = inferStationType(data.label, data.stationType)
+  const colors = (inferredType && STATION_TYPE_COLORS[inferredType]) || DEFAULT_STATION_COLOR
   return (
-    <div className={`px-4 py-3 bg-white rounded-lg border-2 min-w-[140px] shadow-sm transition-colors ${selected ? 'border-blue-500' : 'border-gray-200'}`}>
-      <Handle type="target" position={Position.Left} className="!bg-blue-400" />
+    <div className={`px-4 py-3 bg-white rounded-lg border-2 min-w-[140px] shadow-sm transition-colors ${selected ? 'border-blue-500' : colors.border}`}>
+      <Handle type="target" position={Position.Left} className={colors.handle} />
       <div className="flex items-center gap-2 mb-1">
-        <div className="w-2 h-2 rounded-full bg-blue-500" />
+        <div className={`w-2 h-2 rounded-full ${colors.dot}`} />
         <span className="text-sm font-semibold text-gray-900">{data.label}</span>
       </div>
       <div className="text-xs text-gray-400 space-y-0.5">
@@ -128,7 +191,7 @@ function StationNode({ data, selected }: { data: StationNodeData; selected: bool
         <div>Cycle time: {data.cycleTime}m</div>
         <div>Operators: {data.operators}</div>
       </div>
-      <Handle type="source" position={Position.Right} className="!bg-blue-400" />
+      <Handle type="source" position={Position.Right} className={colors.handle} />
     </div>
   )
 }
@@ -158,10 +221,45 @@ function EndpointNode({ data }: { data: { label: string; kind: 'entry' | 'exit' 
 
 const nodeTypes: NodeTypes = { station: StationNode, flow: FlowNode, endpoint: EndpointNode }
 
+// A plain number input bound straight to node.data re-derives its displayed
+// value from `String(node.data[key])` on every render — so the moment a user
+// clears the field to type a new value, onChange saw "" and bailed out (to
+// avoid writing NaN), but the input then immediately snapped back to the old
+// number since the underlying data never changed. This keeps its own local
+// text draft so the field can sit empty while typing, only writing a parsed
+// number back once it's valid, and re-syncing from node.data when a
+// genuinely different node is selected.
+function NumericField({ value, onCommit, className }: { value: number; onCommit: (n: number) => void; className?: string }) {
+  const [draft, setDraft] = useState(String(value))
+
+  useEffect(() => { setDraft(String(value)) }, [value])
+
+  return (
+    <Input
+      type="number"
+      value={draft}
+      onChange={(e) => {
+        const raw = e.target.value
+        setDraft(raw)
+        if (raw === '') return
+        const parsed = Number(raw)
+        if (Number.isNaN(parsed)) return
+        onCommit(parsed)
+      }}
+      onBlur={() => {
+        // Left empty or mid-typing an invalid value when focus leaves —
+        // fall back to the last committed value instead of leaving it blank.
+        if (draft === '' || Number.isNaN(Number(draft))) setDraft(String(value))
+      }}
+      className={className}
+    />
+  )
+}
+
 // ─── Property editor ─────────────────────────────────────────────────────────
 
 function PropertyEditor({
-  node, nodes, edges, onChange, onDelete, onSaveStation, onAddParallel,
+  node, nodes, edges, onChange, onDelete, onSaveStation, onAddParallel, numShifts, shiftNames,
 }: {
   node: Node<StationNodeData>
   nodes: Node<StationNodeData>[]
@@ -170,6 +268,8 @@ function PropertyEditor({
   onDelete: (id: string) => void
   onSaveStation: () => void
   onAddParallel: (id: string) => void
+  numShifts: number
+  shiftNames: Record<number, string | undefined>
 }) {
   const fields = [
     { key: 'label',     label: 'Name',            type: 'text'   },
@@ -244,27 +344,64 @@ function PropertyEditor({
             <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
               {label}
             </label>
-            <Input
-              type={type}
-              value={String(node.data[key as keyof StationNodeData])}
-              onChange={(e) => {
-                const raw = e.target.value
-                if (type === 'number') {
-                  // FIX: guard against NaN from an empty field or a partial
-                  // value like "12." — previously this would write NaN into
-                  // node data and render the literal string "NaN" in the input.
-                  if (raw === '') return
-                  const parsed = Number(raw)
-                  if (Number.isNaN(parsed)) return
-                  onChange(node.id, { [key]: parsed })
-                } else {
-                  onChange(node.id, { [key]: raw })
-                }
-              }}
-              className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
-            />
+            {type === 'number' ? (
+              <NumericField
+                value={Number(node.data[key as keyof StationNodeData])}
+                onCommit={(n) => onChange(node.id, { [key]: n })}
+                className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+              />
+            ) : (
+              <Input
+                type={type}
+                value={String(node.data[key as keyof StationNodeData])}
+                onChange={(e) => onChange(node.id, { [key]: e.target.value })}
+                className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+              />
+            )}
           </div>
         ))}
+
+        {/* Shift availability — any combination of the day's shifts (1, 2, 3)
+            this station actually runs on, e.g. shift 2+3 while skipping
+            shift 1. Feeds shifts_per_day, which the engine reads directly
+            when deciding if the station is active. Names shown come from
+            the scenario's simulation_config (SHIFT_n_NAME) — renamed from
+            Simulation Config's Shift Calendar, not editable here. */}
+        <div>
+          <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+            Shift Available
+          </label>
+          <div className="grid gap-1.5" style={{ gridTemplateColumns: `repeat(${numShifts}, 1fr)` }}>
+            {Array.from({ length: numShifts }, (_, i) => i + 1).map((shiftNum) => {
+              const selected = node.data.shiftsPerDay ?? [1]
+              const active = selected.includes(shiftNum)
+              const label = shiftNames[shiftNum]?.trim() || `Shift ${shiftNum}`
+              return (
+                <button
+                  key={shiftNum}
+                  type="button"
+                  title={label}
+                  onClick={() => {
+                    const next = active
+                      ? selected.filter((n) => n !== shiftNum)
+                      : [...selected, shiftNum]
+                    onChange(node.id, { shiftsPerDay: next.sort() })
+                  }}
+                  className={`h-8 rounded-lg text-xs font-semibold transition-colors select-none truncate px-1 ${
+                    active
+                      ? 'bg-green-400 text-white hover:brightness-95'
+                      : 'bg-gray-100 text-gray-400 hover:bg-gray-200'
+                  }`}
+                >
+                  {label}
+                </button>
+              )
+            })}
+          </div>
+          {(node.data.shiftsPerDay ?? [1]).length === 0 && (
+            <p className="text-[10px] text-amber-500 mt-1">No shift selected — station will never be active.</p>
+          )}
+        </div>
 
         {/* Assembly count — only relevant on stations built from the
             Assembly palette item: how many input sub-parts combine into
@@ -275,17 +412,9 @@ function PropertyEditor({
             <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
               Number of Assemblies
             </label>
-            <Input
-              type="number"
-              min={1}
-              value={String(node.data.assemblyCount ?? 1)}
-              onChange={(e) => {
-                const raw = e.target.value
-                if (raw === '') return
-                const parsed = Number(raw)
-                if (Number.isNaN(parsed)) return
-                onChange(node.id, { assemblyCount: parsed })
-              }}
+            <NumericField
+              value={node.data.assemblyCount ?? 1}
+              onCommit={(n) => onChange(node.id, { assemblyCount: n })}
               className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
             />
             <p className="text-[10px] text-gray-400 mt-1">Sub-parts required to produce one assembled unit.</p>
@@ -305,17 +434,9 @@ function PropertyEditor({
                 {sourceBases.map((src) => (
                   <div key={src} className="flex items-center gap-2">
                     <span className="text-[11px] text-gray-500 flex-1 truncate">{src}</span>
-                    <Input
-                      type="number"
-                      min={0}
-                      value={String(assemblyInputs[src] ?? 1)}
-                      onChange={(e) => {
-                        const raw = e.target.value
-                        if (raw === '') return
-                        const parsed = Number(raw)
-                        if (Number.isNaN(parsed)) return
-                        onChange(node.id, { assemblyInputs: { ...assemblyInputs, [src]: parsed } })
-                      }}
+                    <NumericField
+                      value={assemblyInputs[src] ?? 1}
+                      onCommit={(n) => onChange(node.id, { assemblyInputs: { ...assemblyInputs, [src]: n } })}
                       className="h-7 w-16 text-xs rounded-lg border-gray-200 bg-gray-50 focus:bg-white"
                     />
                   </div>
@@ -461,11 +582,17 @@ function buildFlowGraph(
   processflow: Record<string, { operation: string; resource: string | { mode: string; options: string[] }; duration: number }[]>,
   variant: string,
   stationStats: Record<string, { utilization: number; jobs: number }>,
-  stationsData: Record<string, { capacity?: number }> = {},
+  stationsData: Record<string, { capacity?: number; 'Station Type'?: string }> = {},
 ): { nodes: Node<FlowNodeData>[]; edges: Edge[] } {
   const steps = processflow[variant] ?? []
-  const COL_GAP = 220
-  const ROW_GAP = 120     // vertical spacing between parallel machines
+  // Card width easily exceeds 160px once the operation name, resource name,
+  // and "∥ parallel" badge are laid out (min-w-[160px] is just a floor) —
+  // 220 was tighter than the rendered card, so adjacent columns visually
+  // overlapped. Same for ROW_GAP vs. actual card height (header band + util
+  // stripe + two text rows + divider + progress bar comfortably exceeds
+  // 120px), which overlapped stacked parallel-machine rows.
+  const COL_GAP = 260
+  const ROW_GAP = 160     // vertical spacing between parallel machines
 
   const nodes: Node<FlowNodeData>[] = []
   // stepNodeIds[i] = list of node ids in column i (one per parallel machine,
@@ -508,6 +635,7 @@ function buildFlowGraph(
             // per-machine util isn't available; show the station's overall util on each
             utilization: stat?.utilization,
             jobs: stat?.jobs,
+            stationType: stationsData[resourceName]?.['Station Type'],
           },
         })
         rowCursor += 1
@@ -597,8 +725,11 @@ function buildEditableGraph(
   stationsData: Record<string, StationConfig>,
 ): { nodes: Node<StationNodeData>[]; edges: Edge[] } {
   const steps = processflow[variant] ?? []
-  const COL_GAP = 220
-  const ROW_GAP = 120
+  // Matches the widened gaps in buildFlowGraph (View mode) — the same
+  // column/row math is used here so Build and View lay out identically,
+  // and 220/120 was too tight for cards once resource names get long.
+  const COL_GAP = 260
+  const ROW_GAP = 140
 
   const nodes: Node<StationNodeData>[] = []
   const stepNodeIds: string[][] = []
@@ -629,6 +760,7 @@ function buildEditableGraph(
             capacity,
             cycleTime: step.duration,
             operators: cfg?.operator_per_station ?? 1,
+            shiftsPerDay: normalizeShiftsPerDay(cfg?.shifts_per_day),
             assemblyCount: cfg?.['Assembly Count'],
             assemblyInputs: cfg?.['Assembly Inputs'],
           },
@@ -681,13 +813,35 @@ function baseStationName(label: string): string {
   return label.replace(/\s+#\d+$/, '')
 }
 
+/**
+ * Normalize a station's `shifts_per_day` into an explicit list of active
+ * shift numbers. Accepts the legacy count form (a plain number N meaning
+ * "shifts 1..N", e.g. 2 -> [1, 2]) or an already-explicit list (e.g. [2, 3]
+ * — not capped at 3, since a scenario can define more shifts via "+ Add
+ * shift" in Simulation Config).
+ */
+function normalizeShiftsPerDay(value: number | number[] | undefined): number[] {
+  if (Array.isArray(value)) return value.filter((n) => Number.isInteger(n) && n >= 1)
+  const n = value ?? 1
+  return Array.from({ length: Math.max(0, n) }, (_, i) => i + 1)
+}
+
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function Canvas() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const { activeScenario, activeRun, setActiveScenario, showToast } = useAppStore()
+  const { activeScenario: storedScenario, activeRun, setActiveScenario, showToast, justReset, setJustReset } = useAppStore()
   const isDark = useAppStore(s => s.theme) === 'dark'
+
+  // After the Run Dashboard's Reset button, View Flow should show a blank
+  // Build canvas instead of the real scenario's stations — but /run itself
+  // still needs the real scenario selected (for its own 0-0 KPI cards), so
+  // this can't just be "activeScenario is null". justReset is a separate
+  // flag for exactly that: treat the scenario as absent here only, until the
+  // user actually starts building (touches Build mode) or a fresh run
+  // happens elsewhere, either of which clears it again.
+  const activeScenario = justReset ? null : storedScenario
 
   // Memoized so React Flow always sees the same object reference across renders/HMR —
   // an unstable nodeTypes reference makes React Flow re-init internally on every
@@ -697,6 +851,15 @@ export default function Canvas() {
 
   // Mode: 'view' shows scenario flow; 'build' is free-canvas builder
   const [mode, setMode] = useState<'view' | 'build'>(activeScenario ? 'view' : 'build')
+
+  // Force Build mode the moment justReset flips on (e.g. user was already
+  // sitting on View Flow when they hit Reset on /run in another tab/earlier
+  // navigation) — the useState initializer above only runs once at mount,
+  // so without this a component that was already mounted in 'view' would
+  // keep showing the View toggle rather than snapping to the blank canvas.
+  useEffect(() => {
+    if (justReset) setMode('build')
+  }, [justReset])
   // Within View mode: '2d' is the existing ReactFlow diagram, '3d' is the new Scene
   const [viewMode, setViewMode] = useState<'3d' | '2d'>('3d')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
@@ -909,7 +1072,7 @@ export default function Canvas() {
           id: `station_${id}`,
           type: 'station',
           position: { x: nds.length > 0 ? rightmostX + 220 : 80, y: avgY },
-          data: { label, stationType: label, capacity: 1, cycleTime: 30, operators: 1 },
+          data: { label, stationType: label, capacity: 1, cycleTime: 30, operators: 1, shiftsPerDay: [1] },
         },
       ]
     })
@@ -925,6 +1088,20 @@ export default function Canvas() {
     setEdges((eds) => eds.filter((e) => e.source !== id && e.target !== id))
     setSelectedNode(null)
   }
+
+  // How many shifts/day this scenario defines — derived from the highest
+  // SHIFT_n_START key present in simulation_config, same logic as the
+  // backend's SimulationUtils.num_shifts, so "+ Add shift" in Simulation
+  // Config (which just adds another SHIFT_n_START/END pair) is immediately
+  // reflected here as an extra toggle button, not capped at 3.
+  const simCfgRaw = (activeScenario?.simulation_config as Record<string, unknown> | undefined) ?? {}
+  let numShifts = 3
+  for (let i = 4; simCfgRaw[`SHIFT_${i}_START`] != null; i++) numShifts = i
+  // Display-only — renaming happens in Simulation Config's Shift Calendar,
+  // not here; this just reflects whatever SHIFT_n_NAME is currently saved.
+  const shiftNames: Record<number, string | undefined> = Object.fromEntries(
+    Array.from({ length: numShifts }, (_, i) => i + 1).map((n) => [n, simCfgRaw[`SHIFT_${n}_NAME`] as string | undefined])
+  )
 
   /** Add another parallel machine for this station: duplicates the box, renames
    *  both to "Name #1" / "Name #2" (etc.), and wires the copy to the same
@@ -1000,7 +1177,7 @@ export default function Canvas() {
       nodes.forEach((n) => {
         const base = baseStationName(n.data.label)
         stationsData[base] = {
-          capacity: capacityCount[base], shifts_per_day: 1,
+          capacity: capacityCount[base], shifts_per_day: n.data.shiftsPerDay ?? [1],
           operator_per_station: n.data.operators,
           ...(n.data.stationType !== undefined ? { 'Station Type': n.data.stationType } : {}),
           ...(n.data.assemblyCount !== undefined ? { 'Assembly Count': n.data.assemblyCount } : {}),
@@ -1092,6 +1269,7 @@ export default function Canvas() {
     onSuccess: (scenario) => {
       queryClient.invalidateQueries({ queryKey: ['scenarios'] })
       setActiveScenario(scenario)
+      setJustReset(false)
       showToast(`"${scenario.name}" saved`)
       navigate('/run')
     },
@@ -1426,7 +1604,14 @@ export default function Canvas() {
               >
                 <Background color={isDark ? '#334155' : undefined} />
                 <Controls />
-                <MiniMap nodeColor="#3b82f6" maskColor={isDark ? 'rgba(15,23,42,0.7)' : 'rgba(240,244,255,0.7)'} />
+                <MiniMap
+                  nodeColor={(n) => {
+                    const d = n.data as StationNodeData
+                    const inferred = inferStationType(d.label, d.stationType)
+                    return (inferred && STATION_TYPE_HEX[inferred]) || DEFAULT_STATION_HEX
+                  }}
+                  maskColor={isDark ? 'rgba(15,23,42,0.7)' : 'rgba(240,244,255,0.7)'}
+                />
               </ReactFlow>
             )}
           </div>
@@ -1672,6 +1857,8 @@ export default function Canvas() {
                 onDelete={deleteNode}
                 onSaveStation={() => { setSelectedNode(null); showToast('Station saved') }}
                 onAddParallel={addParallelMachine}
+                numShifts={numShifts}
+                shiftNames={shiftNames}
               />
             </div>
           )}

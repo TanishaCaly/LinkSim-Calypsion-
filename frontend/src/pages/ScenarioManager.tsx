@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { Plus, Upload, Trash2, Play, FileText, Clock, Eye, X, Save, PlusCircle } from 'lucide-react'
@@ -32,6 +32,87 @@ function formatStepResource(resource: unknown): string {
     return `${options} (${r.mode ?? 'routing'})`
   }
   return ''
+}
+
+/**
+ * Estimated steady-state availability (%) for a station, derived from its
+ * Failure Rate (daily failure probability, 0-1) and Repair Time (minutes),
+ * via availability = MTBF / (MTBF + MTTR). Display-only — doesn't change
+ * which shifts the station actually runs on (that's the separate
+ * shifts_per_day field, edited in the Canvas station panel), just estimates
+ * how much of its scheduled time it's likely to be up given random
+ * breakdowns, matching how the engine's Machine class already models
+ * failures (see backend/engine/formulas.py daily_failure_rate_to_per_minute).
+ */
+function estimateAvailabilityPct(failureRate: number | undefined, repairTime: number | undefined): number {
+  const rate = failureRate ?? 0
+  const mttr = repairTime ?? 0
+  if (rate <= 0) return 100
+  const mtbf = 1440 / rate // minutes between failures, from a daily failure probability
+  if (mttr <= 0) return 100
+  return (mtbf / (mtbf + mttr)) * 100
+}
+
+/**
+ * Inverse of estimateAvailabilityPct: given a target availability % and the
+ * station's current Repair Time, solves for the daily Failure Rate (0-1)
+ * that would produce it, so editing % here writes back a consistent value.
+ */
+function availabilityPctToFailureRate(pct: number, repairTime: number | undefined): number {
+  const mttr = repairTime ?? 0
+  const clamped = Math.max(0.01, Math.min(100, pct))
+  if (clamped >= 100 || mttr <= 0) return 0
+  const mtbf = mttr * (clamped / (100 - clamped))
+  return 1440 / mtbf
+}
+
+/**
+ * The Station Availability (%) cell binds straight to
+ * estimateAvailabilityPct(Failure rate, Repair Time) recomputed on every
+ * render — so typing a new value round-trips through
+ * availabilityPctToFailureRate and back through estimateAvailabilityPct,
+ * which doesn't perfectly invert (floating point + the 0.01 floor on
+ * Failure rate) and drifts the displayed number away from what was typed.
+ * Worse, clearing the field to type a fresh value saw "" and had nowhere to
+ * go but snap back to the recomputed number, making it look like the digit
+ * couldn't be deleted. This keeps its own local text draft while typing —
+ * committing (and inverting to Failure Rate) only once the value looks like
+ * a real number — and only re-syncs from the computed % when the station
+ * actually changes underneath it, not on every recompute of this same value.
+ */
+function AvailabilityPctField({
+  value, onCommit, stationKey,
+}: { value: number; onCommit: (pct: number) => void; stationKey: string }) {
+  const [draft, setDraft] = useState(String(value))
+  const lastKey = useRef(stationKey)
+
+  if (lastKey.current !== stationKey) {
+    lastKey.current = stationKey
+    if (draft !== String(value)) setDraft(String(value))
+  }
+
+  return (
+    <Input
+      type="number"
+      min={0}
+      max={100}
+      step={0.01}
+      value={draft}
+      onChange={(e) => {
+        const raw = e.target.value
+        setDraft(raw)
+        if (raw === '') return
+        const parsed = Number(raw)
+        if (Number.isNaN(parsed)) return
+        onCommit(parsed)
+      }}
+      onBlur={() => {
+        if (draft === '' || Number.isNaN(Number(draft))) setDraft(String(value))
+      }}
+      title="Editable — writes back to this station's Failure Rate (holding Repair Time fixed)"
+      className="h-8 text-sm w-24 pr-5"
+    />
+  )
 }
 
 function UploadDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
@@ -624,7 +705,7 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-gray-100">
-                  {['Station', 'Capacity', 'Shifts/Day', 'Operators', 'Failure Rate', 'Buffer Quantity', 'Buffer X', 'Buffer Y', 'Buffer Z', 'No. of Buffers', 'Buffer Order', 'PM Schedule', 'Rework %', 'Material Shortage %', ''].map(h => (
+                  {['Station', 'Capacity', 'Shifts/Day', 'Operators', 'Failure Rate (%)', 'Buffer Quantity', 'Buffer X', 'Buffer Y', 'Buffer Z', 'No. of Buffers', 'Buffer Order', 'PM Schedule', 'Rework %', 'Material Shortage %', ''].map(h => (
                     <th key={h} className="text-left text-[10px] font-bold text-gray-400 uppercase tracking-widest pb-3 pr-4 whitespace-nowrap">{h}</th>
                   ))}
                 </tr>
@@ -653,7 +734,24 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                       <td className="py-1.5 pr-4">{num('capacity')}</td>
                       <td className="py-1.5 pr-4">{num('shifts_per_day')}</td>
                       <td className="py-1.5 pr-4">{num('operator_per_station')}</td>
-                      <td className="py-1.5 pr-4">{num('Failure rate')}</td>
+                      <td className="py-1.5 pr-4">
+                        {/* Stored/sent to the engine as a 0-1 daily failure
+                            probability (backend/engine/machine.py requires
+                            0 <= failure_rate <= 1), but shown/typed here as a
+                            0-100 percentage since that's what "5% failure
+                            rate" actually means to a user. */}
+                        <div className="relative w-24">
+                          <Input
+                            type="number"
+                            min={0}
+                            max={100}
+                            value={Math.round(((cfg['Failure rate'] ?? 0) as number) * 1000) / 10}
+                            onChange={(e) => updateStationField(i, 'Failure rate', Math.max(0, Math.min(100, Number(e.target.value))) / 100)}
+                            className="h-8 text-sm w-24 pr-5"
+                          />
+                          <span className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-gray-400 pointer-events-none">%</span>
+                        </div>
+                      </td>
                       <td className="py-1.5 pr-4">{num('Buffer Capacity')}</td>
                       <td className="py-1.5 pr-4">{num('Buffer Width')}</td>
                       <td className="py-1.5 pr-4">{num('Buffer Depth')}</td>
@@ -843,7 +941,7 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-gray-100">
-                      {['Variant', 'Operation', 'Station / Resource', 'Exit Controller (branching)', 'Duration (min)', 'Station Availability (Shifts/Day)', 'Repair Time', 'Setup Time', ''].map(h => (
+                      {['Variant', 'Operation', 'Station / Resource', 'Exit Controller (branching)', 'Duration (min)', 'Station Availability (%)', 'Repair Time', 'Setup Time', ''].map(h => (
                         <th key={h} className="text-left text-[10px] font-bold text-gray-400 uppercase tracking-widest pb-3 pr-4 whitespace-nowrap">{h}</th>
                       ))}
                     </tr>
@@ -996,7 +1094,24 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                             className="h-8 text-sm w-24"
                           />
                         </td>
-                        <td className="py-1.5 pr-4">{stationNum('shifts_per_day')}</td>
+                        <td className="py-1.5 pr-4">
+                          {stationCfg ? (
+                            <div className="relative w-24">
+                              <AvailabilityPctField
+                                stationKey={row.resource}
+                                value={Math.round(estimateAvailabilityPct(stationCfg['Failure rate'], stationCfg['Repair Time']) * 100) / 100}
+                                onCommit={(pct) => updateStationField(
+                                  stationIdx,
+                                  'Failure rate',
+                                  availabilityPctToFailureRate(pct, stationCfg['Repair Time']),
+                                )}
+                              />
+                              <span className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-gray-400 pointer-events-none">%</span>
+                            </div>
+                          ) : (
+                            <span className="text-gray-300 text-xs">—</span>
+                          )}
+                        </td>
                         <td className="py-1.5 pr-4">{stationNum('Repair Time')}</td>
                         <td className="py-1.5 pr-4">{stationNum('Setup time')}</td>
                         <td className="py-1.5 pr-4">
@@ -1309,7 +1424,7 @@ export default function ScenarioManager() {
   const [viewScenario, setViewScenario] = useState<Scenario | null>(null)
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const { setActiveScenario, setActiveRun, showToast } = useAppStore()
+  const { setActiveScenario, setActiveRun, showToast, setJustReset } = useAppStore()
 
   const handleViewFile = async (id: number) => {
     try {
@@ -1337,6 +1452,7 @@ export default function ScenarioManager() {
   const handleSelect = async (id: number) => {
     const full = await scenariosApi.get(id)
     setActiveScenario(full)
+    setJustReset(false)
     navigate('/run')
   }
 
@@ -1362,7 +1478,7 @@ export default function ScenarioManager() {
               Import
             </Button>
             <Button
-              onClick={() => { setActiveScenario(null); setActiveRun(null); navigate('/canvas') }}
+              onClick={() => { setActiveScenario(null); setActiveRun(null); setJustReset(false); navigate('/canvas') }}
               className="bg-blue-600 hover:bg-blue-700 text-white shadow-md hover:shadow-blue-200 hover:shadow-lg transition-all rounded-full px-5"
             >
               <Plus className="h-4 w-4 mr-2" />

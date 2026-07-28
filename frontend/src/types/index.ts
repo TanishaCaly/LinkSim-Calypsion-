@@ -2,7 +2,10 @@
 
 export interface StationConfig {
   capacity: number
-  shifts_per_day: number
+  // Legacy count (1/2/3, meaning "shifts 1..N") from the Stations tab, OR an
+  // explicit list of active shift numbers (e.g. [2, 3]) from the Canvas
+  // Build panel's per-station shift picker — the engine accepts both.
+  shifts_per_day: number | number[]
   operator_per_station: number
   'Station Type'?: string
   'Assembly Count'?: number
@@ -61,6 +64,11 @@ export interface SimConfig {
   BREAKS_1?: { start: number; duration: number }[]
   BREAKS_2?: { start: number; duration: number }[]
   BREAKS_3?: { start: number; duration: number }[]
+  // Cosmetic display names (e.g. "Morning" instead of "Shift 1") — inert to
+  // the engine, just shown wherever a shift's name appears in the UI.
+  SHIFT_1_NAME?: string
+  SHIFT_2_NAME?: string
+  SHIFT_3_NAME?: string
   STATION_DOWNTIME: number
   ACTIVE_PROCESSING_TIME: number
 }
@@ -208,6 +216,9 @@ export interface StationNodeData {
   capacity: number
   cycleTime: number
   operators: number
+  // Which of the day's shifts (1, 2, 3) this station runs on — any
+  // combination, not just a contiguous count (e.g. [2, 3] to skip shift 1).
+  shiftsPerDay?: number[]
   assemblyCount?: number
   // "Assembly type/table" — quantity of each upstream station's output needed
   // to produce one assembled unit here, keyed by the upstream station's base name.
