@@ -1056,6 +1056,74 @@ function shiftEntriesToConfig(shifts: ShiftEntry[]): Partial<SimConfigOverride> 
 }
 
 /**
+ * Two shift-hour windows as (start, end) hour-of-day pairs, where end <= start
+ * means the shift wraps past midnight (e.g. 22-6). Every window is expressed
+ * as its "today" AND "tomorrow" occurrence on a 0-48 timeline — a plain
+ * same-day shift (e.g. 2-4) still needs its tomorrow occurrence (26-28) to
+ * correctly detect overlap against a wrapping shift that spills into the
+ * next calendar day (e.g. 22-6, whose today-occurrence is 22-30). Returns
+ * true if the two windows share ANY overlapping time.
+ */
+function hourWindowsOverlap(aStart: number, aEnd: number, bStart: number, bEnd: number): boolean {
+  const toIntervals = (start: number, end: number): [number, number][] => {
+    const todayEnd = end <= start ? end + 24 : end
+    return [[start, todayEnd], [start + 24, todayEnd + 24]]
+  }
+  const as = toIntervals(aStart, aEnd)
+  const bs = toIntervals(bStart, bEnd)
+  return as.some(([as1, ae1]) => bs.some(([bs1, be1]) => as1 < be1 && bs1 < ae1))
+}
+
+/**
+ * Warnings for the Shift Calendar — non-blocking (Apply/Save always works
+ * regardless; see the "warning only" decision this mirrors from elsewhere in
+ * the app, e.g. Source/Drain). Flags two real misconfigurations:
+ *
+ *   1. Two shifts overlapping in time on a day both are actually active —
+ *      e.g. Shift 1 6am-2pm and Shift 4 8am-4pm both running Monday means
+ *      the same hours are double-covered, almost certainly not intended.
+ *   2. A break scheduled outside its OWN shift's hours — it would never
+ *      actually happen, since the engine only checks breaks while that
+ *      shift is active.
+ *
+ * Does not flag: shifts with no active days (a valid way to temporarily
+ * disable a shift), or days with zero shifts active (a valid off day).
+ */
+function shiftCalendarWarnings(shifts: ShiftEntry[]): string[] {
+  const warnings: string[] = []
+  const dayLabel = (d: number) => CALENDAR_DAYS[d] ?? `Day ${d}`
+  const shiftLabel = (s: ShiftEntry) => s.name.trim() || `Shift ${s.num}`
+
+  for (let i = 0; i < shifts.length; i++) {
+    for (let j = i + 1; j < shifts.length; j++) {
+      const a = shifts[i]
+      const b = shifts[j]
+      if (!hourWindowsOverlap(a.start, a.end, b.start, b.end)) continue
+      const sharedDays = a.workingDays.filter((d) => b.workingDays.includes(d))
+      if (sharedDays.length === 0) continue
+      warnings.push(
+        `${shiftLabel(a)} (${fmtHour(a.start)}–${fmtHour(a.end)}) overlaps ${shiftLabel(b)} ` +
+        `(${fmtHour(b.start)}–${fmtHour(b.end)}) on ${sharedDays.map(dayLabel).join(', ')}`
+      )
+    }
+  }
+
+  for (const s of shifts) {
+    for (const bw of s.breaks) {
+      const breakEnd = bw.start + bw.duration / 60
+      if (!hourWindowsOverlap(s.start, s.end, bw.start, breakEnd)) {
+        warnings.push(
+          `${shiftLabel(s)}'s break at ${fmtHour(bw.start)} falls outside its own ` +
+          `${fmtHour(s.start)}–${fmtHour(s.end)} hours — it will never actually occur`
+        )
+      }
+    }
+  }
+
+  return warnings
+}
+
+/**
  * Editable weekly view of however many shifts this scenario uses (3 by
  * default, more via "+ Add shift"). Each shift has its own independent
  * working-days pattern — no shift is special-cased to always run every day.
@@ -1845,6 +1913,11 @@ function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDialogProp
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open])
 
+  // Non-blocking — Apply always works regardless of these. Just flags
+  // overlapping shift hours and breaks scheduled outside their own shift's
+  // hours, both real (if easy to make) configuration mistakes.
+  const calendarWarnings = useMemo(() => shiftCalendarWarnings(shifts), [shifts])
+
   const updateShift = (num: number, patch: Partial<ShiftEntry>) => {
     setShifts(prev => prev.map(s => s.num === num ? { ...s, ...patch } : s))
   }
@@ -1968,6 +2041,20 @@ function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDialogProp
             onAddShift={addShift}
             onRemoveShift={removeShift}
           />
+
+          {/* Non-blocking — flags overlapping shift hours and breaks
+              scheduled outside their own shift's hours. Save/Apply still
+              works either way; this is just a heads-up. */}
+          {calendarWarnings.length > 0 && (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 space-y-1.5">
+              {calendarWarnings.map((w, i) => (
+                <p key={i} className="text-xs text-amber-700 flex items-start gap-1.5">
+                  <span className="shrink-0">⚠</span>
+                  <span>{w}</span>
+                </p>
+              ))}
+            </div>
+          )}
 
           {/* Replications */}
           <div>
@@ -2961,7 +3048,7 @@ type Tab = 'kpis' | 'gantt' | 'jobtrace'
 
 export default function RunDashboard() {
   const navigate = useNavigate()
-  const { activeScenario, activeRun, setActiveRun, setActiveScenario, showToast, setJustReset } = useAppStore()
+  const { activeScenario, activeRun, setActiveRun, setActiveScenario, showToast, justReset, setJustReset } = useAppStore()
   const [displayRun, setDisplayRun] = useState<RunDetail | null>(activeRun)
   const [tab, setTab] = useState<Tab>('kpis')
   const [ganttExpanded, setGanttExpanded] = useState(false)
@@ -3001,7 +3088,16 @@ export default function RunDashboard() {
   // Whenever the active scenario changes, load THAT scenario's own latest run
   // (or clear the display entirely if it has none) — otherwise the previously
   // viewed scenario's run stays on screen after switching scenarios.
+  //
+  // Skipped while justReset is set: this effect also re-fires on every fresh
+  // mount of this page (not just on an actual scenario switch), since
+  // activeScenario?.id is unchanged but the component itself is new — e.g.
+  // navigating to View Flow and back to /run. Without this guard, Reset's
+  // cleared KPIs would silently get re-populated a few seconds later once
+  // this effect's fetch of "the scenario's latest run" resolved, since Reset
+  // doesn't delete anything server-side — it only clears local state.
   useEffect(() => {
+    if (justReset) return
     if (!activeScenario) { setDisplayRun(null); setActiveRun(null); return }
     let cancelled = false
     simulationsApi.listRuns(activeScenario.id).then((runs) => {
@@ -3018,7 +3114,7 @@ export default function RunDashboard() {
     })
     return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeScenario?.id])
+  }, [activeScenario?.id, justReset])
 
   const [progress, setProgress] = useState<{ pct: number; msg: string; simTimeNow?: number; simTimeTotal?: number } | null>(null)
   const [historyCollapsed, setHistoryCollapsed] = useState(false)
@@ -3370,62 +3466,74 @@ export default function RunDashboard() {
             </Card>
           )}
 
-          {/* KPI cards always render, even with no run selected — Reset (and
-              the initial empty state) shows every card at its zeroed value
-              (0 jobs, 0.0000 /hr, 0.0 days, 0%, etc.) instead of hiding the
-              whole grid, since the user wants Reset to visibly show "0-0"
-              here rather than an empty placeholder. */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3 auto-rows-fr">
-            <CompletedJobsCard completed={completedJobs} inProgress={inProgressJobs} stats={stats} />
-            <ThroughputCard value={`${throughput} /hr`} sub="jobs per hour" stats={stats} />
-            <SimDurationCard simDays={simDays} simTime={simTime} simCfg={simCfg} />
-            <PeakUtilCard peakUtil={peakUtil} bottleneck={bottleneck} stats={stats} />
-          </div>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6 auto-rows-fr">
-            <AvgUtilCard avgUtil={avgUtil} stats={stats} />
-            <BottleneckCard bottleneck={bottleneck} stats={stats} />
-            <AtRiskCard count={atRisk} stats={stats} />
-            <TotalFailuresCard total={totalFailures} rework={totalRework} stats={stats} />
-          </div>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6 auto-rows-fr">
-            <AvgSetupCard stats={stats} />
-            <AvgBufferBlockedCard stats={stats} />
-          </div>
+          {/* Status + tabs — back in its original spot above the KPI cards.
+              Hidden (not the KPI cards below) when there's no run selected
+              (initial empty state, or right after Reset), since there's no
+              run to show a status badge for. */}
+          {displayRun && (
+            <div className="no-print flex items-center justify-between mb-5">
+              <div className="flex items-center gap-3">
+                <StatusBadge status={displayRun.status} />
+                {displayRun.status === 'completed' && <CheckCircle className="h-4 w-4 text-green-500" />}
+                {displayRun.status === 'failed' && <AlertTriangle className="h-4 w-4 text-red-500" />}
+                <span className="text-sm text-gray-400">Run #{displayRun.id}</span>
+              </div>
+              {displayRun.status === 'completed' && (
+                <div className="flex rounded-lg border border-gray-200 overflow-hidden">
+                  <button
+                    onClick={() => setTab('kpis')}
+                    className={`px-4 py-1.5 text-sm font-medium transition-colors ${tab === 'kpis' ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}
+                  >
+                    <Layers className="h-3.5 w-3.5 inline mr-1" />KPIs
+                  </button>
+                  <button
+                    onClick={() => setTab('gantt')}
+                    className={`px-4 py-1.5 text-sm font-medium transition-colors ${tab === 'gantt' ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}
+                  >
+                    <CalendarDays className="h-3.5 w-3.5 inline mr-1" />Timeline
+                  </button>
+                  <button
+                    onClick={() => setTab('jobtrace')}
+                    className={`px-4 py-1.5 text-sm font-medium transition-colors ${tab === 'jobtrace' ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}
+                  >
+                    <List className="h-3.5 w-3.5 inline mr-1" />Job Trace
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* KPI cards — shown on the KPIs tab, same as before the tabs
+              existed, so selecting Timeline/Job Trace replaces them entirely
+              instead of leaving them visible above that panel. The one
+              exception is when there's no run at all (Reset, or the initial
+              empty state): the tabs themselves are hidden then (see the
+              status/tabs row above), so there's no "Timeline tab selected"
+              to conflict with — show the zeroed 0-0 cards regardless of
+              `tab`, rather than a blank area with nothing in it. */}
+          {(!displayRun || tab === 'kpis') && (
+            <>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3 auto-rows-fr">
+                <CompletedJobsCard completed={completedJobs} inProgress={inProgressJobs} stats={stats} />
+                <ThroughputCard value={`${throughput} /hr`} sub="jobs per hour" stats={stats} />
+                <SimDurationCard simDays={simDays} simTime={simTime} simCfg={simCfg} />
+                <PeakUtilCard peakUtil={peakUtil} bottleneck={bottleneck} stats={stats} />
+              </div>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6 auto-rows-fr">
+                <AvgUtilCard avgUtil={avgUtil} stats={stats} />
+                <BottleneckCard bottleneck={bottleneck} stats={stats} />
+                <AtRiskCard count={atRisk} stats={stats} />
+                <TotalFailuresCard total={totalFailures} rework={totalRework} stats={stats} />
+              </div>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6 auto-rows-fr">
+                <AvgSetupCard stats={stats} />
+                <AvgBufferBlockedCard stats={stats} />
+              </div>
+            </>
+          )}
 
           {displayRun && (
             <div className="relative">
-              {/* Status + tabs */}
-              <div className="no-print flex items-center justify-between mb-5">
-                <div className="flex items-center gap-3">
-                  <StatusBadge status={displayRun.status} />
-                  {displayRun.status === 'completed' && <CheckCircle className="h-4 w-4 text-green-500" />}
-                  {displayRun.status === 'failed' && <AlertTriangle className="h-4 w-4 text-red-500" />}
-                  <span className="text-sm text-gray-400">Run #{displayRun.id}</span>
-                </div>
-                {displayRun.status === 'completed' && (
-                  <div className="flex rounded-lg border border-gray-200 overflow-hidden">
-                    <button
-                      onClick={() => setTab('kpis')}
-                      className={`px-4 py-1.5 text-sm font-medium transition-colors ${tab === 'kpis' ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}
-                    >
-                      <Layers className="h-3.5 w-3.5 inline mr-1" />KPIs
-                    </button>
-                    <button
-                      onClick={() => setTab('gantt')}
-                      className={`px-4 py-1.5 text-sm font-medium transition-colors ${tab === 'gantt' ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}
-                    >
-                      <CalendarDays className="h-3.5 w-3.5 inline mr-1" />Timeline
-                    </button>
-                    <button
-                      onClick={() => setTab('jobtrace')}
-                      className={`px-4 py-1.5 text-sm font-medium transition-colors ${tab === 'jobtrace' ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}
-                    >
-                      <List className="h-3.5 w-3.5 inline mr-1" />Job Trace
-                    </button>
-                  </div>
-                )}
-              </div>
-
               {displayRun.status === 'failed' && (
                 <Card className="mb-5 border-red-200 bg-red-50">
                   <CardContent className="pt-4 pb-4 text-sm text-red-700">

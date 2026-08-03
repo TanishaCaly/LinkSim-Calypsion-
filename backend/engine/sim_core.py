@@ -35,6 +35,63 @@ logger = logging.getLogger("linksim.engine")
 # never terminate.
 MAX_SIM_TIME = 525_600.0
 
+# ── Station types with non-machine behaviour ─────────────────────────────────
+# Most stations are real processing machines: they hold a job for its cycle
+# time, occupy an operator, can break down, need setup on changeover, and can
+# require rework. A few Object Palette types are NOT machines and must not be
+# modelled as one:
+#
+#   Connector — a pure routing junction. A job passes straight through with
+#               zero delay: no capacity contention, no operator, no failure,
+#               no setup, no rework. Used only to shape the flow graph.
+#   Conveyor  — material transport. A job takes a transport time to traverse
+#               it, but a belt is not a single-server machine: many units ride
+#               it at once (so effectively unlimited concurrent capacity), it
+#               consumes no operator, and it has no changeover or rework.
+#
+# Read from stations_data[name]["Station Type"], which the Canvas writes when
+# a scenario is saved. Absent (every Excel/YAML-imported scenario, and any
+# scenario saved before these types existed) → treated as a normal machine,
+# so existing scenarios behave exactly as before.
+STATION_TYPE_CONNECTOR = "Connector"
+STATION_TYPE_CONVEYOR = "Conveyor"
+
+# Stand-in for "unbounded" concurrency on a conveyor. A real belt has no
+# meaningful server count, but SimPy resources need a finite capacity, so use
+# a number no realistic job count will reach. Deliberately not float('inf'):
+# SimPy requires an int capacity, and utilization maths multiplies by it.
+CONVEYOR_CAPACITY = 1_000_000
+
+
+def _station_type(station: Dict[str, Any]) -> str:
+    """Normalised "Station Type" for a stations_data entry ("" when unset)."""
+    return str(station.get("Station Type") or "").strip()
+
+
+def _is_passthrough(station: Dict[str, Any]) -> bool:
+    """True for Connector — a zero-time routing junction, not a work station."""
+    return _station_type(station) == STATION_TYPE_CONNECTOR
+
+
+def _is_conveyor(station: Dict[str, Any]) -> bool:
+    """True for Conveyor — transport delay, no operator, unbounded capacity."""
+    return _station_type(station) == STATION_TYPE_CONVEYOR
+
+
+def _transport_time(station: Dict[str, Any], fallback: float) -> float:
+    """
+    A conveyor's traverse time. Prefers the explicit "Transport Time" field
+    the Canvas writes for Conveyor stations; falls back to the process-flow
+    step's own duration when unset, so a conveyor added before that field
+    existed still moves jobs in a sensible amount of time rather than zero.
+    """
+    raw = station.get("Transport Time")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return fallback
+    return value if value > 0 else fallback
+
 
 def _format_job_id(variant_type: str, variant_id: int) -> str:
     """
@@ -509,15 +566,24 @@ class ManufacturingSimulation:
     def _init_resources(self) -> Dict[str, Machine]:
         resources = {}
         for name, station in self.stations_data.items():
+            # Conveyors and Connectors are not machines: they never break down
+            # and have no preventive maintenance. Passing simulation_time=None
+            # suppresses Machine's failure/PM background processes entirely
+            # (see machine.py) instead of relying on a 0 failure rate, which
+            # would still spawn and run both processes for the whole horizon.
+            is_transport = _is_conveyor(station) or _is_passthrough(station)
+            # A belt carries many units at once, so it must not serialise jobs
+            # the way a single-server machine does.
+            capacity = CONVEYOR_CAPACITY if _is_conveyor(station) else station.get("capacity", 1)
             resources[name] = Machine(
                 env=self.env,
                 name=name,
-                failure_rate=station.get("Failure rate", 0),
+                failure_rate=0 if is_transport else station.get("Failure rate", 0),
                 repair_time=station.get("Repair Time", 10),
-                pm_schedule=station.get("PM Schedule"),
-                capacity=station.get("capacity", 1),
+                pm_schedule=None if is_transport else station.get("PM Schedule"),
+                capacity=capacity,
                 job_log=self.job_log,
-                simulation_time=self.sim_config["SIM_TIME"],
+                simulation_time=None if is_transport else self.sim_config["SIM_TIME"],
             )
         return resources
 
@@ -639,6 +705,21 @@ class ManufacturingSimulation:
             durations = step.get("durations")
             release_cb = pending_rack_release
             pending_rack_release = None
+
+            # A Connector is a routing junction, not a work station: the job
+            # passes straight through with no delay, no machine contention and
+            # no operator. Handled here rather than inside _perform_operation
+            # so none of that function's machine machinery (capacity request,
+            # setup, downtime, rework, busy_time accounting) runs at all. The
+            # job still gets a trace entry so it doesn't look like a dropped
+            # step in the Job Trace, and any rack slot held for this step is
+            # released immediately since nothing is ever waiting here.
+            if _is_passthrough(self.stations_data[resource_name]):
+                if release_cb is not None:
+                    release_cb()
+                self._log_passthrough(resource_name, variant_id, variant_type, step.get("operation", ""))
+                continue
+
             try:
                 if isinstance(durations, list):
                     for i, duration in enumerate(durations):
@@ -736,6 +817,58 @@ class ManufacturingSimulation:
         )
         self.simulation_state["job_count"] = self.simulation_state["completed_jobs"]
 
+    def _log_passthrough(
+        self, resource_name: str, variant_id: int, variant_type: str, operation: str
+    ) -> None:
+        """
+        Record a job's instant traversal of a Connector.
+
+        No time passes and no resource is held, so there is nothing to measure
+        — but the job trace should still show the job reaching this point,
+        otherwise a Connector in the middle of a flow looks like a step where
+        jobs silently vanish. Every duration field is zero and the station is
+        credited a completed job so per-station counts stay consistent with the
+        number of jobs that actually routed through it.
+        """
+        now_real = self.simulation_state["start_date"] + timedelta(minutes=self.env.now)
+        stamp = now_real.strftime("%Y-%m-%d %H:%M:%S")
+
+        station = self.stations_data[resource_name]
+        station.setdefault("job_counts", {"waiting": 0, "processing": 0, "completed": 0})
+        station["job_counts"]["completed"] += 1
+        station["last_job_end_time"] = self.env.now
+        if self.env.now >= self.sim_config.get("WARMUP_TIME", 0):
+            station["completed_jobs_per_station"] = (
+                station.get("completed_jobs_per_station", 0) + 1
+            )
+
+        self.completion_log.setdefault(resource_name, []).append({
+            "job_id": _format_job_id(variant_type, variant_id),
+            "station_name": resource_name,
+            "status": "Completed",
+            "Completed_jobs": station.get("completed_jobs_per_station", 0),
+            "Blocked Time": 0.0,
+            "Waiting Time": 0.0,
+            "Processing Time": 0.0,
+            "process_start_time_real": stamp,
+            "process_end_time_real": stamp,
+            "station_downtime": 0.0,
+            "pause_time": 0.0,
+            "operators_downtime": 0.0,
+            "total_rework_time": 0.0,
+            "total_setup_time": 0.0,
+            "material_unavailability": 0.0,
+            "delay_reason": "No delay",
+        })
+
+        variant_name = f"{variant_type} {variant_id}"
+        self.simulation_state["current_jobs"][variant_name] = f"Completed at {resource_name}"
+        self.simulation_state["job_exit_times"][variant_name] = self.env.now
+        logger.debug(
+            "Connector '%s': %s#%s passed through instantly (op '%s')",
+            resource_name, variant_type, variant_id, operation,
+        )
+
     # ------------------------------------------------------------------
     # Operation execution (core logic from ManufacturingSimulation._perform_operation)
     # ------------------------------------------------------------------
@@ -752,12 +885,25 @@ class ManufacturingSimulation:
         on_machine_acquired: Optional[Callable[[], None]] = None,
     ):
         resource = self.resources[resource_name]
+        station_cfg = self.stations_data[resource_name]
+        # A Conveyor transports rather than processes: the job rides it for a
+        # transport time, but no operator is consumed (a belt runs itself) and
+        # there is no changeover or rework, since nothing is being worked on.
+        # Its unbounded capacity is set up in _init_resources.
+        is_conveyor = _is_conveyor(station_cfg)
         # A station with 0 assigned operators is machine-only / a queue-buffer:
         # it must NOT gate on operator availability (#7). Keep the raw count so
         # we can branch on it, but use >=1 for the cycle-time division.
-        has_operators = bool(num_operators)
+        has_operators = bool(num_operators) and not is_conveyor
         num_operators = num_operators or 1
-        adjusted_ct = duration / num_operators
+        if is_conveyor:
+            # Transport time is wall-clock travel along the belt — it is not
+            # work split between operators, so it must NOT be divided by the
+            # operator count the way a machine's cycle time is.
+            adjusted_ct = _transport_time(station_cfg, duration)
+            num_operators = 1
+        else:
+            adjusted_ct = duration / num_operators
         # Per-station shift schedule (honours the station's own shift windows;
         # falls back to the global config when the station defines none).
         shift_cfg = self._station_shift_cfg.get(resource_name, self.sim_config)
@@ -791,7 +937,9 @@ class ManufacturingSimulation:
         total_pause = 0.0
         total_setup = 0.0
         material_unavail = 0.0
-        station_downtime_budget = self.sim_config.get("STATION_DOWNTIME", 0)
+        # The global STATION_DOWNTIME allowance models machine unavailability;
+        # a conveyor is not a machine, so it is never charged this.
+        station_downtime_budget = 0 if is_conveyor else self.sim_config.get("STATION_DOWNTIME", 0)
 
         block_start = self.env.now
         # Pre-register this job's trace entry as "Waiting" BEFORE requesting
@@ -858,8 +1006,10 @@ class ManufacturingSimulation:
             # "changeover on type change" model) — same variant back-to-back
             # incurs zero setup time. Runs while still holding the resource,
             # shift-aware, before cycle time starts.
+            # A conveyor has no tooling to change over — a different variant
+            # simply rides the same belt, so setup is always skipped for it.
             last_variant = self.stations_data[resource_name].get("last_variant_type")
-            setup_time = self._setup_time_for(resource_name, last_variant, variant_type)
+            setup_time = 0 if is_conveyor else self._setup_time_for(resource_name, last_variant, variant_type)
             if setup_time > 0 and variant_type != last_variant:
                 setup_time_remaining = setup_time
                 su_start = self.env.now
@@ -945,8 +1095,11 @@ class ManufacturingSimulation:
                                     )
                                     total_operator_dt += op_dt_added
 
-                        # Material shortage
-                        shortage = SimulationUtils.check_material_shortage(self.stations_data, resource_name)
+                        # Material shortage — a conveyor consumes no material,
+                        # it only moves what is already on it.
+                        shortage = 0 if is_conveyor else SimulationUtils.check_material_shortage(
+                            self.stations_data, resource_name
+                        )
                         if shortage > 0:
                             ms_start = self.env.now
                             yield self.env.timeout(min(shortage, available))
@@ -1019,13 +1172,15 @@ class ManufacturingSimulation:
                 return
 
             # --- Rework ---
+            # Nothing is machined on a conveyor, so there is no defect to
+            # rework — transport never produces scrap.
             current_shift = SimulationUtils.get_active_shift(
                 self.env, self.simulation_state, shift_cfg, shifts_per_day
             )
             operator = SimulationUtils.operator_available(
                 self.stations_data, self.operators_data, resource_name, current_shift
             )
-            rework_time = SimulationUtils.check_rework(
+            rework_time = 0 if is_conveyor else SimulationUtils.check_rework(
                 self.stations_data, resource_name, adjusted_ct, operator
             )
             if rework_time > 0:

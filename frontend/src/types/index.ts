@@ -8,6 +8,9 @@ export interface StationConfig {
   shifts_per_day: number | number[]
   operator_per_station: number
   'Station Type'?: string
+  // Conveyor only — minutes to traverse the belt. The engine uses this instead
+  // of the process-flow step's duration for Conveyor stations.
+  'Transport Time'?: number
   'Assembly Count'?: number
   'Assembly Inputs'?: Record<string, number>
   'Failure rate': number
@@ -25,6 +28,23 @@ export interface StationConfig {
   shift1: string
   shift2: string
   shift3: string
+  // Per-station override of which weekdays a given shift number runs on for
+  // THIS station only (Python weekday numbering: Monday=0 ... Sunday=6).
+  // Absent/undefined falls back to the scenario's global Shift Calendar
+  // (WORKING_DAYS_n in simulation_config) for that shift number — set only
+  // when a station's own calendar genuinely differs from every other
+  // station using the same shift number. A 4th+ shift's override lives at
+  // the same `workingDays{n}` key, covered by the index signature below.
+  workingDays1?: number[]
+  workingDays2?: number[]
+  workingDays3?: number[]
+  // Per-station override of a shift's break windows (e.g. lunch), same
+  // override-or-fall-back-to-global pattern as workingDaysN above. A 4th+
+  // shift's override lives at the same `breaks{n}` key, covered by the
+  // index signature below.
+  breaks1?: { start: number; duration: number }[]
+  breaks2?: { start: number; duration: number }[]
+  breaks3?: { start: number; duration: number }[]
   STATION_DOWNTIME: number
   [key: string]: unknown
 }
@@ -219,7 +239,29 @@ export interface StationNodeData {
   // Which of the day's shifts (1, 2, 3) this station runs on — any
   // combination, not just a contiguous count (e.g. [2, 3] to skip shift 1).
   shiftsPerDay?: number[]
+  // Per-shift-number override of which weekdays THIS station runs that
+  // shift on (Monday=0 ... Sunday=6), keyed by shift number. Absent for a
+  // given shift number falls back to the scenario's global Shift Calendar
+  // for that shift — this only holds entries where a station's own
+  // calendar genuinely differs from the global one.
+  workingDaysByShift?: Record<number, number[]>
+  // Per-shift-number override of THIS station's start/end hour for that
+  // shift (e.g. { 1: { start: 8, end: 16 } } for an 8am-4pm Shift 1),
+  // independent of the scenario's global Shift Calendar hours for that
+  // shift number. Absent for a given shift number falls back to the global
+  // hours.
+  shiftHoursByShift?: Record<number, { start: number; end: number }>
+  // Per-shift-number override of THIS station's break windows for that
+  // shift, independent of the scenario's global breaks for that shift
+  // number. Absent for a given shift number falls back to the global
+  // breaks; an explicit empty array means "no breaks for this station on
+  // this shift", not "unset".
+  breaksByShift?: Record<number, { start: number; duration: number }[]>
   assemblyCount?: number
+  // Minutes for a unit to travel the length of a Conveyor. Used instead of
+  // cycleTime for Conveyor stations, since transport is wall-clock travel
+  // time rather than work that operators share.
+  transportTime?: number
   // "Assembly type/table" — quantity of each upstream station's output needed
   // to produce one assembled unit here, keyed by the upstream station's base name.
   assemblyInputs?: Record<string, number>

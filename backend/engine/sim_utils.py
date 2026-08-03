@@ -94,19 +94,36 @@ class SimulationUtils:
     @staticmethod
     def build_station_shift_config(base_config: dict, station_data: dict) -> dict:
         """
-        Return a copy of base_config with SHIFT_n_START / SHIFT_n_END overridden
-        by the station's own shiftN time-windows where present (any number of
-        shifts, not just 1-3).
+        Return a copy of base_config with SHIFT_n_START/SHIFT_n_END,
+        WORKING_DAYS_n, and BREAKS_n overridden by the station's own
+        per-shift settings where present (any number of shifts, not just 1-3).
 
-        This lets each station honour its own shift schedule instead of the
-        global default. Stations that don't define a given shift window keep the
-        global value, so behaviour is unchanged when station windows are absent.
+        This lets each station honour its own shift hours, weekly working-days
+        calendar, AND break windows instead of the global default — e.g. one
+        station running Shift 1 6am-2pm with no break while another runs
+        Shift 1 8am-4pm with a lunch break, despite both using "Shift 1".
+        Stations that don't define a given override keep the global value, so
+        behaviour is unchanged for every station that doesn't set one (every
+        Excel/YAML-imported scenario, and any station saved before these
+        fields existed).
+
+        The returned dict is genuinely PER-STATION — sim_core.py builds one
+        of these per station name at init and uses it (not the global
+        sim_config) everywhere a shift-active/working-day/break check
+        happens, so this override reaches every one of those checks
+        automatically.
         """
         cfg = dict(base_config)
         for i in range(1, SimulationUtils.num_shifts(base_config) + 1):
             window = SimulationUtils.parse_shift_window(station_data.get(f"shift{i}"))
             if window:
                 cfg[f"SHIFT_{i}_START"], cfg[f"SHIFT_{i}_END"] = window
+            working_days = station_data.get(f"workingDays{i}")
+            if working_days:
+                cfg[f"WORKING_DAYS_{i}"] = list(working_days)
+            station_breaks = station_data.get(f"breaks{i}")
+            if station_breaks is not None:
+                cfg[f"BREAKS_{i}"] = list(station_breaks)
         return cfg
 
     @staticmethod

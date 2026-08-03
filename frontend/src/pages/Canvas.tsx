@@ -8,7 +8,9 @@ import ReactFlow, {
 import 'reactflow/dist/style.css'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { Save, Plus, Trash2, Settings, Eye, Edit3, Play, ChevronLeft, ChevronRight, Box, Layout as LayoutIcon } from 'lucide-react'
+import {
+  Save, Plus, Trash2, Settings, Eye, Edit3, Play, ChevronLeft, ChevronRight, Box, Layout as LayoutIcon, X,
+} from 'lucide-react'
 import { scenariosApi } from '@/api/scenarios'
 import { useAppStore } from '@/store/useAppStore'
 import { Button } from '@/components/ui/button'
@@ -19,6 +21,232 @@ import { Badge } from '@/components/ui/badge'
 import Scene from '@/canvas3d/Scene'
 import { buildScene3D } from '@/canvas3d/layout'
 import type { StationNodeData, ScenarioCreate, StationConfig } from '@/types'
+
+// ─── Detailed Object Palette icons ───────────────────────────────────────────
+//
+// Closely mirrors the reference render set: a boxy machine housing with a
+// glass front over a colored part, a status-light stub on top, and a small
+// control panel with red/green indicator dots + a drawer handle along the
+// bottom — shared across every "machine" type (Station, Parallel Station,
+// Assembly, Dismantle, Inspection, Packaging), differentiated by the shape
+// inside the glass (a stamped block, a claw, a drill bit, a magnifier, a
+// tape line). Robot, Conveyor, Buffer, Connector and Movable Part are
+// distinct enough in the reference to get their own bespoke shape entirely
+// rather than reusing the housing. `color` (a hex from STATION_TYPE_HEX)
+// only tints the accent part inside the glass — the housing itself stays a
+// neutral light gray/teal to match the reference across all types.
+function shade(hex: string, amount: number): string {
+  const n = parseInt(hex.slice(1), 16)
+  const r = Math.max(0, Math.min(255, (n >> 16) + amount))
+  const g = Math.max(0, Math.min(255, ((n >> 8) & 0xff) + amount))
+  const b = Math.max(0, Math.min(255, (n & 0xff) + amount))
+  return `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)}`
+}
+
+const HOUSING = '#e2e8f0'
+const HOUSING_SHADE = '#cbd5e1'
+const GLASS = '#334155'
+const GLASS_FLOOR = '#475569'
+const CONVEYOR_DARK = '#27303f'
+const CONVEYOR_ROLLER = '#94a3b8'
+
+/** Roller-conveyor legs flanking a machine housing, or standalone. */
+function ConveyorSide({ x }: { x: number }) {
+  return (
+    <g transform={`translate(${x},0)`}>
+      <rect x="0" y="34" width="16" height="12" rx="2" fill={CONVEYOR_DARK} />
+      {[2, 5.5, 9, 12.5].map((rx) => (
+        <rect key={rx} x={rx} y="36" width="2" height="8" rx="1" fill={CONVEYOR_ROLLER} />
+      ))}
+      <rect x="2" y="46" width="3" height="8" fill="#94a3b8" />
+      <rect x="11" y="46" width="3" height="8" fill="#94a3b8" />
+    </g>
+  )
+}
+
+/** The status-light stub on top of every machine housing (green=Source cue by default, tinted per type). */
+function StatusLight({ color }: { color: string }) {
+  return (
+    <g>
+      <rect x="27" y="2" width="10" height="6" rx="2" fill="#1e293b" />
+      <ellipse cx="32" cy="3" rx="5" ry="2.5" fill={color} />
+    </g>
+  )
+}
+
+/** Shared housing: body, glass window, floor, control panel with two indicator dots + a drawer handle. */
+function MachineHousing({ children, statusColor }: { children?: React.ReactNode; statusColor: string }) {
+  return (
+    <g>
+      <ConveyorSide x={0} />
+      <ConveyorSide x={32} />
+      <StatusLight color={statusColor} />
+      {/* Housing body */}
+      <rect x="12" y="8" width="40" height="46" rx="3" fill={HOUSING} />
+      <rect x="12" y="8" width="40" height="46" rx="3" fill="none" stroke={HOUSING_SHADE} strokeWidth="1" />
+      {/* Glass window */}
+      <rect x="17" y="14" width="30" height="24" rx="1.5" fill={GLASS} />
+      <rect x="17" y="32" width="30" height="6" fill={GLASS_FLOOR} />
+      {children}
+      {/* Control panel */}
+      <circle cx="20" cy="47" r="2" fill="#4ade80" />
+      <circle cx="27" cy="47" r="2" fill="#f87171" />
+      <rect x="38" y="44.5" width="8" height="5" rx="1" fill="#f59e0b" />
+    </g>
+  )
+}
+
+function IsoIcon({ type, color }: { type: string; color: string }) {
+  return (
+    <svg viewBox="0 0 64 64" width="100%" height="100%" className="shrink-0">
+      {ISO_ICON_BODY[type] ? ISO_ICON_BODY[type](color) : <MachineHousing statusColor={color} />}
+    </svg>
+  )
+}
+
+const ISO_ICON_BODY: Record<string, (color: string) => React.ReactNode> = {
+  Source: (color) => (
+    <MachineHousing statusColor="#4ade80">
+      {/* stamped block sitting on the glass floor */}
+      <rect x="25" y="24" width="14" height="9" rx="1.5" fill={color} />
+      <rect x="25" y="24" width="14" height="3" rx="1" fill={shade(color, 40)} />
+    </MachineHousing>
+  ),
+  Drain: (color) => (
+    <MachineHousing statusColor="#f87171">
+      <rect x="25" y="24" width="14" height="9" rx="1.5" fill={color} />
+      <rect x="25" y="24" width="14" height="3" rx="1" fill={shade(color, 40)} />
+    </MachineHousing>
+  ),
+  Station: (color) => (
+    <MachineHousing statusColor={color}>
+      {/* a stubby press/stamp tool over the block */}
+      <rect x="30" y="16" width="4" height="8" fill="#64748b" />
+      <polygon points="26,24 38,24 35,30 29,30" fill={shade(color, -10)} />
+      <rect x="27" y="30" width="10" height="6" rx="1" fill={color} />
+    </MachineHousing>
+  ),
+  'Parallel Station': (color) => (
+    <g>
+      <g transform="translate(-13,0) scale(0.85)"><MachineHousing statusColor={color}>
+        <rect x="30" y="16" width="4" height="8" fill="#64748b" />
+        <polygon points="26,24 38,24 35,30 29,30" fill={shade(color, -10)} />
+        <rect x="27" y="30" width="10" height="6" rx="1" fill={color} />
+      </MachineHousing></g>
+      <g transform="translate(13,0) scale(0.85)"><MachineHousing statusColor={color}>
+        <rect x="30" y="16" width="4" height="8" fill="#64748b" />
+        <polygon points="26,24 38,24 35,30 29,30" fill={shade(color, -10)} />
+        <rect x="27" y="30" width="10" height="6" rx="1" fill={color} />
+      </MachineHousing></g>
+    </g>
+  ),
+  Assembly: (color) => (
+    <MachineHousing statusColor={color}>
+      {/* small claw/gripper arm over the block */}
+      <rect x="30" y="16" width="3" height="6" fill="#64748b" />
+      <path d="M27 22 Q32 20 37 22 L35 26 Q32 24.5 29 26 Z" fill="#94a3b8" />
+      <rect x="27" y="28" width="10" height="6" rx="1" fill={color} />
+      <rect x="27" y="28" width="10" height="2" fill={shade(color, 40)} />
+    </MachineHousing>
+  ),
+  Dismantle: (color) => (
+    <MachineHousing statusColor={color}>
+      {/* a drill/press bit, thinner than Station's stamp, splitting the block */}
+      <rect x="31" y="15" width="2" height="10" fill="#64748b" />
+      <polygon points="29,25 35,25 32,30" fill="#94a3b8" />
+      <rect x="27" y="30" width="4.5" height="6" rx="1" fill={color} />
+      <rect x="32.5" y="30" width="4.5" height="6" rx="1" fill={shade(color, -25)} />
+    </MachineHousing>
+  ),
+  Inspection: (color) => (
+    <MachineHousing statusColor={color}>
+      <rect x="26" y="24" width="12" height="8" rx="1.5" fill={color} />
+      <circle cx="35" cy="21" r="4" fill="none" stroke="#e2e8f0" strokeWidth="1.6" />
+      <line x1="37.8" y1="23.8" x2="40" y2="26" stroke="#e2e8f0" strokeWidth="1.8" strokeLinecap="round" />
+    </MachineHousing>
+  ),
+  Packaging: (color) => (
+    <MachineHousing statusColor={color}>
+      <rect x="25" y="23" width="14" height="10" rx="1.5" fill={color} />
+      <line x1="32" y1="23" x2="32" y2="33" stroke="#e2e8f0" strokeWidth="1.2" />
+      <line x1="25" y1="27" x2="39" y2="27" stroke="#e2e8f0" strokeWidth="1.2" />
+    </MachineHousing>
+  ),
+  Robot: (color) => (
+    <g>
+      <rect x="20" y="46" width="24" height="8" rx="2" fill="#1e293b" />
+      <rect x="36" y="40" width="10" height="8" rx="1.5" fill="#334155" />
+      <circle cx="39" cy="44" r="1.6" fill="#4ade80" />
+      <circle cx="43" cy="44" r="1.6" fill="#f87171" />
+      <circle cx="26" cy="44" r="6" fill={shade(color, -20)} />
+      <rect x="23" y="26" width="6" height="20" rx="3" fill={color} />
+      <circle cx="26" cy="26" r="4.5" fill={shade(color, -20)} />
+      <rect x="24" y="10" width="5" height="18" rx="2.5" fill={color} transform="rotate(-25 26 26)" />
+      <circle cx="34" cy="14" r="4" fill={shade(color, -20)} />
+      <rect x="32" y="7" width="14" height="5" rx="2.5" fill={shade(color, 15)} transform="rotate(20 34 14)" />
+      <g transform="rotate(20 34 14) translate(44,10)">
+        <path d="M0 2 L5 0 L5 2 L2 4 Z" fill="#64748b" />
+        <path d="M0 6 L5 8 L5 6 L2 4 Z" fill="#94a3b8" />
+      </g>
+    </g>
+  ),
+  Buffer: (color) => (
+    <g>
+      <rect x="8" y="10" width="6" height="44" fill="#334155" />
+      <rect x="50" y="10" width="6" height="44" fill="#334155" />
+      {[16, 28, 40].map((y, i) => (
+        <g key={y}>
+          <rect x="12" y={y} width="40" height="6" rx="1" fill={shade('#64748b', i * 8 - 8)} />
+          {[16, 24, 32, 40].map((rx) => (
+            <rect key={rx} x={rx} y={y + 1} width="1.4" height="4" fill="#94a3b8" />
+          ))}
+        </g>
+      ))}
+      <rect x="24" y="30" width="12" height="9" rx="1.5" fill={color} />
+      <rect x="24" y="30" width="12" height="3" fill={shade(color, 40)} />
+    </g>
+  ),
+  Conveyor: (color) => (
+    <g>
+      <rect x="6" y="30" width="52" height="12" rx="3" fill={CONVEYOR_DARK} />
+      {[10, 15, 20, 25, 30, 35, 40, 45, 50].map((rx) => (
+        <rect key={rx} x={rx} y="32.5" width="2.2" height="7" rx="1" fill={CONVEYOR_ROLLER} />
+      ))}
+      <rect x="10" y="42" width="4" height="10" fill="#94a3b8" />
+      <rect x="50" y="42" width="4" height="10" fill="#94a3b8" />
+      <rect x="26" y="24" width="12" height="7" rx="1.5" fill={color} opacity="0.85" />
+    </g>
+  ),
+  Connector: (color) => (
+    <g>
+      <ConveyorSide x={0} />
+      <ConveyorSide x={32} />
+      <rect x="12" y="30" width="40" height="14" rx="2" fill="#f1f5f9" />
+      <rect x="12" y="30" width="40" height="14" rx="2" fill="none" stroke="#cbd5e1" strokeWidth="1" />
+      <circle cx="22" cy="37" r="2.6" fill="#4ade80" />
+      <circle cx="42" cy="37" r="2.6" fill="#f87171" />
+      <rect x="30" y="34" width="4" height="6" rx="1" fill={color} />
+    </g>
+  ),
+  'Movable Part': (color) => (
+    <g>
+      <rect x="14" y="46" width="36" height="6" rx="1.5" fill="#334155" />
+      <rect x="20" y="40" width="24" height="8" rx="1.5" fill="#1e293b" />
+      <polygon points="32,14 46,22 32,30 18,22" fill={shade(color, 35)} />
+      <polygon points="18,22 32,30 32,42 18,34" fill={shade(color, -15)} />
+      <polygon points="46,22 32,30 32,42 46,34" fill={color} />
+    </g>
+  ),
+}
+
+const HOUR_OPTIONS = Array.from({ length: 24 }, (_, h) => h)
+
+function fmtHour(h: number): string {
+  const hh = Math.floor(h) % 24
+  const period = hh < 12 ? 'am' : 'pm'
+  const display = hh % 12 === 0 ? 12 : hh % 12
+  return `${display}${period}`
+}
 
 // ─── Colour helpers ───────────────────────────────────────────────────────────
 
@@ -65,66 +293,32 @@ function FlowNode({ data, selected }: { data: FlowNodeData; selected: boolean })
   const typeHex = STATION_TYPE_HEX[inferredType] || DEFAULT_STATION_HEX
 
   return (
-    <div
-      style={{ borderColor: border }}
-      className="bg-white rounded-2xl border-2 min-w-[160px] shadow-md overflow-hidden"
-    >
+    <div className="flex flex-col items-center px-1 py-1 group" style={{ width: 140 }}>
       <Handle type="target" position={Position.Left} style={{ background: '#94a3b8', width: 8, height: 8 }} />
 
-      {/* Station type header band — colored bar with the type spelled out,
-          e.g. "ASSEMBLY" in green, "INSPECTION" in purple. */}
+      {/* Icon + name + utilization % only — duration, the operation/station
+          name split, the parallel badge, and the progress bar were cut for
+          being too much crammed into one card; those details are still
+          available via the station's click-through panel. Selection ring
+          doubles as the utilization health indicator (colored by topColor). */}
       <div
-        className="text-[9px] font-bold text-white text-center uppercase tracking-wider py-1"
-        style={{ background: typeHex }}
+        className="w-28 h-28 rounded-xl transition-shadow"
+        style={{ boxShadow: selected ? `0 0 0 3px ${border}` : `0 0 0 2px ${border}` }}
       >
-        {inferredType}
+        <IsoIcon type={inferredType} color={typeHex} />
       </div>
 
-      {/* Utilization health stripe — separate signal, separate bar */}
-      <div style={{ height: 4, background: topColor }} />
-
-      <div className="px-4 py-3">
-        {/* Operation name */}
-        <div className="text-xs font-bold text-gray-900 truncate">{data.label}</div>
-        {/* Station name + parallel-machine badge */}
-        <div className="flex items-center gap-1.5 mt-0.5">
-          <span className="text-[11px] text-gray-400 truncate">{data.resource}</span>
-          {data.machineCount && data.machineCount > 1 && (
-            <span
-              className="text-[9px] font-bold px-1.5 py-0.5 rounded-md bg-indigo-100 text-indigo-700 shrink-0"
-              title={`Parallel machine ${data.machineIndex} of ${data.machineCount}`}
-            >
-              ∥ parallel
-            </span>
-          )}
-        </div>
-
-        {/* Divider */}
-        <div className="border-t border-gray-100 my-2" />
-
-        {/* Duration + util */}
-        <div className="flex items-center justify-between gap-2">
-          <span className="text-[10px] text-gray-400 font-medium">{data.duration} min</span>
-          {hasUtil && (
-            <span
-              className="text-[10px] font-bold px-2 py-0.5 rounded-full"
-              style={{ color: topColor, background: topColor + '20' }}
-            >
-              {u.toFixed(0)}%
-            </span>
-          )}
-        </div>
-
-        {/* Util progress bar */}
-        {hasUtil && (
-          <div className="mt-2 h-1.5 bg-gray-100 rounded-full overflow-hidden">
-            <div
-              className="h-full rounded-full transition-all"
-              style={{ width: `${Math.min(u, 100)}%`, background: topColor }}
-            />
-          </div>
-        )}
+      <div className="text-xs font-bold text-gray-900 truncate max-w-full mt-1 bg-white/80 px-1.5 rounded">
+        {data.resource}
       </div>
+      {hasUtil && (
+        <span
+          className="text-[10px] font-bold px-2 py-0.5 rounded-full mt-0.5"
+          style={{ color: topColor, background: topColor + '20' }}
+        >
+          {u.toFixed(0)}%
+        </span>
+      )}
 
       <Handle type="source" position={Position.Right} style={{ background: '#94a3b8', width: 8, height: 8 }} />
     </div>
@@ -141,18 +335,28 @@ function FlowNode({ data, selected }: { data: FlowNodeData; selected: boolean })
 // Falls back to green (plain Station) for legacy nodes with no stationType
 // set and no recognizable keyword.
 const STATION_TYPE_COLORS: Record<string, { border: string; dot: string; handle: string }> = {
-  Station:    { border: 'border-green-400',  dot: 'bg-green-500',  handle: '!bg-green-400' },
-  Buffer:     { border: 'border-amber-700',  dot: 'bg-amber-700',  handle: '!bg-amber-700' },
-  Assembly:   { border: 'border-pink-400',   dot: 'bg-pink-500',   handle: '!bg-pink-400' },
-  Inspection: { border: 'border-purple-400', dot: 'bg-purple-500', handle: '!bg-purple-400' },
-  Packaging:  { border: 'border-orange-400', dot: 'bg-orange-500', handle: '!bg-orange-400' },
+  Source:           { border: 'border-sky-400',    dot: 'bg-sky-500',    handle: '!bg-sky-400' },
+  Station:          { border: 'border-green-400',  dot: 'bg-green-500',  handle: '!bg-green-400' },
+  'Parallel Station': { border: 'border-cyan-400', dot: 'bg-cyan-500',   handle: '!bg-cyan-400' },
+  Buffer:           { border: 'border-amber-700',  dot: 'bg-amber-700',  handle: '!bg-amber-700' },
+  Assembly:         { border: 'border-pink-400',   dot: 'bg-pink-500',   handle: '!bg-pink-400' },
+  Dismantle:        { border: 'border-lime-500',   dot: 'bg-lime-600',   handle: '!bg-lime-500' },
+  Inspection:       { border: 'border-purple-400', dot: 'bg-purple-500', handle: '!bg-purple-400' },
+  Packaging:        { border: 'border-orange-400', dot: 'bg-orange-500', handle: '!bg-orange-400' },
+  Conveyor:         { border: 'border-yellow-500', dot: 'bg-yellow-500', handle: '!bg-yellow-500' },
+  Robot:            { border: 'border-indigo-400', dot: 'bg-indigo-500', handle: '!bg-indigo-400' },
+  Connector:        { border: 'border-slate-400',  dot: 'bg-slate-500',  handle: '!bg-slate-400' },
+  'Movable Part':   { border: 'border-rose-400',   dot: 'bg-rose-500',   handle: '!bg-rose-400' },
+  Drain:            { border: 'border-red-400',    dot: 'bg-red-500',   handle: '!bg-red-400' },
 }
 const DEFAULT_STATION_COLOR = STATION_TYPE_COLORS.Station
 
 // Same station-type color coding as hex values, for contexts that can't use
 // Tailwind classes directly (e.g. React Flow's MiniMap nodeColor prop).
 const STATION_TYPE_HEX: Record<string, string> = {
-  Station: '#22c55e', Buffer: '#b45309', Assembly: '#ec4899', Inspection: '#a855f7', Packaging: '#fb923c',
+  Source: '#0ea5e9', Station: '#22c55e', 'Parallel Station': '#06b6d4', Buffer: '#b45309',
+  Assembly: '#ec4899', Dismantle: '#65a30d', Inspection: '#a855f7', Packaging: '#fb923c',
+  Conveyor: '#eab308', Robot: '#6366f1', Connector: '#64748b', 'Movable Part': '#f43f5e', Drain: '#ef4444',
 }
 const DEFAULT_STATION_HEX = STATION_TYPE_HEX.Station
 
@@ -170,27 +374,50 @@ function inferStationType(label: string, stationType?: string): string {
   if (stationType) return stationType
   const name = label.toLowerCase()
   if (name.startsWith('assembly')) return 'Assembly'
+  if (/dismantle|disassembl/.test(name)) return 'Dismantle'
   if (/queue|buffer/.test(name)) return 'Buffer'
-  if (/(inspect|^qa|_qa|^vt|_vt|^rt|_rt|quality)/.test(name)) return 'Inspection'
+  // Inspection is NOT guessed from the name (VT/RT/QA-named stations, common
+  // in imported scenarios, used to be auto-labeled "Inspection" here) — an
+  // inspection station has no different simulation behaviour from a plain
+  // Station, so guessing it from naming just added a cosmetic label with no
+  // real meaning behind it. It's still a real Object Palette item: a station
+  // explicitly built with it keeps its "Station Type": "Inspection" tag
+  // (handled by the `if (stationType) return stationType` line above) —
+  // only the naming-based GUESS for untagged/imported stations is removed.
   if (/(pack|dispatch)/.test(name)) return 'Packaging'
+  if (/conveyor|convey/.test(name)) return 'Conveyor'
+  if (/\brobot/.test(name)) return 'Robot'
+  if (/^source|entry/.test(name)) return 'Source'
+  if (/^drain|^exit/.test(name)) return 'Drain'
   return 'Station'
 }
 
+// Tecnomatix's own toolbox uses ONE consistent 3D-block body for every
+// material-flow object (Station, Buffer, Assembly, Robot, ...) — objects are
+// told apart by a small icon/pictogram badge in the corner, not by different
+// silhouettes. This matches that: every type shares the same beveled block
+// shape (a lighter "lid" strip along the top gives it a slight 3D read,
+// echoing the reference screenshot's blue boxes), and the corner badge +
+// type-specific summary line is what actually differentiates them.
 function StationNode({ data, selected }: { data: StationNodeData; selected: boolean }) {
   const inferredType = inferStationType(data.label, data.stationType)
   const colors = (inferredType && STATION_TYPE_COLORS[inferredType]) || DEFAULT_STATION_COLOR
+
   return (
-    <div className={`px-4 py-3 bg-white rounded-lg border-2 min-w-[140px] shadow-sm transition-colors ${selected ? 'border-blue-500' : colors.border}`}>
+    <div className="flex flex-col items-center px-1 py-1 group">
       <Handle type="target" position={Position.Left} className={colors.handle} />
-      <div className="flex items-center gap-2 mb-1">
-        <div className={`w-2 h-2 rounded-full ${colors.dot}`} />
-        <span className="text-sm font-semibold text-gray-900">{data.label}</span>
+      {/* Just the icon artwork + name — no card/rectangle around it. The
+          selection ring sits behind the icon rather than boxing it in, so
+          the icon's own silhouette (housing, robot arm, belt, ...) stays
+          the only visible shape. */}
+      <div
+        className={`w-32 h-32 rounded-xl transition-shadow ${selected ? 'ring-2 ring-blue-500 ring-offset-2' : 'group-hover:ring-2 group-hover:ring-blue-200 group-hover:ring-offset-2'}`}
+      >
+        <IsoIcon type={inferredType} color={(inferredType && STATION_TYPE_HEX[inferredType]) || DEFAULT_STATION_HEX} />
       </div>
-      <div className="text-xs text-gray-400 space-y-0.5">
-        <div>Capacity: {data.capacity}</div>
-        <div>Cycle time: {data.cycleTime}m</div>
-        <div>Operators: {data.operators}</div>
-      </div>
+      <span className="text-sm font-semibold text-gray-800 truncate max-w-[150px] mt-1 bg-white/80 px-1.5 rounded">
+        {data.label}
+      </span>
       <Handle type="source" position={Position.Right} className={colors.handle} />
     </div>
   )
@@ -260,6 +487,7 @@ function NumericField({ value, onCommit, className }: { value: number; onCommit:
 
 function PropertyEditor({
   node, nodes, edges, onChange, onDelete, onSaveStation, onAddParallel, numShifts, shiftNames,
+  globalWorkingDays, globalShiftHours, globalBreaks,
 }: {
   node: Node<StationNodeData>
   nodes: Node<StationNodeData>[]
@@ -270,12 +498,34 @@ function PropertyEditor({
   onAddParallel: (id: string) => void
   numShifts: number
   shiftNames: Record<number, string | undefined>
+  globalWorkingDays: Record<number, number[]>
+  globalShiftHours: Record<number, { start: number; end: number }>
+  globalBreaks: Record<number, { start: number; duration: number }[]>
 }) {
-  const fields = [
-    { key: 'label',     label: 'Name',            type: 'text'   },
-    { key: 'cycleTime', label: 'Cycle Time (min)', type: 'number' },
-    { key: 'operators', label: 'Operators',        type: 'number' },
-  ]
+  const nodeType = inferStationType(node.data.label, node.data.stationType)
+  // A Connector is a routing junction, a Conveyor is transport, and a
+  // Source/Drain is just where jobs enter/leave the line — none of these are
+  // a machine, so the machine fields below (capacity, cycle time, operators,
+  // shifts, parallel machines) don't apply to them (the engine ignores those
+  // fields for Connector/Conveyor; Source/Drain have no real engine semantics
+  // at all yet — see sim_core.py's Station Type handling). Showing them
+  // anyway would invite settings that do nothing.
+  const isConnector = nodeType === 'Connector'
+  const isConveyor = nodeType === 'Conveyor'
+  const isBookend = nodeType === 'Source' || nodeType === 'Drain'
+
+  const fields = (isConnector || isBookend)
+    ? [{ key: 'label', label: 'Name', type: 'text' }]
+    : isConveyor
+      ? [
+          { key: 'label',         label: 'Name',                type: 'text'   },
+          { key: 'transportTime', label: 'Transport Time (min)', type: 'number' },
+        ]
+      : [
+          { key: 'label',     label: 'Name',            type: 'text'   },
+          { key: 'cycleTime', label: 'Cycle Time (min)', type: 'number' },
+          { key: 'operators', label: 'Operators',        type: 'number' },
+        ]
 
   // "Assembly Count" only makes sense on stations built from the Assembly
   // palette item. Keyed off stationType (set once at creation, restored from
@@ -346,7 +596,11 @@ function PropertyEditor({
             </label>
             {type === 'number' ? (
               <NumericField
-                value={Number(node.data[key as keyof StationNodeData])}
+                // Fields that only exist on some station types (e.g. a
+                // Conveyor's transportTime) are undefined on a freshly added
+                // node — Number(undefined) is NaN, which would render an empty
+                // uneditable box, so fall back to 0.
+                value={Number(node.data[key as keyof StationNodeData] ?? 0)}
                 onCommit={(n) => onChange(node.id, { [key]: n })}
                 className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
               />
@@ -366,7 +620,10 @@ function PropertyEditor({
             shift 1. Feeds shifts_per_day, which the engine reads directly
             when deciding if the station is active. Names shown come from
             the scenario's simulation_config (SHIFT_n_NAME) — renamed from
-            Simulation Config's Shift Calendar, not editable here. */}
+            Simulation Config's Shift Calendar, not editable here. Not shown
+            for Connector/Source/Drain — none of them are ever "off shift"
+            in a way that means anything. */}
+        {!isConnector && !isBookend && (
         <div>
           <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
             Shift Available
@@ -402,6 +659,198 @@ function PropertyEditor({
             <p className="text-[10px] text-amber-500 mt-1">No shift selected — station will never be active.</p>
           )}
         </div>
+        )}
+
+        {/* Per-station working-days calendar — one MON-SUN row per shift this
+            station actually runs (from Shift Available above). Defaults to
+            the scenario's global Shift Calendar for that shift number until
+            toggled, at which point this station's own pattern is saved
+            (workingDaysByShift) and the engine's build_station_shift_config
+            overrides that shift's WORKING_DAYS_n for this station only —
+            other stations still using the shift's global calendar are
+            unaffected. Hidden for Connector/Source/Drain, same as above. */}
+        {!isConnector && !isBookend && (node.data.shiftsPerDay ?? [1]).length > 0 && (
+          <div>
+            <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+              Working Days
+            </label>
+            <div className="space-y-2">
+              {(node.data.shiftsPerDay ?? [1]).map((shiftNum) => {
+                const label = shiftNames[shiftNum]?.trim() || `Shift ${shiftNum}`
+                const days = node.data.workingDaysByShift?.[shiftNum] ?? globalWorkingDays[shiftNum] ?? [0, 1, 2, 3, 4]
+                const isCustom = node.data.workingDaysByShift?.[shiftNum] !== undefined
+                return (
+                  <div key={shiftNum}>
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-[10px] font-semibold text-gray-500 truncate">{label}</span>
+                      {isCustom && (
+                        <button
+                          type="button"
+                          className="text-[9px] text-blue-500 hover:text-blue-700"
+                          title="Revert to this scenario's global Shift Calendar for this shift"
+                          onClick={() => {
+                            const next = { ...(node.data.workingDaysByShift ?? {}) }
+                            delete next[shiftNum]
+                            onChange(node.id, { workingDaysByShift: next })
+                          }}
+                        >
+                          Reset
+                        </button>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-7 gap-1">
+                      {['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((d, dayIdx) => {
+                        const active = days.includes(dayIdx)
+                        return (
+                          <button
+                            key={dayIdx}
+                            type="button"
+                            title={['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'][dayIdx]}
+                            onClick={() => {
+                              const nextDays = (active ? days.filter((n) => n !== dayIdx) : [...days, dayIdx]).sort()
+                              onChange(node.id, {
+                                workingDaysByShift: { ...(node.data.workingDaysByShift ?? {}), [shiftNum]: nextDays },
+                              })
+                            }}
+                            className={`h-6 rounded text-[10px] font-bold transition-colors ${
+                              active
+                                ? 'bg-blue-400 text-white hover:brightness-95'
+                                : 'bg-gray-100 text-gray-400 hover:bg-gray-200'
+                            }`}
+                          >
+                            {d}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Per-station shift hours + breaks — same override-or-fall-back
+            pattern as Working Days above: a station starts on the
+            scenario's global hours/breaks for each shift it runs, and only
+            diverges once actually edited here. Persisted as shift{n} (an
+            "HH:MM-HH:MM" window string, parsed by the engine's
+            parse_shift_window) and breaks{n} on stations_data. */}
+        {!isConnector && !isBookend && (node.data.shiftsPerDay ?? [1]).length > 0 && (
+          <div>
+            <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+              Shift Hours &amp; Breaks
+            </label>
+            <div className="space-y-3">
+              {(node.data.shiftsPerDay ?? [1]).map((shiftNum) => {
+                const label = shiftNames[shiftNum]?.trim() || `Shift ${shiftNum}`
+                const hours = node.data.shiftHoursByShift?.[shiftNum] ?? globalShiftHours[shiftNum] ?? { start: 8, end: 16 }
+                const hoursCustom = node.data.shiftHoursByShift?.[shiftNum] !== undefined
+                const breaks = node.data.breaksByShift?.[shiftNum] ?? globalBreaks[shiftNum] ?? []
+                const breaksCustom = node.data.breaksByShift?.[shiftNum] !== undefined
+
+                const setHours = (patch: Partial<{ start: number; end: number }>) => {
+                  onChange(node.id, {
+                    shiftHoursByShift: { ...(node.data.shiftHoursByShift ?? {}), [shiftNum]: { ...hours, ...patch } },
+                  })
+                }
+                const setBreaks = (next: { start: number; duration: number }[]) => {
+                  onChange(node.id, { breaksByShift: { ...(node.data.breaksByShift ?? {}), [shiftNum]: next } })
+                }
+
+                return (
+                  <div key={shiftNum} className="rounded-lg border border-gray-100 p-2">
+                    <div className="flex items-center justify-between mb-1.5">
+                      <span className="text-[10px] font-semibold text-gray-500 truncate">{label}</span>
+                      {(hoursCustom || breaksCustom) && (
+                        <button
+                          type="button"
+                          className="text-[9px] text-blue-500 hover:text-blue-700"
+                          title="Revert hours and breaks to this scenario's global Simulation Config for this shift"
+                          onClick={() => {
+                            const nextHours = { ...(node.data.shiftHoursByShift ?? {}) }
+                            delete nextHours[shiftNum]
+                            const nextBreaks = { ...(node.data.breaksByShift ?? {}) }
+                            delete nextBreaks[shiftNum]
+                            onChange(node.id, { shiftHoursByShift: nextHours, breaksByShift: nextBreaks })
+                          }}
+                        >
+                          Reset
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-1.5 mb-2">
+                      <select
+                        value={hours.start}
+                        onChange={(e) => setHours({ start: Number(e.target.value) })}
+                        className="h-7 text-xs text-gray-800 bg-gray-50 border border-gray-200 rounded-md px-1 flex-1 min-w-0"
+                      >
+                        {HOUR_OPTIONS.map((h) => <option key={h} value={h}>{fmtHour(h)}</option>)}
+                      </select>
+                      <span className="text-[10px] text-gray-400 shrink-0">–</span>
+                      <select
+                        value={hours.end}
+                        onChange={(e) => setHours({ end: Number(e.target.value) })}
+                        className="h-7 text-xs text-gray-800 bg-gray-50 border border-gray-200 rounded-md px-1 flex-1 min-w-0"
+                      >
+                        {HOUR_OPTIONS.map((h) => <option key={h} value={h}>{fmtHour(h)}</option>)}
+                      </select>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      {breaks.map((bw, bi) => (
+                        <div key={bi} className="rounded border border-gray-100 p-1.5 space-y-1">
+                          <div className="flex items-center justify-between">
+                            <span className="text-[9px] font-semibold text-gray-400 uppercase tracking-wide">Break starts</span>
+                            <button
+                              type="button"
+                              onClick={() => setBreaks(breaks.filter((_, i) => i !== bi))}
+                              className="text-gray-300 hover:text-red-500 transition-colors shrink-0"
+                              aria-label="Remove break"
+                            >
+                              <X className="h-3 w-3" />
+                            </button>
+                          </div>
+                          <select
+                            value={bw.start}
+                            onChange={(e) => {
+                              const next = [...breaks]
+                              next[bi] = { ...bw, start: Number(e.target.value) }
+                              setBreaks(next)
+                            }}
+                            className="h-6 text-[10px] text-gray-700 bg-gray-50 border border-gray-200 rounded px-1 w-full"
+                          >
+                            {HOUR_OPTIONS.map((h) => <option key={h} value={h}>{fmtHour(h)}</option>)}
+                          </select>
+                          <div className="flex items-center gap-1">
+                            <NumericField
+                              value={bw.duration}
+                              onCommit={(n) => {
+                                const next = [...breaks]
+                                next[bi] = { ...bw, duration: n }
+                                setBreaks(next)
+                              }}
+                              className="h-6 text-[10px] flex-1 min-w-0 rounded border-gray-200 bg-gray-50 px-1 [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+                            />
+                            <span className="text-[9px] text-gray-400 shrink-0">min</span>
+                          </div>
+                        </div>
+                      ))}
+                      <button
+                        type="button"
+                        onClick={() => setBreaks([...breaks, { start: 12, duration: 30 }])}
+                        className="text-[10px] font-semibold text-blue-600 hover:text-blue-700"
+                      >
+                        + Add break
+                      </button>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
 
         {/* Assembly count — only relevant on stations built from the
             Assembly palette item: how many input sub-parts combine into
@@ -449,7 +898,10 @@ function PropertyEditor({
         )}
 
         {/* Parallel machines — capacity is derived from the number of "Name #N"
-            boxes for this station, so it's controlled here instead of a raw field. */}
+            boxes for this station, so it's controlled here instead of a raw
+            field. Not meaningful for Connector/Source/Drain — there is only
+            ever exactly one of each in a line. */}
+        {!isConnector && !isBookend && (
         <div>
           <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
             Parallel Machines
@@ -461,6 +913,7 @@ function PropertyEditor({
             <Plus className="w-3 h-3" /> Add parallel machine
           </button>
         </div>
+        )}
 
         {/* Exit controller / routing — only shown once this station has more
             than one distinct next-station connected (a branch). Decides
@@ -558,11 +1011,25 @@ function PropertyEditor({
 
 // ─── Build mode palette ───────────────────────────────────────────────────────
 
+// Each item pairs a color with a distinct ICON (not color alone) — with 13
+// types, several colors sit close together (teal/cyan, green/lime,
+// amber/yellow) and would be hard to tell apart at a glance in a compact
+// palette list, so the icon shape is the primary differentiator and color
+// is the secondary one.
 const PALETTE_ITEMS = [
-  { label: 'Station',    description: 'Processing station', color: 'bg-teal-50 text-teal-500 border-teal-400' },
-  { label: 'Assembly',   description: 'Assembly station',   color: 'bg-green-50 text-green-500 border-green-400' },
-  { label: 'Inspection', description: 'QA station',         color: 'bg-purple-50 text-purple-500 border-purple-400' },
-  { label: 'Packaging',  description: 'Pack & dispatch',    color: 'bg-orange-50 text-orange-500 border-orange-400' },
+  { label: 'Source',           description: 'Job entry point',    color: 'bg-sky-50 text-sky-500 border-sky-400' },
+  { label: 'Station',          description: 'Processing station', color: 'bg-teal-50 text-teal-500 border-teal-400' },
+  { label: 'Parallel Station', description: 'Multi-lane station', color: 'bg-cyan-50 text-cyan-500 border-cyan-400' },
+  { label: 'Assembly',         description: 'Assembly station',   color: 'bg-green-50 text-green-500 border-green-400' },
+  { label: 'Dismantle',        description: 'Disassembly station', color: 'bg-lime-50 text-lime-600 border-lime-400' },
+  { label: 'Inspection',       description: 'QA station',         color: 'bg-purple-50 text-purple-500 border-purple-400' },
+  { label: 'Packaging',        description: 'Pack & dispatch',    color: 'bg-orange-50 text-orange-500 border-orange-400' },
+  { label: 'Buffer',           description: 'Queue / buffer',     color: 'bg-amber-50 text-amber-700 border-amber-700' },
+  { label: 'Conveyor',         description: 'Material transport', color: 'bg-yellow-50 text-yellow-600 border-yellow-500' },
+  { label: 'Robot',            description: 'Robotic handler',    color: 'bg-indigo-50 text-indigo-500 border-indigo-400' },
+  { label: 'Connector',        description: 'Routing junction',   color: 'bg-slate-100 text-slate-500 border-slate-400' },
+  { label: 'Movable Part',     description: 'Part / WIP token',   color: 'bg-rose-50 text-rose-500 border-rose-400' },
+  { label: 'Drain',            description: 'Job exit point',     color: 'bg-red-50 text-red-500 border-red-400' },
 ]
 
 // A step's `resource` is either a plain station name, or a routing dict
@@ -585,14 +1052,12 @@ function buildFlowGraph(
   stationsData: Record<string, { capacity?: number; 'Station Type'?: string }> = {},
 ): { nodes: Node<FlowNodeData>[]; edges: Edge[] } {
   const steps = processflow[variant] ?? []
-  // Card width easily exceeds 160px once the operation name, resource name,
-  // and "∥ parallel" badge are laid out (min-w-[160px] is just a floor) —
-  // 220 was tighter than the rendered card, so adjacent columns visually
-  // overlapped. Same for ROW_GAP vs. actual card height (header band + util
-  // stripe + two text rows + divider + progress bar comfortably exceeds
-  // 120px), which overlapped stacked parallel-machine rows.
+  // FlowNode is now icon-first (112px icon + name/resource/duration/util rows
+  // beneath it, ~200px tall overall) rather than the old compact text card —
+  // ROW_GAP needs real room to keep stacked parallel-machine icons from
+  // overlapping, same fix already applied to Build mode's layout.
   const COL_GAP = 260
-  const ROW_GAP = 160     // vertical spacing between parallel machines
+  const ROW_GAP = 170     // vertical spacing between parallel machines
 
   const nodes: Node<FlowNodeData>[] = []
   // stepNodeIds[i] = list of node ids in column i (one per parallel machine,
@@ -725,11 +1190,13 @@ function buildEditableGraph(
   stationsData: Record<string, StationConfig>,
 ): { nodes: Node<StationNodeData>[]; edges: Edge[] } {
   const steps = processflow[variant] ?? []
-  // Matches the widened gaps in buildFlowGraph (View mode) — the same
-  // column/row math is used here so Build and View lay out identically,
-  // and 220/120 was too tight for cards once resource names get long.
-  const COL_GAP = 260
-  const ROW_GAP = 140
+  // StationNode (Build mode) renders a 128px icon + label, not the old
+  // compact card these gaps were tuned for — 140/160 stacked parallel
+  // machines almost directly on top of each other once the icon grew that
+  // much larger. Both gaps now clear the icon's actual footprint (128px
+  // tall/wide) with real breathing room instead of overlapping.
+  const COL_GAP = 200
+  const ROW_GAP = 190
 
   const nodes: Node<StationNodeData>[] = []
   const stepNodeIds: string[][] = []
@@ -761,8 +1228,12 @@ function buildEditableGraph(
             cycleTime: step.duration,
             operators: cfg?.operator_per_station ?? 1,
             shiftsPerDay: normalizeShiftsPerDay(cfg?.shifts_per_day),
+            transportTime: cfg?.['Transport Time'],
             assemblyCount: cfg?.['Assembly Count'],
             assemblyInputs: cfg?.['Assembly Inputs'],
+            workingDaysByShift: extractWorkingDaysByShift(cfg),
+            shiftHoursByShift: extractShiftHoursByShift(cfg),
+            breaksByShift: extractBreaksByShift(cfg),
           },
         })
         rowCursor += 1
@@ -808,6 +1279,68 @@ function buildEditableGraph(
   return { nodes, edges }
 }
 
+// Column/row spacing matching buildEditableGraph's own layout, needed again
+// here since ensureSourceAndDrain positions its inserted boxes relative to it.
+const EDITABLE_COL_GAP = 200
+
+/**
+ * Ensures a Build-mode graph starts with a Source and ends with a Drain —
+ * the Tecnomatix convention every line should follow (see Object Palette).
+ * Purely a layout/graph nicety: a Source/Drain has no special simulation
+ * behaviour today (same generic station fields as everything else), so this
+ * only runs when loading a scenario that doesn't already have them, never
+ * overriding one the user placed deliberately.
+ *
+ * Entry = nodes with no incoming edge; Exit = nodes with no outgoing edge.
+ * Insert only when NONE of the current entry/exit nodes are already typed
+ * Source/Drain — a graph that already starts/ends correctly is left alone.
+ */
+function ensureSourceAndDrain(
+  nodes: Node<StationNodeData>[],
+  edges: Edge[],
+  nextId: () => number,
+): { nodes: Node<StationNodeData>[]; edges: Edge[] } {
+  if (nodes.length === 0) return { nodes, edges }
+
+  const hasIncoming = new Set(edges.map((e) => e.target))
+  const hasOutgoing = new Set(edges.map((e) => e.source))
+  const entryNodes = nodes.filter((n) => !hasIncoming.has(n.id))
+  const exitNodes = nodes.filter((n) => !hasOutgoing.has(n.id))
+  const isType = (n: Node<StationNodeData>, type: string) =>
+    inferStationType(n.data.label, n.data.stationType) === type
+
+  const needsSource = !entryNodes.some((n) => isType(n, 'Source'))
+  const needsDrain = !exitNodes.some((n) => isType(n, 'Drain'))
+  if (!needsSource && !needsDrain) return { nodes, edges }
+
+  const nextNodes = [...nodes]
+  const nextEdges = [...edges]
+  const minX = Math.min(...nodes.map((n) => n.position.x))
+  const maxX = Math.max(...nodes.map((n) => n.position.x))
+  const avgY = nodes.reduce((sum, n) => sum + n.position.y, 0) / nodes.length
+
+  if (needsSource) {
+    const id = `station_${nextId()}`
+    nextNodes.push({
+      id, type: 'station',
+      position: { x: minX - EDITABLE_COL_GAP, y: avgY },
+      data: { label: 'Source', stationType: 'Source', capacity: 1, cycleTime: 0, operators: 0, shiftsPerDay: [1] },
+    })
+    for (const n of entryNodes) nextEdges.push({ id: `e_${id}__${n.id}`, source: id, target: n.id })
+  }
+  if (needsDrain) {
+    const id = `station_${nextId()}`
+    nextNodes.push({
+      id, type: 'station',
+      position: { x: maxX + EDITABLE_COL_GAP, y: avgY },
+      data: { label: 'Drain', stationType: 'Drain', capacity: 1, cycleTime: 0, operators: 0, shiftsPerDay: [1] },
+    })
+    for (const n of exitNodes) nextEdges.push({ id: `e_${n.id}__${id}`, source: n.id, target: id })
+  }
+
+  return { nodes: nextNodes, edges: nextEdges }
+}
+
 /** Strip a trailing " #N" suffix used to label parallel-machine boxes, e.g. "Stitching #2" -> "Stitching" */
 function baseStationName(label: string): string {
   return label.replace(/\s+#\d+$/, '')
@@ -826,22 +1359,72 @@ function normalizeShiftsPerDay(value: number | number[] | undefined): number[] {
   return Array.from({ length: Math.max(0, n) }, (_, i) => i + 1)
 }
 
+/**
+ * Collect a saved station's per-shift working-days overrides
+ * (workingDays1, workingDays2, ...) back into the { shiftNum: days[] } shape
+ * StationNodeData.workingDaysByShift uses, so reopening a saved scenario in
+ * Build mode restores exactly what was toggled — not just the global
+ * default every station starts from before any override is made.
+ */
+function extractWorkingDaysByShift(cfg: StationConfig | undefined): Record<number, number[]> | undefined {
+  if (!cfg) return undefined
+  const out: Record<number, number[]> = {}
+  for (const key of Object.keys(cfg)) {
+    const match = /^workingDays(\d+)$/.exec(key)
+    if (!match) continue
+    const days = cfg[key]
+    if (Array.isArray(days)) out[Number(match[1])] = days as number[]
+  }
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
+/**
+ * Collect a saved station's per-shift hour-window overrides (shift1,
+ * shift2, ... parsed as "HH:MM-HH:MM") back into the
+ * { shiftNum: {start, end} } shape StationNodeData.shiftHoursByShift uses.
+ * A value that ISN'T a valid window string (e.g. a real operator name, or
+ * blank) is simply not a station-level hour override — silently skipped
+ * rather than restored as garbage.
+ */
+function extractShiftHoursByShift(cfg: StationConfig | undefined): Record<number, { start: number; end: number }> | undefined {
+  if (!cfg) return undefined
+  const out: Record<number, { start: number; end: number }> = {}
+  for (const key of Object.keys(cfg)) {
+    const match = /^shift(\d+)$/.exec(key)
+    if (!match) continue
+    const raw = cfg[key]
+    if (typeof raw !== 'string') continue
+    const windowMatch = /^(\d{1,2}):\d{2}-(\d{1,2}):\d{2}$/.exec(raw.trim())
+    if (!windowMatch) continue
+    out[Number(match[1])] = { start: Number(windowMatch[1]), end: Number(windowMatch[2]) }
+  }
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
+/**
+ * Collect a saved station's per-shift break overrides (breaks1, breaks2,
+ * ...) back into the { shiftNum: BreakWindow[] } shape
+ * StationNodeData.breaksByShift uses.
+ */
+function extractBreaksByShift(cfg: StationConfig | undefined): Record<number, { start: number; duration: number }[]> | undefined {
+  if (!cfg) return undefined
+  const out: Record<number, { start: number; duration: number }[]> = {}
+  for (const key of Object.keys(cfg)) {
+    const match = /^breaks(\d+)$/.exec(key)
+    if (!match) continue
+    const breaks = cfg[key]
+    if (Array.isArray(breaks)) out[Number(match[1])] = breaks as { start: number; duration: number }[]
+  }
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function Canvas() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const { activeScenario: storedScenario, activeRun, setActiveScenario, showToast, justReset, setJustReset } = useAppStore()
+  const { activeScenario, activeRun, setActiveScenario, showToast, setJustReset } = useAppStore()
   const isDark = useAppStore(s => s.theme) === 'dark'
-
-  // After the Run Dashboard's Reset button, View Flow should show a blank
-  // Build canvas instead of the real scenario's stations — but /run itself
-  // still needs the real scenario selected (for its own 0-0 KPI cards), so
-  // this can't just be "activeScenario is null". justReset is a separate
-  // flag for exactly that: treat the scenario as absent here only, until the
-  // user actually starts building (touches Build mode) or a fresh run
-  // happens elsewhere, either of which clears it again.
-  const activeScenario = justReset ? null : storedScenario
 
   // Memoized so React Flow always sees the same object reference across renders/HMR —
   // an unstable nodeTypes reference makes React Flow re-init internally on every
@@ -852,14 +1435,6 @@ export default function Canvas() {
   // Mode: 'view' shows scenario flow; 'build' is free-canvas builder
   const [mode, setMode] = useState<'view' | 'build'>(activeScenario ? 'view' : 'build')
 
-  // Force Build mode the moment justReset flips on (e.g. user was already
-  // sitting on View Flow when they hit Reset on /run in another tab/earlier
-  // navigation) — the useState initializer above only runs once at mount,
-  // so without this a component that was already mounted in 'view' would
-  // keep showing the View toggle rather than snapping to the blank canvas.
-  useEffect(() => {
-    if (justReset) setMode('build')
-  }, [justReset])
   // Within View mode: '2d' is the existing ReactFlow diagram, '3d' is the new Scene
   const [viewMode, setViewMode] = useState<'3d' | '2d'>('3d')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
@@ -955,6 +1530,12 @@ export default function Canvas() {
     return () => cancelAnimationFrame(id)
   }, [viewFlowInstance, viewPanelOpen])
 
+  // Build-mode canvas instance — needed to convert a drag-and-drop's screen
+  // (clientX/clientY) coordinates into flow-space coordinates, so a palette
+  // item dropped on the canvas lands exactly under the cursor instead of at
+  // an auto-computed "rightmost + offset" spot.
+  const [buildFlowInstance, setBuildFlowInstance] = useState<ReactFlowInstance | null>(null)
+
   // ── Entry panel: read-only per-variant Quantity/Interval display — editing
   // happens in Build mode instead. Re-seeded whenever the underlying scenario
   // data actually changes (not on every render) via the id/updated_at.
@@ -1039,8 +1620,12 @@ export default function Canvas() {
       activeScenario.processflow_data, selectedVariant, activeScenario.stations_data
     )
     if (editNodes.length === 0) return
-    setNodes(editNodes)
-    setEdges(editEdges)
+    // Every line should start with a Source and end with a Drain (Tecnomatix
+    // convention) — added automatically for scenarios saved before this
+    // existed, or imported from Excel/YAML, which never have them.
+    const { nodes: finalNodes, edges: finalEdges } = ensureSourceAndDrain(editNodes, editEdges, nextNodeId)
+    setNodes(finalNodes)
+    setEdges(finalEdges)
     setScenarioName(activeScenario.name)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, activeScenario, selectedVariant])
@@ -1058,21 +1643,32 @@ export default function Canvas() {
     setEdges((eds) => eds.map((e) => (e.id === id ? { ...e, label } : e)))
   }
 
-  const addNode = (label: string) => {
+  // `dropPosition` (already in flow coordinates) places the new node exactly
+  // there — used when a palette item is dragged onto the canvas, Tecomatix-
+  // style. Omitted for a plain click on the palette item, which keeps the
+  // old auto-placement (rightmost node + offset) as a one-click fallback.
+  const addNode = (label: string, dropPosition?: { x: number; y: number }) => {
     const id = nextNodeId()
     setNodes((nds) => {
-      // Place the new box just to the right of the current rightmost node
-      // (and vertically centered among existing nodes), instead of drifting
-      // off screen as more nodes accumulate.
       const rightmostX = nds.length > 0 ? Math.max(...nds.map((n) => n.position.x)) : 40
       const avgY = nds.length > 0 ? nds.reduce((sum, n) => sum + n.position.y, 0) / nds.length : 160
+      const position = dropPosition ?? { x: nds.length > 0 ? rightmostX + 220 : 80, y: avgY }
+      // Non-machine types start with values that match how the engine treats
+      // them: a Connector never processes (0 cycle time, no operator) and a
+      // Conveyor moves rather than works (transport time, no operator).
+      const data: StationNodeData =
+        label === 'Connector'
+          ? { label, stationType: label, capacity: 1, cycleTime: 0, operators: 0, shiftsPerDay: [1] }
+          : label === 'Conveyor'
+            ? { label, stationType: label, capacity: 1, cycleTime: 0, operators: 0, transportTime: 5, shiftsPerDay: [1] }
+            : { label, stationType: label, capacity: 1, cycleTime: 30, operators: 1, shiftsPerDay: [1] }
       return [
         ...nds,
         {
           id: `station_${id}`,
           type: 'station',
-          position: { x: nds.length > 0 ? rightmostX + 220 : 80, y: avgY },
-          data: { label, stationType: label, capacity: 1, cycleTime: 30, operators: 1, shiftsPerDay: [1] },
+          position,
+          data,
         },
       ]
     })
@@ -1101,6 +1697,41 @@ export default function Canvas() {
   // not here; this just reflects whatever SHIFT_n_NAME is currently saved.
   const shiftNames: Record<number, string | undefined> = Object.fromEntries(
     Array.from({ length: numShifts }, (_, i) => i + 1).map((n) => [n, simCfgRaw[`SHIFT_${n}_NAME`] as string | undefined])
+  )
+  // The scenario's GLOBAL working-days pattern per shift number (Simulation
+  // Config's Shift Calendar) — the baseline a station's own per-station
+  // override (workingDaysByShift) starts from and can diverge away from.
+  // Matches the engine's own default (SimulationUtils.working_days): Mon-Fri
+  // for shifts 1/2, every day for shift 3+, when the scenario hasn't set one.
+  const globalWorkingDays: Record<number, number[]> = Object.fromEntries(
+    Array.from({ length: numShifts }, (_, i) => i + 1).map((n) => [
+      n,
+      (simCfgRaw[`WORKING_DAYS_${n}`] as number[] | undefined) ?? (n <= 2 ? [0, 1, 2, 3, 4] : [0, 1, 2, 3, 4, 5, 6]),
+    ])
+  )
+  // The scenario's GLOBAL shift hours per shift number — same fallback
+  // constants as RunDashboard's Simulation Config dialog (SHIFT_DEFAULTS),
+  // so a station's "no override" state shows the same hours the user would
+  // see in Simulation Config, not an arbitrary placeholder.
+  const SHIFT_HOUR_DEFAULTS: Record<number, { start: number; end: number }> = {
+    1: { start: 6, end: 14 }, 2: { start: 14, end: 22 }, 3: { start: 22, end: 6 },
+  }
+  const globalShiftHours: Record<number, { start: number; end: number }> = Object.fromEntries(
+    Array.from({ length: numShifts }, (_, i) => i + 1).map((n) => [
+      n,
+      {
+        start: (simCfgRaw[`SHIFT_${n}_START`] as number | undefined) ?? SHIFT_HOUR_DEFAULTS[n]?.start ?? 8,
+        end: (simCfgRaw[`SHIFT_${n}_END`] as number | undefined) ?? SHIFT_HOUR_DEFAULTS[n]?.end ?? 16,
+      },
+    ])
+  )
+  // The scenario's GLOBAL break windows per shift number — no default breaks
+  // for a shift the scenario hasn't configured any for.
+  const globalBreaks: Record<number, { start: number; duration: number }[]> = Object.fromEntries(
+    Array.from({ length: numShifts }, (_, i) => i + 1).map((n) => [
+      n,
+      (simCfgRaw[`BREAKS_${n}`] as { start: number; duration: number }[] | undefined) ?? [],
+    ])
   )
 
   /** Add another parallel machine for this station: duplicates the box, renames
@@ -1176,15 +1807,41 @@ export default function Canvas() {
       })
       nodes.forEach((n) => {
         const base = baseStationName(n.data.label)
+        // Expand { 1: [0,1,2], 3: [5,6] } into workingDays1/workingDays3 keys
+        // — the shape build_station_shift_config reads per shift number.
+        const workingDaysFields: Record<string, number[]> = {}
+        for (const [shiftNum, days] of Object.entries(n.data.workingDaysByShift ?? {})) {
+          workingDaysFields[`workingDays${shiftNum}`] = days
+        }
+        // Per-station hour-window override, written into the SAME shift{n}
+        // field the engine's build_station_shift_config already parses as
+        // an "HH:MM-HH:MM" window (see parse_shift_window) — stations built
+        // here have never actually used shift{n} for an operator name (that
+        // was always a hardcoded 'Op1'/'' placeholder), so repurposing it
+        // for the real hour override doesn't collide with anything.
+        const shiftHourFields: Record<string, string> = {}
+        for (const [shiftNum, hours] of Object.entries(n.data.shiftHoursByShift ?? {})) {
+          const pad = (h: number) => String(Math.floor(h) % 24).padStart(2, '0')
+          shiftHourFields[`shift${shiftNum}`] = `${pad(hours.start)}:00-${pad(hours.end)}:00`
+        }
+        // Expand { 1: [...] } into breaks1/breaks3 keys.
+        const breaksFields: Record<string, { start: number; duration: number }[]> = {}
+        for (const [shiftNum, breaks] of Object.entries(n.data.breaksByShift ?? {})) {
+          breaksFields[`breaks${shiftNum}`] = breaks
+        }
         stationsData[base] = {
           capacity: capacityCount[base], shifts_per_day: n.data.shiftsPerDay ?? [1],
           operator_per_station: n.data.operators,
           ...(n.data.stationType !== undefined ? { 'Station Type': n.data.stationType } : {}),
+          ...(n.data.transportTime !== undefined ? { 'Transport Time': n.data.transportTime } : {}),
           ...(n.data.assemblyCount !== undefined ? { 'Assembly Count': n.data.assemblyCount } : {}),
           ...(n.data.assemblyInputs !== undefined ? { 'Assembly Inputs': n.data.assemblyInputs } : {}),
+          ...workingDaysFields,
+          ...breaksFields,
           'Failure rate': 0, 'Repair Time': 10, 'PM Schedule': 'Monthly',
           'Material Shortage Probability (%)': 0, 'Rework Probability (%)': 0,
-          shift1: 'Op1', shift2: '', shift3: '', STATION_DOWNTIME: 0,
+          shift1: '', shift2: '', shift3: '', STATION_DOWNTIME: 0,
+          ...shiftHourFields,
         }
       })
 
@@ -1202,6 +1859,16 @@ export default function Canvas() {
       const entryNodes = nodes.filter((n) => !hasIncoming.has(n.id))
       const steps: ScenarioCreate['processflow_data'][string] = []
       const seenStations = new Set<string>()
+      // The duration written into the process-flow step. A Conveyor's time is
+      // its transport time (the engine reads "Transport Time" but falls back
+      // to the step duration), and a Connector never takes any time at all.
+      const stepDuration = (n: Node<StationNodeData>): number => {
+        const t = inferStationType(n.data.label, n.data.stationType)
+        if (t === 'Connector') return 0
+        if (t === 'Conveyor') return n.data.transportTime ?? n.data.cycleTime
+        return n.data.cycleTime
+      }
+
       let frontier = entryNodes
       const visitedNodeIds = new Set<string>()
       while (frontier.length > 0) {
@@ -1226,7 +1893,7 @@ export default function Canvas() {
             const rules = n.data.routingRules ?? []
             steps.push({
               operation: `${base}_op`,
-              duration: n.data.cycleTime,
+              duration: stepDuration(n),
               resource: {
                 mode,
                 options: destBases,
@@ -1243,7 +1910,7 @@ export default function Canvas() {
             const oneDest = destNodes.find((d) => baseStationName(d.data.label) === destBases[0])
             if (oneDest) next.push(oneDest)
           } else {
-            steps.push({ operation: `${base}_op`, resource: base, duration: n.data.cycleTime })
+            steps.push({ operation: `${base}_op`, resource: base, duration: stepDuration(n) })
             for (const d of destNodes) next.push(d)
           }
         }
@@ -1443,18 +2110,23 @@ export default function Canvas() {
         ) : (
           <div className="flex-1 p-4 overflow-auto">
             <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1">Object Palette</p>
-            <p className="text-[10px] text-gray-400 mb-3">Click to add to canvas</p>
+            <p className="text-[10px] text-gray-400 mb-3">Drag onto the canvas, or click to drop it in</p>
             <div className="space-y-2">
               {PALETTE_ITEMS.map((item) => {
-                const [bgColor, textColor, borderColor] = item.color.split(' ')
+                const [bgColor, , borderColor] = item.color.split(' ')
                 return (
                   <button
                     key={item.label}
+                    draggable
+                    onDragStart={(e) => {
+                      e.dataTransfer.setData('application/linksim-palette-item', item.label)
+                      e.dataTransfer.effectAllowed = 'move'
+                    }}
                     onClick={() => addNode(item.label)}
-                    className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl border border-l-4 border-gray-100 hover:shadow-sm text-left transition-all group ${borderColor}`}
+                    className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl border border-l-4 border-gray-100 hover:shadow-sm text-left transition-all group cursor-grab active:cursor-grabbing ${borderColor}`}
                   >
                     <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${bgColor}`}>
-                      <Plus className={`h-3.5 w-3.5 ${textColor}`} />
+                      <IsoIcon type={item.label} color={STATION_TYPE_HEX[item.label] ?? DEFAULT_STATION_HEX} />
                     </div>
                     <div>
                       <div className="text-xs font-semibold text-gray-800">{item.label}</div>
@@ -1586,6 +2258,20 @@ export default function Canvas() {
                 )
               )
             ) : (
+              <div
+                className="w-full h-full"
+                onDragOver={(e) => {
+                  e.preventDefault()
+                  e.dataTransfer.dropEffect = 'move'
+                }}
+                onDrop={(e) => {
+                  e.preventDefault()
+                  const label = e.dataTransfer.getData('application/linksim-palette-item')
+                  if (!label || !buildFlowInstance) return
+                  const position = buildFlowInstance.screenToFlowPosition({ x: e.clientX, y: e.clientY })
+                  addNode(label, position)
+                }}
+              >
               <ReactFlow
                 nodes={nodes}
                 edges={edges}
@@ -1600,7 +2286,7 @@ export default function Canvas() {
                 elementsSelectable
                 panOnDrag
                 selectionOnDrag={false}
-                onInit={(instance) => instance.fitView({ padding: 0.2 })}
+                onInit={(instance) => { setBuildFlowInstance(instance); instance.fitView({ padding: 0.2 }) }}
               >
                 <Background color={isDark ? '#334155' : undefined} />
                 <Controls />
@@ -1613,6 +2299,7 @@ export default function Canvas() {
                   maskColor={isDark ? 'rgba(15,23,42,0.7)' : 'rgba(240,244,255,0.7)'}
                 />
               </ReactFlow>
+              </div>
             )}
           </div>
 
@@ -1859,6 +2546,9 @@ export default function Canvas() {
                 onAddParallel={addParallelMachine}
                 numShifts={numShifts}
                 shiftNames={shiftNames}
+                globalWorkingDays={globalWorkingDays}
+                globalShiftHours={globalShiftHours}
+                globalBreaks={globalBreaks}
               />
             </div>
           )}
