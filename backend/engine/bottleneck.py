@@ -13,6 +13,7 @@ from .formulas import (
     calc_breakdown_impact, calc_rework_impact, calc_wait_time_impact_pct,
     calc_jobs_lost_to_wait, calc_operators_needed,
 )
+from .sim_utils import SimulationUtils
 
 
 def _station_utilization(station: dict, sim_config: dict) -> float:
@@ -45,7 +46,15 @@ def identify_bottlenecks(
     bottlenecks: List[Dict] = []
 
     total_simulated_time = station_info.get("total_simulated_time_per_station", 1)
-    shifts_per_day = station_info.get("shifts_per_day", 1)
+    # shifts_per_day on a station can be either the legacy int count (e.g. 2
+    # meaning "shifts 1..2") OR an explicit list of active shift numbers
+    # (e.g. [2, 3] — every Canvas-built scenario saves this form). Used below
+    # as a numeric multiplier (additional_time = improvement * ... *
+    # shifts_per_day * ...), so a list must be reduced to its shift COUNT
+    # first — multiplying a float by a raw list raises "can't multiply
+    # sequence by non-int of type 'float'".
+    raw_shifts_per_day = station_info.get("shifts_per_day", 1)
+    shifts_per_day = len(SimulationUtils.active_shift_set(raw_shifts_per_day)) or 1
     total_days = sim_time_to_days(total_simulated_time)
 
     current_station_util = _station_utilization(station_info, sim_config)
@@ -194,7 +203,9 @@ def calculate_affected_jobs(
     sim_config: dict,
     cycle_times: dict,
 ) -> Dict[str, Any]:
-    shifts_per_day = station_info.get("shifts_per_day", 1)
+    # Same list-vs-count normalization as identify_bottlenecks above —
+    # shifts_per_day is used as a numeric multiplier a few lines down.
+    shifts_per_day = len(SimulationUtils.active_shift_set(station_info.get("shifts_per_day", 1))) or 1
     total_days = sim_config.get("total_days", 1)
     completed_jobs = station_info.get("completed_jobs", 0)
     busy_time = station_info.get("busy_time", 0)

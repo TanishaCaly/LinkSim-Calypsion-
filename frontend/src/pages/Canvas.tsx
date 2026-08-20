@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ReactFlow, {
   addEdge, Background, Controls, MiniMap,
-  useNodesState, useEdgesState,
+  useNodesState, useEdgesState, useEdges,
   type Connection, type Edge, type Node, type NodeTypes, type ReactFlowInstance,
-  Handle, Position, MarkerType,
+  Handle, Position, MarkerType, ConnectionMode,
 } from 'reactflow'
 import 'reactflow/dist/style.css'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import {
   Save, Plus, Trash2, Settings, Eye, Edit3, Play, ChevronLeft, ChevronRight, Box, Layout as LayoutIcon, X,
+  ChevronDown, Check,
 } from 'lucide-react'
 import { scenariosApi } from '@/api/scenarios'
 import { useAppStore } from '@/store/useAppStore'
@@ -28,7 +29,7 @@ import type { StationNodeData, ScenarioCreate, StationConfig } from '@/types'
 // glass front over a colored part, a status-light stub on top, and a small
 // control panel with red/green indicator dots + a drawer handle along the
 // bottom — shared across every "machine" type (Station, Parallel Station,
-// Assembly, Dismantle, Inspection, Packaging), differentiated by the shape
+// Assembly, Dismantle), differentiated by the shape
 // inside the glass (a stamped block, a claw, a drill bit, a magnifier, a
 // tape line). Robot, Conveyor, Buffer, Connector and Movable Part are
 // distinct enough in the reference to get their own bespoke shape entirely
@@ -104,20 +105,46 @@ function IsoIcon({ type, color }: { type: string; color: string }) {
   )
 }
 
+/**
+ * Flat inspection-table platform for Start/End — matches the reference
+ * render: a conveyor feeding onto a low tabletop, a status-light pole, a
+ * round button, and (Start only) a box sitting on the table. Deliberately
+ * NOT the tall glass-front MachineHousing — Start/End aren't machines
+ * doing work, they're just where a job appears on/leaves the line.
+ * `hasBox` distinguishes Start (job present) from End (table empty).
+ */
+function StartEndPlatform({ color, hasBox }: { color: string; hasBox: boolean }) {
+  return (
+    <g>
+      <ConveyorSide x={0} />
+      {/* Low tabletop */}
+      <rect x="14" y="36" width="38" height="16" rx="2.5" fill={HOUSING} />
+      <rect x="14" y="36" width="38" height="16" rx="2.5" fill="none" stroke={HOUSING_SHADE} strokeWidth="1" />
+      <rect x="18" y="39" width="30" height="6" rx="1" fill="#f1f5f9" />
+      {/* Status-light pole */}
+      <rect x="41" y="18" width="3" height="20" fill="#64748b" />
+      <rect x="38.5" y="12" width="8" height="7" rx="1.5" fill="#1e293b" />
+      <ellipse cx="42.5" cy="13.5" rx="4" ry="2.2" fill={color} />
+      {/* Round push-button */}
+      <circle cx="46" cy="46.5" r="2.6" fill="#1e293b" />
+      <circle cx="46" cy="46.5" r="1.7" fill={color} />
+      {hasBox && (
+        <>
+          <polygon points="24,28 33,32 24,36 15,32" fill={shade('#f97316', 20)} />
+          <polygon points="15,32 24,36 24,44 15,40" fill={shade('#f97316', -15)} />
+          <polygon points="33,32 24,36 24,44 33,40" fill="#f97316" />
+        </>
+      )}
+    </g>
+  )
+}
+
 const ISO_ICON_BODY: Record<string, (color: string) => React.ReactNode> = {
-  Source: (color) => (
-    <MachineHousing statusColor="#4ade80">
-      {/* stamped block sitting on the glass floor */}
-      <rect x="25" y="24" width="14" height="9" rx="1.5" fill={color} />
-      <rect x="25" y="24" width="14" height="3" rx="1" fill={shade(color, 40)} />
-    </MachineHousing>
-  ),
-  Drain: (color) => (
-    <MachineHousing statusColor="#f87171">
-      <rect x="25" y="24" width="14" height="9" rx="1.5" fill={color} />
-      <rect x="25" y="24" width="14" height="3" rx="1" fill={shade(color, 40)} />
-    </MachineHousing>
-  ),
+  // Start/End deliberately do NOT use the MachineHousing family — see
+  // StartEndPlatform above. Start shows a box sitting on the table (a job
+  // has just appeared); End shows the table empty (the job has left).
+  Source: (color) => <StartEndPlatform color={color} hasBox />,
+  Drain: (color) => <StartEndPlatform color={color} hasBox={false} />,
   Station: (color) => (
     <MachineHousing statusColor={color}>
       {/* a stubby press/stamp tool over the block */}
@@ -156,20 +183,6 @@ const ISO_ICON_BODY: Record<string, (color: string) => React.ReactNode> = {
       <polygon points="29,25 35,25 32,30" fill="#94a3b8" />
       <rect x="27" y="30" width="4.5" height="6" rx="1" fill={color} />
       <rect x="32.5" y="30" width="4.5" height="6" rx="1" fill={shade(color, -25)} />
-    </MachineHousing>
-  ),
-  Inspection: (color) => (
-    <MachineHousing statusColor={color}>
-      <rect x="26" y="24" width="12" height="8" rx="1.5" fill={color} />
-      <circle cx="35" cy="21" r="4" fill="none" stroke="#e2e8f0" strokeWidth="1.6" />
-      <line x1="37.8" y1="23.8" x2="40" y2="26" stroke="#e2e8f0" strokeWidth="1.8" strokeLinecap="round" />
-    </MachineHousing>
-  ),
-  Packaging: (color) => (
-    <MachineHousing statusColor={color}>
-      <rect x="25" y="23" width="14" height="10" rx="1.5" fill={color} />
-      <line x1="32" y1="23" x2="32" y2="33" stroke="#e2e8f0" strokeWidth="1.2" />
-      <line x1="25" y1="27" x2="39" y2="27" stroke="#e2e8f0" strokeWidth="1.2" />
     </MachineHousing>
   ),
   Robot: (color) => (
@@ -237,15 +250,68 @@ const ISO_ICON_BODY: Record<string, (color: string) => React.ReactNode> = {
       <polygon points="46,22 32,30 32,42 46,34" fill={color} />
     </g>
   ),
-}
-
-const HOUR_OPTIONS = Array.from({ length: 24 }, (_, h) => h)
-
-function fmtHour(h: number): string {
-  const hh = Math.floor(h) % 24
-  const period = hh < 12 ? 'am' : 'pm'
-  const display = hh % 12 === 0 ? 12 : hh % 12
-  return `${display}${period}`
+  // Worker — a small figure in a hi-vis vest and hardhat, matching the
+  // reference render. `color` tints the vest so it still reads as this
+  // node's type color (amber) at a glance among the other icons.
+  Worker: (color) => (
+    <g>
+      <ellipse cx="32" cy="56" rx="12" ry="3" fill="#00000014" />
+      {/* legs */}
+      <rect x="26" y="42" width="5" height="14" rx="2" fill="#475569" />
+      <rect x="33" y="42" width="5" height="14" rx="2" fill="#334155" />
+      {/* torso + vest */}
+      <rect x="24" y="28" width="16" height="16" rx="3" fill="#475569" />
+      <rect x="24" y="28" width="16" height="16" rx="3" fill={color} opacity="0.9" />
+      <line x1="32" y1="28" x2="32" y2="44" stroke="#f1f5f9" strokeWidth="1.4" />
+      <line x1="25" y1="33" x2="31" y2="35" stroke="#f1f5f9" strokeWidth="1.4" />
+      <line x1="39" y1="33" x2="33" y2="35" stroke="#f1f5f9" strokeWidth="1.4" />
+      {/* arms */}
+      <rect x="18" y="29" width="5" height="12" rx="2.5" fill="#334155" />
+      <rect x="41" y="29" width="5" height="12" rx="2.5" fill="#334155" />
+      {/* head + hardhat */}
+      <circle cx="32" cy="20" r="6.5" fill="#f2c9a0" />
+      <path d="M24.5 18 a7.5 7.5 0 0 1 15 0 z" fill="#f8fafc" />
+      <rect x="24" y="16.5" width="16" height="2.2" rx="1" fill="#e2e8f0" />
+    </g>
+  ),
+  // Workplace — same glass-housing body every other station uses (so it
+  // matches the palette's color/shape language instead of standing out),
+  // with a small worker figure + robot arm sharing the glass window —
+  // a place where both a human and a machine perform work.
+  Workplace: (color) => (
+    <MachineHousing statusColor={color}>
+      {/* worker figure */}
+      <circle cx="23" cy="19" r="2.6" fill="#f1f5f9" />
+      <rect x="20" y="22.5" width="6" height="7" rx="2" fill="#f1f5f9" />
+      {/* robot arm */}
+      <rect x="33" y="24" width="2" height="7" rx="1" fill={color} />
+      <rect x="33.5" y="17.5" width="7" height="2.4" rx="1.2" fill={color} transform="rotate(-25 34 24)" />
+      <circle cx="34" cy="24" r="2" fill={shade(color, -15)} />
+    </MachineHousing>
+  ),
+  // Worker Controller — a badge/access-control reader box: screen, red/green
+  // indicator lights, side lever, and a beacon on top, matching the
+  // reference render. `color` tints the screen icon and beacon.
+  'Worker Controller': (color) => (
+    <g>
+      <rect x="16" y="52" width="32" height="4" rx="1.5" fill="#1e293b" />
+      <rect x="14" y="18" width="36" height="34" rx="3" fill={HOUSING} />
+      <rect x="14" y="18" width="36" height="34" rx="3" fill="none" stroke={HOUSING_SHADE} strokeWidth="1" />
+      {/* screen */}
+      <rect x="19" y="22" width="26" height="14" rx="1.5" fill="#1e293b" />
+      <circle cx="26" cy="28" r="3" fill={color} />
+      <rect x="31" y="26" width="10" height="1.6" rx="0.8" fill={color} opacity="0.8" />
+      <rect x="31" y="29.5" width="10" height="1.6" rx="0.8" fill={color} opacity="0.5" />
+      {/* indicator lights + lever */}
+      <circle cx="22" cy="42" r="2.2" fill="#4ade80" />
+      <circle cx="29" cy="42" r="2.2" fill="#f87171" />
+      <rect x="39" y="38" width="6" height="9" rx="1.5" fill={shade(color, -20)} />
+      <rect x="40.5" y="34" width="3" height="6" rx="1.5" fill="#334155" />
+      {/* beacon */}
+      <rect x="29" y="10" width="6" height="6" rx="1.5" fill="#1e293b" />
+      <ellipse cx="32" cy="10" rx="3.6" ry="2" fill={color} />
+    </g>
+  ),
 }
 
 // ─── Colour helpers ───────────────────────────────────────────────────────────
@@ -276,6 +342,12 @@ interface FlowNodeData {
   utilization?: number
   jobs?: number
   stationType?: string
+  shiftsPerDay?: number[]
+  // Set when this station names a Worker Controller pool (stations_data's
+  // "Worker Controller" field) — lets the View-mode panel show "Staffed by
+  // Worker Controller X" instead of leaving a pooled station looking
+  // identical to one using the plain static shift1/2/3 assignment.
+  workerController?: string
 }
 
 function FlowNode({ data, selected }: { data: FlowNodeData; selected: boolean }) {
@@ -328,35 +400,36 @@ function FlowNode({ data, selected }: { data: FlowNodeData; selected: boolean })
 // ─── BUILD MODE node ──────────────────────────────────────────────────────────
 
 // Station-type color coding — matches the shop-floor convention the user
-// specified (Station=green, Buffer/Queue=brown, Assembly=pink), with
-// Inspection/Packaging kept as they were (purple/orange). "Buffer" is a
+// specified (Station=green, Buffer/Queue=brown, Assembly=pink). "Buffer" is a
 // queue/buffer-like station (name contains "Queue"), not a real Object
 // Palette item — inferred purely from naming, same as the others below.
 // Falls back to green (plain Station) for legacy nodes with no stationType
 // set and no recognizable keyword.
 const STATION_TYPE_COLORS: Record<string, { border: string; dot: string; handle: string }> = {
-  Source:           { border: 'border-sky-400',    dot: 'bg-sky-500',    handle: '!bg-sky-400' },
+  Source:           { border: 'border-emerald-500', dot: 'bg-emerald-500', handle: '!bg-emerald-500' },
   Station:          { border: 'border-green-400',  dot: 'bg-green-500',  handle: '!bg-green-400' },
   'Parallel Station': { border: 'border-cyan-400', dot: 'bg-cyan-500',   handle: '!bg-cyan-400' },
   Buffer:           { border: 'border-amber-700',  dot: 'bg-amber-700',  handle: '!bg-amber-700' },
   Assembly:         { border: 'border-pink-400',   dot: 'bg-pink-500',   handle: '!bg-pink-400' },
   Dismantle:        { border: 'border-lime-500',   dot: 'bg-lime-600',   handle: '!bg-lime-500' },
-  Inspection:       { border: 'border-purple-400', dot: 'bg-purple-500', handle: '!bg-purple-400' },
-  Packaging:        { border: 'border-orange-400', dot: 'bg-orange-500', handle: '!bg-orange-400' },
   Conveyor:         { border: 'border-yellow-500', dot: 'bg-yellow-500', handle: '!bg-yellow-500' },
   Robot:            { border: 'border-indigo-400', dot: 'bg-indigo-500', handle: '!bg-indigo-400' },
   Connector:        { border: 'border-slate-400',  dot: 'bg-slate-500',  handle: '!bg-slate-400' },
   'Movable Part':   { border: 'border-rose-400',   dot: 'bg-rose-500',   handle: '!bg-rose-400' },
   Drain:            { border: 'border-red-400',    dot: 'bg-red-500',   handle: '!bg-red-400' },
+  Workplace:        { border: 'border-blue-400',   dot: 'bg-blue-500',  handle: '!bg-blue-400' },
+  Worker:           { border: 'border-amber-500',  dot: 'bg-amber-500', handle: '!bg-amber-500' },
+  'Worker Controller': { border: 'border-violet-400', dot: 'bg-violet-500', handle: '!bg-violet-400' },
 }
 const DEFAULT_STATION_COLOR = STATION_TYPE_COLORS.Station
 
 // Same station-type color coding as hex values, for contexts that can't use
 // Tailwind classes directly (e.g. React Flow's MiniMap nodeColor prop).
 const STATION_TYPE_HEX: Record<string, string> = {
-  Source: '#0ea5e9', Station: '#22c55e', 'Parallel Station': '#06b6d4', Buffer: '#b45309',
-  Assembly: '#ec4899', Dismantle: '#65a30d', Inspection: '#a855f7', Packaging: '#fb923c',
+  Source: '#10b981', Station: '#22c55e', 'Parallel Station': '#06b6d4', Buffer: '#b45309',
+  Assembly: '#ec4899', Dismantle: '#65a30d',
   Conveyor: '#eab308', Robot: '#6366f1', Connector: '#64748b', 'Movable Part': '#f43f5e', Drain: '#ef4444',
+  Workplace: '#3b82f6', Worker: '#f59e0b', 'Worker Controller': '#8b5cf6',
 }
 const DEFAULT_STATION_HEX = STATION_TYPE_HEX.Station
 
@@ -365,8 +438,8 @@ const DEFAULT_STATION_HEX = STATION_TYPE_HEX.Station
  * set — which is EVERY station in a scenario imported from Excel/YAML,
  * since 'Station Type' is a Canvas-only concept never written by the
  * parsers. Falls back to keyword-matching the station's name, the same
- * pattern already used for isAssembly below, extended to Buffer/Inspection/
- * Packaging too. Defaults to 'Station' (the common case — a plain
+ * pattern already used for isAssembly below, extended to Buffer too.
+ * Defaults to 'Station' (the common case — a plain
  * processing station) when no special keyword matches, rather than an
  * "unknown" color, since that's what almost every unmatched name actually is.
  */
@@ -376,15 +449,6 @@ function inferStationType(label: string, stationType?: string): string {
   if (name.startsWith('assembly')) return 'Assembly'
   if (/dismantle|disassembl/.test(name)) return 'Dismantle'
   if (/queue|buffer/.test(name)) return 'Buffer'
-  // Inspection is NOT guessed from the name (VT/RT/QA-named stations, common
-  // in imported scenarios, used to be auto-labeled "Inspection" here) — an
-  // inspection station has no different simulation behaviour from a plain
-  // Station, so guessing it from naming just added a cosmetic label with no
-  // real meaning behind it. It's still a real Object Palette item: a station
-  // explicitly built with it keeps its "Station Type": "Inspection" tag
-  // (handled by the `if (stationType) return stationType` line above) —
-  // only the naming-based GUESS for untagged/imported stations is removed.
-  if (/(pack|dispatch)/.test(name)) return 'Packaging'
   if (/conveyor|convey/.test(name)) return 'Conveyor'
   if (/\brobot/.test(name)) return 'Robot'
   if (/^source|entry/.test(name)) return 'Source'
@@ -399,26 +463,53 @@ function inferStationType(label: string, stationType?: string): string {
 // shape (a lighter "lid" strip along the top gives it a slight 3D read,
 // echoing the reference screenshot's blue boxes), and the corner badge +
 // type-specific summary line is what actually differentiates them.
-function StationNode({ data, selected }: { data: StationNodeData; selected: boolean }) {
+function StationNode({ id, data, selected }: { id: string; data: StationNodeData; selected: boolean }) {
   const inferredType = inferStationType(data.label, data.stationType)
   const colors = (inferredType && STATION_TYPE_COLORS[inferredType]) || DEFAULT_STATION_COLOR
+  // Worker/Workplace/Worker Controller are annotation-scale nodes (zero-time,
+  // no capacity of their own) — a slightly smaller icon than the full
+  // machine housing types reads as "lighter weight" and reduces the crowding
+  // these three caused sitting at full station size.
+  const isSmallIcon = inferredType === 'Worker' || inferredType === 'Workplace' || inferredType === 'Worker Controller'
 
+  // A Workplace, Worker, or Worker Controller with no edges at all isn't
+  // wired into anything yet — grey it out on the canvas so it visually
+  // reads as "not wired in" until the user connects it (Workplace to a
+  // station, Worker/Worker Controller to each other).
+  const edges = useEdges()
+  const isUnwired =
+    (inferredType === 'Workplace' || inferredType === 'Worker' || inferredType === 'Worker Controller') &&
+    !edges.some((e) => e.source === id || e.target === id)
+
+  // Default React Flow handles render at ~6px — easy to miss the hit-box on
+  // a fast drag, especially for the smaller Worker/Workplace/Worker
+  // Controller icons. Sized up with a white ring so they're both a bigger
+  // target and visible against any icon behind them.
+  const handleStyle = { width: 14, height: 14, border: '2px solid white' }
+
+  // Both dots are declared type="source". Under connectionMode={Loose} a
+  // source handle can both START and RECEIVE a connection (only "target"
+  // handles are start-restricted), so this makes every dot symmetric —
+  // any dot really can connect to any dot, in either direction — without
+  // stacking two overlapping <Handle> elements on the same spot (that
+  // approach silently breaks pointer hit-testing for whichever one ends
+  // up underneath).
   return (
     <div className="flex flex-col items-center px-1 py-1 group">
-      <Handle type="target" position={Position.Left} className={colors.handle} />
+      <Handle id="left" type="source" position={Position.Left} className={colors.handle} style={handleStyle} />
       {/* Just the icon artwork + name — no card/rectangle around it. The
           selection ring sits behind the icon rather than boxing it in, so
           the icon's own silhouette (housing, robot arm, belt, ...) stays
           the only visible shape. */}
       <div
-        className={`w-32 h-32 rounded-xl transition-shadow ${selected ? 'ring-2 ring-blue-500 ring-offset-2' : 'group-hover:ring-2 group-hover:ring-blue-200 group-hover:ring-offset-2'}`}
+        className={`${isSmallIcon ? 'w-24 h-24' : 'w-32 h-32'} rounded-xl transition-shadow ${selected ? 'ring-2 ring-blue-500 ring-offset-2' : 'group-hover:ring-2 group-hover:ring-blue-200 group-hover:ring-offset-2'} ${isUnwired ? 'grayscale opacity-60' : ''}`}
       >
         <IsoIcon type={inferredType} color={(inferredType && STATION_TYPE_HEX[inferredType]) || DEFAULT_STATION_HEX} />
       </div>
       <span className="text-sm font-semibold text-gray-800 truncate max-w-[150px] mt-1 bg-white/80 px-1.5 rounded">
         {data.label}
       </span>
-      <Handle type="source" position={Position.Right} className={colors.handle} />
+      <Handle id="right" type="source" position={Position.Right} className={colors.handle} style={handleStyle} />
     </div>
   )
 }
@@ -483,11 +574,279 @@ function NumericField({ value, onCommit, className }: { value: number; onCommit:
   )
 }
 
+// Read-only "Shifts available" display (View-mode station panel) — a plain
+// row of pills, one per shift, stops being readable once a scenario defines
+// more than a handful (wraps into several messy lines). Caps the pills shown
+// and folds the rest behind a "+N more" toggle instead, same idea as
+// ShiftAvailabilityDropdown below but for a static list, not an editor.
+function ShiftPillList({
+  shiftNums, shiftNames, maxVisible = 4,
+}: {
+  shiftNums: number[]
+  shiftNames: Record<number, string | undefined>
+  maxVisible?: number
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const shiftLabel = (n: number) => shiftNames[n]?.trim() || `Shift ${n}`
+  const visible = expanded ? shiftNums : shiftNums.slice(0, maxVisible)
+  const hiddenCount = shiftNums.length - visible.length
+
+  return (
+    <div className="flex flex-wrap gap-1">
+      {visible.map((n) => (
+        <span
+          key={n}
+          className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200"
+        >
+          {shiftLabel(n)}
+        </span>
+      ))}
+      {hiddenCount > 0 && (
+        <button
+          type="button"
+          onClick={() => setExpanded(true)}
+          className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-gray-100 text-gray-500 hover:bg-gray-200 transition-colors"
+        >
+          +{hiddenCount} more
+        </button>
+      )}
+      {expanded && shiftNums.length > maxVisible && (
+        <button
+          type="button"
+          onClick={() => setExpanded(false)}
+          className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-gray-100 text-gray-500 hover:bg-gray-200 transition-colors"
+        >
+          Show less
+        </button>
+      )}
+    </div>
+  )
+}
+
+// A multi-select dropdown for which shifts a station runs — a button-grid
+// with one cell per shift stops being usable once a scenario defines more
+// than ~6 shifts (wraps into an unreadable multi-row mess), so this instead
+// shows a compact summary ("Shift 1, Shift 2" or "3 shifts selected") and
+// opens a scrollable checklist on click, which stays readable at any shift count.
+function ShiftAvailabilityDropdown({
+  numShifts, shiftNames, selected, onChange,
+}: {
+  numShifts: number
+  shiftNames: Record<number, string | undefined>
+  selected: number[]
+  onChange: (next: number[]) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    const onClickOutside = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onClickOutside)
+    return () => document.removeEventListener('mousedown', onClickOutside)
+  }, [open])
+
+  const shiftLabel = (n: number) => shiftNames[n]?.trim() || `Shift ${n}`
+  const summary =
+    selected.length === 0 ? 'No shifts selected'
+    : selected.length === 1 ? shiftLabel(selected[0])
+    : selected.length <= 2 ? selected.map(shiftLabel).join(', ')
+    : `${selected.length} shifts selected`
+
+  const toggle = (shiftNum: number) => {
+    const next = selected.includes(shiftNum)
+      ? selected.filter((n) => n !== shiftNum)
+      : [...selected, shiftNum]
+    onChange(next.sort((a, b) => a - b))
+  }
+
+  return (
+    <div ref={rootRef} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className={`w-full h-8 flex items-center justify-between gap-2 rounded-lg border px-2.5 text-xs font-semibold transition-colors ${
+          selected.length === 0
+            ? 'border-amber-200 bg-amber-50 text-amber-600'
+            : 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
+        }`}
+      >
+        <span className="truncate">{summary}</span>
+        <ChevronDown className={`h-3.5 w-3.5 shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && (
+        <div className="absolute left-0 right-0 z-20 mt-1 max-h-52 overflow-y-auto rounded-lg border border-gray-200 bg-white shadow-lg py-1">
+          {Array.from({ length: numShifts }, (_, i) => i + 1).map((shiftNum) => {
+            const active = selected.includes(shiftNum)
+            return (
+              <button
+                key={shiftNum}
+                type="button"
+                onClick={() => toggle(shiftNum)}
+                className={`w-full flex items-center gap-2 px-2.5 py-1.5 text-xs text-left transition-colors ${
+                  active ? 'bg-emerald-50 hover:bg-emerald-100' : 'hover:bg-gray-50'
+                }`}
+              >
+                <span
+                  className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors ${
+                    active ? 'bg-emerald-500 border-emerald-500' : 'border-gray-300 bg-white'
+                  }`}
+                >
+                  {active && <Check className="h-3 w-3 text-white" strokeWidth={3} />}
+                </span>
+                <span className={active ? 'font-semibold text-emerald-700' : 'text-gray-500'}>{shiftLabel(shiftNum)}</span>
+              </button>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// A plain native <select>'s dropdown popup is rendered by the OS/browser,
+// not by our CSS — so it always shows default black-border/blue-highlight
+// styling no matter what className is put on the <select> itself. This is a
+// small custom single-select styled the same way ShiftAvailabilityDropdown
+// is (toggle button + absolute styled panel + click-outside-to-close), so
+// both the closed control and the open list match the rest of the app.
+function StyledSelect({
+  value, options, onChange,
+}: {
+  value: string
+  options: { value: string; label: string }[]
+  onChange: (next: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    const onClickOutside = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onClickOutside)
+    return () => document.removeEventListener('mousedown', onClickOutside)
+  }, [open])
+
+  const current = options.find((o) => o.value === value)
+
+  return (
+    <div ref={rootRef} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="w-full h-8 flex items-center justify-between gap-2 rounded-lg border border-gray-200 bg-gray-50 hover:bg-white px-2.5 text-sm text-gray-900 transition-colors"
+      >
+        <span className="truncate">{current?.label ?? value}</span>
+        <ChevronDown className={`h-3.5 w-3.5 shrink-0 text-gray-400 transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && (
+        <div className="absolute left-0 right-0 z-20 mt-1 rounded-lg border border-gray-200 bg-white shadow-lg py-1">
+          {options.map((opt) => {
+            const active = opt.value === value
+            return (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => { onChange(opt.value); setOpen(false) }}
+                className={`w-full flex items-center gap-2 px-2.5 py-1.5 text-xs text-left transition-colors ${
+                  active ? 'bg-blue-50 hover:bg-blue-100' : 'hover:bg-gray-50'
+                }`}
+              >
+                <span
+                  className={`flex h-4 w-4 shrink-0 items-center justify-center rounded-full border transition-colors ${
+                    active ? 'border-blue-500' : 'border-gray-300'
+                  }`}
+                >
+                  {active && <span className="h-2 w-2 rounded-full bg-blue-500" />}
+                </span>
+                <span className={active ? 'font-semibold text-blue-700' : 'text-gray-600'}>{opt.label}</span>
+              </button>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function MultiStyledSelect({
+  values, options, onChange, placeholder = 'Select…',
+}: {
+  values: string[]
+  options: { value: string; label: string }[]
+  onChange: (next: string[]) => void
+  placeholder?: string
+}) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    const onClickOutside = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onClickOutside)
+    return () => document.removeEventListener('mousedown', onClickOutside)
+  }, [open])
+
+  const selectedLabels = options.filter((o) => values.includes(o.value)).map((o) => o.label)
+  const toggle = (value: string) =>
+    onChange(values.includes(value) ? values.filter((v) => v !== value) : [...values, value])
+
+  return (
+    <div ref={rootRef} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="w-full h-8 flex items-center justify-between gap-2 rounded-lg border border-gray-200 bg-gray-50 hover:bg-white px-2.5 text-xs text-gray-900 transition-colors"
+      >
+        <span className="truncate">
+          {selectedLabels.length > 0 ? selectedLabels.join(', ') : placeholder}
+        </span>
+        <ChevronDown className={`h-3 w-3 shrink-0 text-gray-400 transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && (
+        <div className="absolute left-0 right-0 z-20 mt-1 rounded-lg border border-gray-200 bg-white shadow-lg py-1">
+          {options.length === 0 ? (
+            <p className="px-2.5 py-1.5 text-xs text-gray-400">No tasks yet.</p>
+          ) : (
+            options.map((opt) => {
+              const active = values.includes(opt.value)
+              return (
+                <button
+                  key={opt.value}
+                  type="button"
+                  onClick={() => toggle(opt.value)}
+                  className={`w-full flex items-center gap-2 px-2.5 py-1.5 text-xs text-left transition-colors ${
+                    active ? 'bg-blue-50 hover:bg-blue-100' : 'hover:bg-gray-50'
+                  }`}
+                >
+                  <span
+                    className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors ${
+                      active ? 'border-blue-500 bg-blue-500' : 'border-gray-300'
+                    }`}
+                  >
+                    {active && <Check className="h-3 w-3 text-white" />}
+                  </span>
+                  <span className={active ? 'font-semibold text-blue-700' : 'text-gray-600'}>{opt.label}</span>
+                </button>
+              )
+            })
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── Property editor ─────────────────────────────────────────────────────────
 
 function PropertyEditor({
-  node, nodes, edges, onChange, onDelete, onSaveStation, onAddParallel, numShifts, shiftNames,
-  globalWorkingDays, globalShiftHours, globalBreaks,
+  node, nodes, edges, onChange, onDelete, onSaveStation, onAddParallel, onAddWorkplace, onRemoveWorkplace, onToggleWire, onAssignOperator, onUnassignOperator, numShifts, shiftNames, operatorsData,
 }: {
   node: Node<StationNodeData>
   nodes: Node<StationNodeData>[]
@@ -496,11 +855,14 @@ function PropertyEditor({
   onDelete: (id: string) => void
   onSaveStation: () => void
   onAddParallel: (id: string) => void
+  onAddWorkplace: (id: string) => void
+  onRemoveWorkplace: (id: string) => void
+  onToggleWire: (sourceId: string, targetId: string, connect: boolean) => void
+  onAssignOperator: (operatorName: string, controllerId: string, workplaceId: string) => void
+  onUnassignOperator: (operatorName: string, controllerId: string, workplaceId: string) => void
   numShifts: number
   shiftNames: Record<number, string | undefined>
-  globalWorkingDays: Record<number, number[]>
-  globalShiftHours: Record<number, { start: number; end: number }>
-  globalBreaks: Record<number, { start: number; duration: number }[]>
+  operatorsData: Record<string, { 'Skill Rating': number; 'Availability (%)': number }>
 }) {
   const nodeType = inferStationType(node.data.label, node.data.stationType)
   // A Connector is a routing junction, a Conveyor is transport, and a
@@ -513,19 +875,189 @@ function PropertyEditor({
   const isConnector = nodeType === 'Connector'
   const isConveyor = nodeType === 'Conveyor'
   const isBookend = nodeType === 'Source' || nodeType === 'Drain'
+  // Worker and Worker Controller are zero-time annotation nodes, just like
+  // Connector — they don't do work themselves. A Worker Controller becomes a
+  // live dispatch pool at run time, drawing from every Worker wired upstream
+  // of it and staffing every Workplace wired downstream (see the save
+  // mutation's pool-wiring walk, and backend/engine/worker_pool.py).
+  const isWorker = nodeType === 'Worker'
+  const isWorkerController = nodeType === 'Worker Controller'
+  const isAnnotation = isConnector || isBookend || isWorker || isWorkerController
 
-  const fields = (isConnector || isBookend)
-    ? [{ key: 'label', label: 'Name', type: 'text' }]
+  // Non-blocking heads-up for a Worker Controller with nothing actually
+  // wired to it yet — same idea as RunDashboard.tsx's shiftCalendarWarnings:
+  // saving/running still works either way, this just flags a pool that will
+  // silently do nothing at run time (no Workers to dispatch, or nothing to
+  // dispatch them TO). Mirrors the save mutation's own upstream walk
+  // (Worker/Connector/Workplace are passthroughs) so the check matches
+  // exactly what gets written to stations_data on save.
+  const controllerWarnings: string[] = []
+  if (isWorkerController) {
+    const seen = new Set<string>()
+    let hasWorker = false
+    const staffedStations: Node<StationNodeData>[] = []
+    let frontierIds = [node.id]
+    while (frontierIds.length > 0) {
+      const nextIds: string[] = []
+      for (const id of frontierIds) {
+        if (seen.has(id)) continue
+        seen.add(id)
+        for (const e of edges.filter((edge) => edge.target === id)) {
+          const neighbor = nodes.find((nn) => nn.id === e.source)
+          if (!neighbor) continue
+          const t = inferStationType(neighbor.data.label, neighbor.data.stationType)
+          if (t === 'Worker') hasWorker = true
+          if (t === 'Worker' || t === 'Connector' || t === 'Workplace') {
+            nextIds.push(neighbor.id)
+          } else {
+            staffedStations.push(neighbor)
+          }
+        }
+      }
+      frontierIds = nextIds
+    }
+    if (!hasWorker) controllerWarnings.push('No Workers wired in — this pool has nobody to dispatch.')
+    if (staffedStations.length === 0) controllerWarnings.push('No stations staffed — wire a Workplace to a real station.')
+  }
+  // Workplace behaves exactly like Station, but a workplace with 0 operators
+  // makes no sense (per its whole purpose — a station that requires a
+  // worker), so its Operators field is clamped to a minimum of 1 instead of
+  // allowing the machine-only 0 that a plain Station permits.
+  const isWorkplace = nodeType === 'Workplace'
+  const isBuffer = nodeType === 'Buffer'
+  const isRobot = nodeType === 'Robot'
+  // A plain, real station (not Connector/Conveyor/Source/Drain/Worker/
+  // Workplace/Worker Controller/Buffer/Robot) can opt into being staffed
+  // directly by a Worker Controller via the "Requires Workplace" checkbox
+  // below, instead of needing a separate Workplace node manually wired in.
+  // A Buffer is just a queue/holding spot, and a Robot runs unattended —
+  // neither is ever a place a Worker stands, so both are excluded the same
+  // as the annotation types.
+  const isPlainStation = !isAnnotation && !isConveyor && !isWorkplace && !isBuffer && !isRobot
+
+  // Non-blocking heads-up for a Workplace not actually wired into anything —
+  // it needs BOTH an incoming edge from a real station (what it staffs) and
+  // an outgoing edge reaching a Worker Controller (through any chain of
+  // Connectors) to do anything at run time.
+  const workplaceWarnings: string[] = []
+  // Operators of every Worker currently wired into the Worker Controller
+  // this Workplace reaches — informational only (a Workplace never picks an
+  // operator itself; it's staffed by whichever Worker(s) are in that pool).
+  let workplaceOperatorNames: string[] = []
+  let reachedController: Node<StationNodeData> | null = null
+  if (isWorkplace) {
+    const hasRealStationIn = edges
+      .filter((e) => e.target === node.id)
+      .some((e) => {
+        const src = nodes.find((nn) => nn.id === e.source)
+        if (!src) return false
+        const t = inferStationType(src.data.label, src.data.stationType)
+        return t !== 'Worker' && t !== 'Worker Controller' && t !== 'Workplace'
+      })
+    const seen = new Set<string>()
+    let frontierIds = [node.id]
+    while (frontierIds.length > 0 && !reachedController) {
+      const nextIds: string[] = []
+      for (const id of frontierIds) {
+        if (seen.has(id)) continue
+        seen.add(id)
+        for (const e of edges.filter((edge) => edge.source === id)) {
+          const dest = nodes.find((nn) => nn.id === e.target)
+          if (!dest) continue
+          const t = inferStationType(dest.data.label, dest.data.stationType)
+          if (t === 'Worker Controller') { reachedController = dest; break }
+          if (t === 'Connector') nextIds.push(dest.id)
+        }
+        if (reachedController) break
+      }
+      frontierIds = nextIds
+    }
+    if (!hasRealStationIn) workplaceWarnings.push('Not connected from a real station — nothing to staff.')
+    if (!reachedController) workplaceWarnings.push('Not wired to a Worker Controller — this pool link does nothing.')
+    if (reachedController) {
+      workplaceOperatorNames = edges
+        .filter((e) => e.target === reachedController!.id)
+        .map((e) => nodes.find((nn) => nn.id === e.source))
+        .filter((n): n is Node<StationNodeData> => !!n && inferStationType(n.data.label, n.data.stationType) === 'Worker')
+        // A Worker with no assignedWorkplaceIds set hasn't used the picker
+        // yet — treat it as serving every Workplace on its Controller
+        // (old/simple behaviour). Once a Worker has picked specific
+        // Workplaces, only show it under those, not every sibling Workplace
+        // sharing the same Controller pool.
+        .filter((n) => !n.data.assignedWorkplaceIds || n.data.assignedWorkplaceIds.includes(node.id))
+        .map((n) => n.data.assignedOperator)
+        .filter((op): op is string => !!op)
+    }
+  }
+
+  // A plain station's Tasks mirror whichever Worker Controller staffs it —
+  // reached via its Workplace child (Station -> Workplace -> ... -> Controller),
+  // same chain the Workplace panel walks above. Kept as one shared list (on
+  // the Controller node) rather than a separate per-station list, so editing
+  // Tasks from either panel stays in sync.
+  let stationReachedController: Node<StationNodeData> | null = null
+  if (isPlainStation) {
+    const workplaceChild = edges
+      .filter((e) => e.source === node.id)
+      .map((e) => nodes.find((nn) => nn.id === e.target))
+      .find((n): n is Node<StationNodeData> => !!n && inferStationType(n.data.label, n.data.stationType) === 'Workplace')
+    if (workplaceChild) {
+      const seen = new Set<string>()
+      let frontierIds = [workplaceChild.id]
+      while (frontierIds.length > 0 && !stationReachedController) {
+        const nextIds: string[] = []
+        for (const id of frontierIds) {
+          if (seen.has(id)) continue
+          seen.add(id)
+          for (const e of edges.filter((edge) => edge.source === id)) {
+            const dest = nodes.find((nn) => nn.id === e.target)
+            if (!dest) continue
+            const t = inferStationType(dest.data.label, dest.data.stationType)
+            if (t === 'Worker Controller') { stationReachedController = dest; break }
+            if (t === 'Connector') nextIds.push(dest.id)
+          }
+          if (stationReachedController) break
+        }
+        frontierIds = nextIds
+      }
+    }
+  }
+
+  const fields = isAnnotation
+    // A Worker is identified purely by its picked Operator (see below) — an
+    // extra free-text Name would be redundant with that and never appears
+    // anywhere the operator name doesn't already, so it's dropped here.
+    ? (isWorker ? [] : [{ key: 'label', label: 'Name', type: 'text' }])
     : isConveyor
       ? [
           { key: 'label',         label: 'Name',                type: 'text'   },
           { key: 'transportTime', label: 'Transport Time (min)', type: 'number' },
         ]
-      : [
-          { key: 'label',     label: 'Name',            type: 'text'   },
-          { key: 'cycleTime', label: 'Cycle Time (min)', type: 'number' },
-          { key: 'operators', label: 'Operators',        type: 'number' },
-        ]
+      // A Workplace is never its own processflow step (see the save
+      // mutation's stepDuration — always 0 for Workplace) and its Operators
+      // count is never read either, since real staffing comes from the
+      // Worker Controller's pool. Cycle Time/Operators would silently do
+      // nothing here, so only Name is shown.
+      : isWorkplace
+        ? [{ key: 'label', label: 'Name', type: 'text' }]
+        : [
+            { key: 'label',     label: 'Name',            type: 'text'   },
+            { key: 'cycleTime', label: 'Cycle Time (min)', type: 'number' },
+            { key: 'operators', label: 'Operators',        type: 'number' },
+          ]
+
+  // An operator is one real person — the same one can't be two separate
+  // Worker nodes at once. Kept in the list (not filtered out) so the full
+  // roster is always visible, but disabled for picking once assigned to any
+  // OTHER Worker node on the canvas (this node's own current pick stays
+  // enabled, so re-opening the dropdown doesn't disable its own selection).
+  const operatorsTakenElsewhere = new Set(
+    nodes
+      .filter((n) => n.id !== node.id && inferStationType(n.data.label, n.data.stationType) === 'Worker')
+      .map((n) => n.data.assignedOperator)
+      .filter((op): op is string => !!op)
+  )
+  const operatorNames = Object.keys(operatorsData)
 
   // "Assembly Count" only makes sense on stations built from the Assembly
   // palette item. Keyed off stationType (set once at creation, restored from
@@ -540,11 +1072,18 @@ function PropertyEditor({
   // same station don't count as separate branches) this node's edges lead to.
   // More than one distinct destination = this station needs an "Exit
   // controller type" (routing) to decide which one a finished job goes to.
+  // A Workplace/Worker/Worker Controller reached from here is pool-wiring,
+  // not a real routing destination — excluded so wiring a Workplace next to
+  // a station never looks like a 2-way branch needing an Exit Controller.
   const destinationBases = Array.from(new Set(
     edges
       .filter((e) => e.source === node.id)
       .map((e) => nodes.find((n) => n.id === e.target))
       .filter((n): n is Node<StationNodeData> => !!n)
+      .filter((n) => {
+        const t = inferStationType(n.data.label, n.data.stationType)
+        return t !== 'Workplace' && t !== 'Worker' && t !== 'Worker Controller'
+      })
       .map((n) => baseStationName(n.data.label))
   ))
   const hasBranch = destinationBases.length > 1
@@ -615,6 +1154,392 @@ function PropertyEditor({
           </div>
         ))}
 
+        {/* Plain station — check to auto-create a Workplace node wired to
+            this station (Station -> Workplace); wire that Workplace on to a
+            Worker Controller yourself to finish staffing it. Unchecking
+            removes whichever Workplace(s) this created. */}
+        {isPlainStation && (
+          <div>
+            <label className="flex items-center gap-2 text-xs font-semibold text-gray-700">
+              <input
+                type="checkbox"
+                checked={node.data.requiresWorker ?? false}
+                onChange={(e) => {
+                  onChange(node.id, { requiresWorker: e.target.checked })
+                  if (e.target.checked) onAddWorkplace(node.id)
+                  else onRemoveWorkplace(node.id)
+                }}
+                className="h-3.5 w-3.5 rounded border-gray-300"
+              />
+              Requires Workplace
+            </label>
+            {node.data.requiresWorker && (
+              <p className="text-[10px] text-gray-400 mt-1.5">
+                A Workplace node was added below this station — wire it to a Worker Controller to finish staffing it.
+              </p>
+            )}
+          </div>
+        )}
+
+        {isPlainStation && (
+          <div>
+            <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+              Tasks
+            </label>
+            {stationReachedController ? (() => {
+              const controllerId = stationReachedController!.id
+              const tasks = stationReachedController!.data.controllerTasks ?? [
+                { id: 'demo-1', label: 'Restock cutting station thread spools', done: false },
+              ]
+              const toggleTask = (id: string) =>
+                onChange(controllerId, {
+                  controllerTasks: tasks.map((t) => (t.id === id ? { ...t, done: !t.done } : t)),
+                })
+              const removeTask = (id: string) =>
+                onChange(controllerId, { controllerTasks: tasks.filter((t) => t.id !== id) })
+              const addTask = () =>
+                onChange(controllerId, {
+                  controllerTasks: [...tasks, { id: `task-${Date.now()}`, label: 'New task', done: false }],
+                })
+              return (
+                <div className="space-y-1.5">
+                  {tasks.length > 0 ? (
+                    <div className="rounded-lg border border-gray-200 divide-y divide-gray-100">
+                      {tasks.map((t) => (
+                        <div key={t.id} className="flex items-center gap-2 px-2 py-1.5">
+                          <input
+                            type="checkbox"
+                            checked={t.done}
+                            onChange={() => toggleTask(t.id)}
+                            className="h-3.5 w-3.5 rounded border-gray-300 shrink-0"
+                          />
+                          <input
+                            type="text"
+                            value={t.label}
+                            onChange={(e) =>
+                              onChange(controllerId, {
+                                controllerTasks: tasks.map((tt) =>
+                                  tt.id === t.id ? { ...tt, label: e.target.value } : tt
+                                ),
+                              })
+                            }
+                            className="text-xs flex-1 min-w-0 bg-transparent border-none focus:outline-none focus:ring-1 focus:ring-indigo-300 rounded px-1 -mx-1 text-gray-700"
+                          />
+                          <button
+                            onClick={() => removeTask(t.id)}
+                            className="text-gray-300 hover:text-red-500 transition-colors shrink-0"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-[10px] text-gray-400">No tasks yet.</p>
+                  )}
+                  <button
+                    onClick={addTask}
+                    className="w-full flex items-center justify-center gap-1.5 py-1.5 text-[11px] font-semibold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded-lg border border-indigo-100 transition-colors"
+                  >
+                    <Plus className="w-3 h-3" /> Add task
+                  </button>
+                </div>
+              )
+            })() : (
+              <p className="text-[10px] text-gray-400">
+                Wire this station's Workplace to a Worker Controller to see and edit its Tasks here.
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* Worker — pick which named operator (defined in the scenario's
+            Operators tab) this node represents, plus how long it takes this
+            worker to move to a DIFFERENT Workplace than the one it was last
+            dispatched to (no cost returning to the same one). Contributes
+            into whichever Worker Controller's pool this node is wired to. */}
+        {isWorker && (
+          <div>
+            <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+              Operator
+            </label>
+            {operatorNames.length > 0 ? (
+              <select
+                value={node.data.assignedOperator ?? ''}
+                onChange={(e) => {
+                  const picked = e.target.value || undefined
+                  // The canvas node's own label follows the picked operator's
+                  // name (e.g. "Op1") instead of staying the generic "Worker
+                  // N" it was created with, so the wiring diagram reads as
+                  // who's actually assigned, not just which box was dropped
+                  // first. Falls back to the type name if cleared.
+                  onChange(node.id, { assignedOperator: picked, label: picked ?? 'Worker' })
+                }}
+                className="w-full h-8 text-sm rounded-lg border border-gray-200 bg-gray-50 focus:bg-white px-2"
+              >
+                <option value="">Select an operator…</option>
+                {operatorNames.map((name) => (
+                  <option key={name} value={name} disabled={operatorsTakenElsewhere.has(name)}>
+                    {name}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <p className="text-[10px] text-amber-500">No operators defined yet — add one in the Operators tab.</p>
+            )}
+            {node.data.assignedOperator && operatorsData[node.data.assignedOperator] && (
+              <div className="mt-2 grid grid-cols-2 gap-2">
+                <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
+                  <p className="text-sm font-bold text-gray-800">{operatorsData[node.data.assignedOperator]['Skill Rating']}</p>
+                  <p className="text-[9px] text-gray-500">Skill Rating</p>
+                </div>
+                <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
+                  <p className="text-sm font-bold text-gray-800">{operatorsData[node.data.assignedOperator]['Availability (%)']}%</p>
+                  <p className="text-[9px] text-gray-500">Availability</p>
+                </div>
+              </div>
+            )}
+            <div className="mt-3">
+              <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+                Travel Time (min)
+              </label>
+              <NumericField
+                value={node.data.travelTime ?? 0}
+                onCommit={(n) => onChange(node.id, { travelTime: Math.max(0, n) })}
+                className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+              />
+              <p className="text-[10px] text-gray-400 mt-1">Delay paid only when reassigned to a different Workplace.</p>
+            </div>
+            <p className="text-[10px] text-gray-400 mt-2">Connect this to a Worker Controller to join its pool.</p>
+
+            <div className="mt-3">
+              <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+                Workplaces
+              </label>
+              {(() => {
+                const controllerEdge = edges.find(
+                  (e) =>
+                    e.source === node.id &&
+                    (() => {
+                      const dest = nodes.find((nn) => nn.id === e.target)
+                      return dest ? inferStationType(dest.data.label, dest.data.stationType) === 'Worker Controller' : false
+                    })()
+                )
+                const controllerId = controllerEdge?.target
+                const allWorkplaces = nodes.filter((n) => inferStationType(n.data.label, n.data.stationType) === 'Workplace')
+                if (!controllerId) {
+                  return (
+                    <p className="text-[10px] text-gray-400">
+                      Connect this Worker to a Worker Controller first, then pick Workplaces here.
+                    </p>
+                  )
+                }
+                if (allWorkplaces.length === 0) {
+                  return <p className="text-[10px] text-gray-400">No Workplaces on the canvas yet.</p>
+                }
+                const assignedIds = node.data.assignedWorkplaceIds ?? []
+                return (
+                  <div className="rounded-lg border border-gray-200 divide-y divide-gray-100 max-h-40 overflow-y-auto">
+                    {allWorkplaces.map((wp) => {
+                      const checked = assignedIds.includes(wp.id)
+                      return (
+                        <label
+                          key={wp.id}
+                          className="flex items-center gap-2 px-2 py-1.5 text-xs text-gray-700 hover:bg-gray-50 cursor-pointer"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(e) => {
+                              // This Worker's own picked-list — independent of
+                              // any other Worker sharing the same Controller
+                              // pool (assignedWorkplaceIds), so OP_01 checking
+                              // a Workplace never shows as checked for OP_02.
+                              onChange(node.id, {
+                                assignedWorkplaceIds: e.target.checked
+                                  ? [...assignedIds, wp.id]
+                                  : assignedIds.filter((id) => id !== wp.id),
+                              })
+                              // Still keep the real Workplace -> Controller
+                              // edge present so the pool-wiring/save logic and
+                              // the Workplace's own Operators picker see this
+                              // Workplace as reachable from the Controller.
+                              if (e.target.checked && !edges.some((ed) => ed.source === wp.id && ed.target === controllerId)) {
+                                onToggleWire(wp.id, controllerId, true)
+                              }
+                            }}
+                            className="h-3.5 w-3.5 rounded border-gray-300"
+                          />
+                          {wp.data.label}
+                        </label>
+                      )
+                    })}
+                  </div>
+                )
+              })()}
+              <p className="text-[10px] text-gray-400 mt-1">
+                Checked Workplaces are the ones this Worker serves.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Worker Controller — the dispatch brain. It does not do work
+            itself: it maintains a pool of Workers (wired IN, upstream) and
+            staffs Workplaces (wired OUT, downstream) — see the save
+            mutation's pool-wiring walk and worker_pool.py's WorkerPool for
+            exactly how each setting below is used at run time. */}
+        {isWorkerController && (
+          <div className="space-y-3">
+            <label className="flex items-center gap-2 text-xs font-semibold text-gray-700">
+              <input
+                type="checkbox"
+                checked={node.data.controllerEnabled ?? true}
+                onChange={(e) => onChange(node.id, { controllerEnabled: e.target.checked })}
+                className="h-3.5 w-3.5 rounded border-gray-300"
+              />
+              Enabled
+            </label>
+
+            <div>
+              <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+                Assignment Strategy
+              </label>
+              <StyledSelect
+                value={node.data.assignmentStrategy ?? 'first_available'}
+                onChange={(v) => onChange(node.id, { assignmentStrategy: v as 'first_available' | 'round_robin' })}
+                options={[
+                  { value: 'first_available', label: 'First Available' },
+                  { value: 'round_robin', label: 'Round Robin' },
+                ]}
+              />
+            </div>
+
+            <label className="flex items-center gap-2 text-xs font-semibold text-gray-700">
+              <input
+                type="checkbox"
+                checked={node.data.useWorkerTravelTime ?? true}
+                onChange={(e) => onChange(node.id, { useWorkerTravelTime: e.target.checked })}
+                className="h-3.5 w-3.5 rounded border-gray-300"
+              />
+              Use Worker Travel Time
+            </label>
+
+            <p className="text-[10px] text-gray-400">
+              Wire Worker(s) in and Workplace(s) out to build this Controller's pool, or pick Workers below.
+            </p>
+
+            {/* Combined Workers + Tasks table — checking a Worker in still
+                creates/removes exactly the same edge the canvas wiring uses
+                (Worker -> Controller), so walkRealStations and the save
+                mutation don't need to know this table exists at all. Each
+                wired Worker additionally gets a Task dropdown right in its
+                row (assignedTaskId, UI-only), so assigning "who does what"
+                happens in one place instead of two separate lists.
+                Workplaces are wired in from the Workplace node's own panel
+                instead (its Operators picker), not from here. */}
+            <div>
+              <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+                Workers &amp; Tasks
+              </label>
+              {(() => {
+                const workers = nodes.filter((n) => inferStationType(n.data.label, n.data.stationType) === 'Worker')
+                return workers.length > 0 ? (
+                  <table className="w-full table-fixed border border-gray-200 rounded-lg border-collapse">
+                    <thead>
+                      <tr className="bg-gray-50">
+                        <th className="w-20 text-left text-[10px] font-bold text-gray-400 uppercase tracking-widest px-2 py-1.5 border-b border-gray-200">
+                          Worker
+                        </th>
+                        <th className="text-left text-[10px] font-bold text-gray-400 uppercase tracking-widest px-2 py-1.5 border-b border-gray-200">
+                          Task
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100">
+                      {workers.map((w) => {
+                        const wired = edges.some((e) => e.source === w.id && e.target === node.id)
+                        const taskTexts = w.data.taskTexts ?? ['']
+                        return (
+                          <tr key={w.id}>
+                            <td className="px-2 py-1.5 align-top w-20 overflow-hidden">
+                              <label className="flex items-center gap-2 cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  checked={wired}
+                                  onChange={(e) => onToggleWire(w.id, node.id, e.target.checked)}
+                                  className="h-3.5 w-3.5 rounded border-gray-300 shrink-0"
+                                />
+                                <span className="text-xs text-gray-700 truncate">{w.data.label}</span>
+                              </label>
+                            </td>
+                            <td className="px-2 py-1.5 align-top">
+                              {wired && (
+                                <div className="space-y-1 min-w-0">
+                                  {taskTexts.map((text, i) => (
+                                    <div key={i} className="flex items-center gap-1 min-w-0">
+                                      <div className="group/tt relative min-w-0 flex-1">
+                                        <input
+                                          type="text"
+                                          value={text}
+                                          onChange={(e) =>
+                                            onChange(w.id, {
+                                              taskTexts: taskTexts.map((t, ti) => (ti === i ? e.target.value : t)),
+                                            })
+                                          }
+                                          placeholder="blank space to write the task"
+                                          className="w-full min-w-0 text-xs bg-gray-50 border border-gray-200 rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-indigo-300 text-gray-700 placeholder:text-gray-400"
+                                        />
+                                        {text && (
+                                          <span className="pointer-events-none absolute left-0 top-full mt-1 z-30 max-w-xs whitespace-normal break-words rounded-lg bg-white text-gray-700 text-xs font-medium px-3 py-2 shadow-lg border border-gray-100 opacity-0 scale-95 origin-top transition-all duration-150 group-hover/tt:opacity-100 group-hover/tt:scale-100">
+                                            {text}
+                                          </span>
+                                        )}
+                                      </div>
+                                      <button
+                                        onClick={() => {
+                                          const next = taskTexts.filter((_, ti) => ti !== i)
+                                          onChange(w.id, { taskTexts: next.length > 0 ? next : [''] })
+                                        }}
+                                        className="text-gray-300 hover:text-red-500 transition-colors shrink-0"
+                                      >
+                                        <Trash2 className="w-3 h-3" />
+                                      </button>
+                                    </div>
+                                  ))}
+                                  <button
+                                    onClick={() => onChange(w.id, { taskTexts: [...taskTexts, ''] })}
+                                    className="flex items-center gap-1 text-[10px] font-semibold text-indigo-600 hover:text-indigo-700 transition-colors"
+                                  >
+                                    <Plus className="w-3 h-3" /> Add task
+                                  </button>
+                                </div>
+                              )}
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                ) : (
+                  <p className="text-[10px] text-gray-400">No Workers on the canvas yet.</p>
+                )
+              })()}
+            </div>
+
+            {controllerWarnings.length > 0 && (
+              <div className="rounded-lg border border-amber-200 bg-amber-50 p-2 space-y-1">
+                {controllerWarnings.map((w, i) => (
+                  <p key={i} className="text-[10px] text-amber-700 flex items-start gap-1">
+                    <span className="shrink-0">⚠</span>
+                    <span>{w}</span>
+                  </p>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Shift availability — any combination of the day's shifts (1, 2, 3)
             this station actually runs on, e.g. shift 2+3 while skipping
             shift 1. Feeds shifts_per_day, which the engine reads directly
@@ -622,234 +1547,25 @@ function PropertyEditor({
             the scenario's simulation_config (SHIFT_n_NAME) — renamed from
             Simulation Config's Shift Calendar, not editable here. Not shown
             for Connector/Source/Drain — none of them are ever "off shift"
-            in a way that means anything. */}
-        {!isConnector && !isBookend && (
+            in a way that means anything. Not shown for Workplace either —
+            its shifts always mirror the station it staffs (see
+            addWorkplaceFor/updateNode), so editing it here would be
+            misleading. */}
+        {!isAnnotation && !isWorkplace && (
         <div>
           <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
             Shift Available
           </label>
-          <div className="grid gap-1.5" style={{ gridTemplateColumns: `repeat(${numShifts}, 1fr)` }}>
-            {Array.from({ length: numShifts }, (_, i) => i + 1).map((shiftNum) => {
-              const selected = node.data.shiftsPerDay ?? [1]
-              const active = selected.includes(shiftNum)
-              const label = shiftNames[shiftNum]?.trim() || `Shift ${shiftNum}`
-              return (
-                <button
-                  key={shiftNum}
-                  type="button"
-                  title={label}
-                  onClick={() => {
-                    const next = active
-                      ? selected.filter((n) => n !== shiftNum)
-                      : [...selected, shiftNum]
-                    onChange(node.id, { shiftsPerDay: next.sort() })
-                  }}
-                  className={`h-8 rounded-lg text-xs font-semibold transition-colors select-none truncate px-1 ${
-                    active
-                      ? 'bg-green-400 text-white hover:brightness-95'
-                      : 'bg-gray-100 text-gray-400 hover:bg-gray-200'
-                  }`}
-                >
-                  {label}
-                </button>
-              )
-            })}
-          </div>
+          <ShiftAvailabilityDropdown
+            numShifts={numShifts}
+            shiftNames={shiftNames}
+            selected={node.data.shiftsPerDay ?? [1]}
+            onChange={(next) => onChange(node.id, { shiftsPerDay: next })}
+          />
           {(node.data.shiftsPerDay ?? [1]).length === 0 && (
             <p className="text-[10px] text-amber-500 mt-1">No shift selected — station will never be active.</p>
           )}
         </div>
-        )}
-
-        {/* Per-station working-days calendar — one MON-SUN row per shift this
-            station actually runs (from Shift Available above). Defaults to
-            the scenario's global Shift Calendar for that shift number until
-            toggled, at which point this station's own pattern is saved
-            (workingDaysByShift) and the engine's build_station_shift_config
-            overrides that shift's WORKING_DAYS_n for this station only —
-            other stations still using the shift's global calendar are
-            unaffected. Hidden for Connector/Source/Drain, same as above. */}
-        {!isConnector && !isBookend && (node.data.shiftsPerDay ?? [1]).length > 0 && (
-          <div>
-            <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
-              Working Days
-            </label>
-            <div className="space-y-2">
-              {(node.data.shiftsPerDay ?? [1]).map((shiftNum) => {
-                const label = shiftNames[shiftNum]?.trim() || `Shift ${shiftNum}`
-                const days = node.data.workingDaysByShift?.[shiftNum] ?? globalWorkingDays[shiftNum] ?? [0, 1, 2, 3, 4]
-                const isCustom = node.data.workingDaysByShift?.[shiftNum] !== undefined
-                return (
-                  <div key={shiftNum}>
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="text-[10px] font-semibold text-gray-500 truncate">{label}</span>
-                      {isCustom && (
-                        <button
-                          type="button"
-                          className="text-[9px] text-blue-500 hover:text-blue-700"
-                          title="Revert to this scenario's global Shift Calendar for this shift"
-                          onClick={() => {
-                            const next = { ...(node.data.workingDaysByShift ?? {}) }
-                            delete next[shiftNum]
-                            onChange(node.id, { workingDaysByShift: next })
-                          }}
-                        >
-                          Reset
-                        </button>
-                      )}
-                    </div>
-                    <div className="grid grid-cols-7 gap-1">
-                      {['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((d, dayIdx) => {
-                        const active = days.includes(dayIdx)
-                        return (
-                          <button
-                            key={dayIdx}
-                            type="button"
-                            title={['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'][dayIdx]}
-                            onClick={() => {
-                              const nextDays = (active ? days.filter((n) => n !== dayIdx) : [...days, dayIdx]).sort()
-                              onChange(node.id, {
-                                workingDaysByShift: { ...(node.data.workingDaysByShift ?? {}), [shiftNum]: nextDays },
-                              })
-                            }}
-                            className={`h-6 rounded text-[10px] font-bold transition-colors ${
-                              active
-                                ? 'bg-blue-400 text-white hover:brightness-95'
-                                : 'bg-gray-100 text-gray-400 hover:bg-gray-200'
-                            }`}
-                          >
-                            {d}
-                          </button>
-                        )
-                      })}
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
-          </div>
-        )}
-
-        {/* Per-station shift hours + breaks — same override-or-fall-back
-            pattern as Working Days above: a station starts on the
-            scenario's global hours/breaks for each shift it runs, and only
-            diverges once actually edited here. Persisted as shift{n} (an
-            "HH:MM-HH:MM" window string, parsed by the engine's
-            parse_shift_window) and breaks{n} on stations_data. */}
-        {!isConnector && !isBookend && (node.data.shiftsPerDay ?? [1]).length > 0 && (
-          <div>
-            <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
-              Shift Hours &amp; Breaks
-            </label>
-            <div className="space-y-3">
-              {(node.data.shiftsPerDay ?? [1]).map((shiftNum) => {
-                const label = shiftNames[shiftNum]?.trim() || `Shift ${shiftNum}`
-                const hours = node.data.shiftHoursByShift?.[shiftNum] ?? globalShiftHours[shiftNum] ?? { start: 8, end: 16 }
-                const hoursCustom = node.data.shiftHoursByShift?.[shiftNum] !== undefined
-                const breaks = node.data.breaksByShift?.[shiftNum] ?? globalBreaks[shiftNum] ?? []
-                const breaksCustom = node.data.breaksByShift?.[shiftNum] !== undefined
-
-                const setHours = (patch: Partial<{ start: number; end: number }>) => {
-                  onChange(node.id, {
-                    shiftHoursByShift: { ...(node.data.shiftHoursByShift ?? {}), [shiftNum]: { ...hours, ...patch } },
-                  })
-                }
-                const setBreaks = (next: { start: number; duration: number }[]) => {
-                  onChange(node.id, { breaksByShift: { ...(node.data.breaksByShift ?? {}), [shiftNum]: next } })
-                }
-
-                return (
-                  <div key={shiftNum} className="rounded-lg border border-gray-100 p-2">
-                    <div className="flex items-center justify-between mb-1.5">
-                      <span className="text-[10px] font-semibold text-gray-500 truncate">{label}</span>
-                      {(hoursCustom || breaksCustom) && (
-                        <button
-                          type="button"
-                          className="text-[9px] text-blue-500 hover:text-blue-700"
-                          title="Revert hours and breaks to this scenario's global Simulation Config for this shift"
-                          onClick={() => {
-                            const nextHours = { ...(node.data.shiftHoursByShift ?? {}) }
-                            delete nextHours[shiftNum]
-                            const nextBreaks = { ...(node.data.breaksByShift ?? {}) }
-                            delete nextBreaks[shiftNum]
-                            onChange(node.id, { shiftHoursByShift: nextHours, breaksByShift: nextBreaks })
-                          }}
-                        >
-                          Reset
-                        </button>
-                      )}
-                    </div>
-
-                    <div className="flex items-center gap-1.5 mb-2">
-                      <select
-                        value={hours.start}
-                        onChange={(e) => setHours({ start: Number(e.target.value) })}
-                        className="h-7 text-xs text-gray-800 bg-gray-50 border border-gray-200 rounded-md px-1 flex-1 min-w-0"
-                      >
-                        {HOUR_OPTIONS.map((h) => <option key={h} value={h}>{fmtHour(h)}</option>)}
-                      </select>
-                      <span className="text-[10px] text-gray-400 shrink-0">–</span>
-                      <select
-                        value={hours.end}
-                        onChange={(e) => setHours({ end: Number(e.target.value) })}
-                        className="h-7 text-xs text-gray-800 bg-gray-50 border border-gray-200 rounded-md px-1 flex-1 min-w-0"
-                      >
-                        {HOUR_OPTIONS.map((h) => <option key={h} value={h}>{fmtHour(h)}</option>)}
-                      </select>
-                    </div>
-
-                    <div className="space-y-1.5">
-                      {breaks.map((bw, bi) => (
-                        <div key={bi} className="rounded border border-gray-100 p-1.5 space-y-1">
-                          <div className="flex items-center justify-between">
-                            <span className="text-[9px] font-semibold text-gray-400 uppercase tracking-wide">Break starts</span>
-                            <button
-                              type="button"
-                              onClick={() => setBreaks(breaks.filter((_, i) => i !== bi))}
-                              className="text-gray-300 hover:text-red-500 transition-colors shrink-0"
-                              aria-label="Remove break"
-                            >
-                              <X className="h-3 w-3" />
-                            </button>
-                          </div>
-                          <select
-                            value={bw.start}
-                            onChange={(e) => {
-                              const next = [...breaks]
-                              next[bi] = { ...bw, start: Number(e.target.value) }
-                              setBreaks(next)
-                            }}
-                            className="h-6 text-[10px] text-gray-700 bg-gray-50 border border-gray-200 rounded px-1 w-full"
-                          >
-                            {HOUR_OPTIONS.map((h) => <option key={h} value={h}>{fmtHour(h)}</option>)}
-                          </select>
-                          <div className="flex items-center gap-1">
-                            <NumericField
-                              value={bw.duration}
-                              onCommit={(n) => {
-                                const next = [...breaks]
-                                next[bi] = { ...bw, duration: n }
-                                setBreaks(next)
-                              }}
-                              className="h-6 text-[10px] flex-1 min-w-0 rounded border-gray-200 bg-gray-50 px-1 [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
-                            />
-                            <span className="text-[9px] text-gray-400 shrink-0">min</span>
-                          </div>
-                        </div>
-                      ))}
-                      <button
-                        type="button"
-                        onClick={() => setBreaks([...breaks, { start: 12, duration: 30 }])}
-                        className="text-[10px] font-semibold text-blue-600 hover:text-blue-700"
-                      >
-                        + Add break
-                      </button>
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
-          </div>
         )}
 
         {/* Assembly count — only relevant on stations built from the
@@ -899,9 +1615,15 @@ function PropertyEditor({
 
         {/* Parallel machines — capacity is derived from the number of "Name #N"
             boxes for this station, so it's controlled here instead of a raw
-            field. Not meaningful for Connector/Source/Drain — there is only
-            ever exactly one of each in a line. */}
-        {!isConnector && !isBookend && (
+            field. Not meaningful for Connector/Source/Drain/Worker/Worker
+            Controller — there is only ever exactly one of each in a line.
+            Not meaningful for Workplace either — a Workplace just names
+            which station a Worker Controller staffs; "more capacity" there
+            is already the station's own Parallel Machines / the pool's own
+            Worker count, not a second Workplace. Not meaningful for Buffer
+            either — a Buffer is just a queue/holding spot, not a machine
+            whose throughput scales with parallel lanes. */}
+        {!isAnnotation && !isWorkplace && !isBuffer && (
         <div>
           <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
             Parallel Machines
@@ -913,6 +1635,103 @@ function PropertyEditor({
             <Plus className="w-3 h-3" /> Add parallel machine
           </button>
         </div>
+        )}
+
+        {isWorkplace && (
+          <div>
+            <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+              Operators &amp; Tasks
+            </label>
+            {!reachedController ? (
+              <p className="text-[10px] text-gray-400">
+                Wire this Workplace to a Worker Controller to assign operators here.
+              </p>
+            ) : Object.keys(operatorsData).length > 0 ? (
+              (() => {
+                return (
+                  <div className="rounded-lg border border-gray-200 max-h-72 overflow-y-auto">
+                    <table className="w-full table-fixed border-collapse">
+                      <thead>
+                        <tr>
+                          <th className="sticky top-0 z-10 bg-gray-50 w-20 text-left text-[10px] font-bold text-gray-400 uppercase tracking-widest px-2 py-1.5 border-b border-gray-200">
+                            Operator
+                          </th>
+                          <th className="sticky top-0 z-10 bg-gray-50 text-left text-[10px] font-bold text-gray-400 uppercase tracking-widest px-2 py-1.5 border-b border-gray-200">
+                            Task
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-100">
+                        {Object.keys(operatorsData).map((name) => {
+                          const checked = workplaceOperatorNames.includes(name)
+                          const workerNode = checked
+                            ? nodes.find(
+                                (n) =>
+                                  inferStationType(n.data.label, n.data.stationType) === 'Worker' &&
+                                  n.data.assignedOperator === name
+                              )
+                            : undefined
+                          return (
+                            <tr key={name}>
+                              <td className="px-2 py-1.5 align-top w-20 overflow-hidden">
+                                <label className="flex items-center gap-2 cursor-pointer">
+                                  <input
+                                    type="checkbox"
+                                    checked={checked}
+                                    onChange={(e) =>
+                                      e.target.checked
+                                        ? onAssignOperator(name, reachedController!.id, node.id)
+                                        : onUnassignOperator(name, reachedController!.id, node.id)
+                                    }
+                                    className="h-3.5 w-3.5 rounded border-gray-300 shrink-0"
+                                  />
+                                  <span className="text-xs text-gray-700 truncate">{name}</span>
+                                </label>
+                              </td>
+                              <td className="px-2 py-1.5 align-top">
+                                {checked && workerNode && (() => {
+                                  const taskTexts = (workerNode.data.taskTexts ?? ['']).filter((t) => t.trim())
+                                  return taskTexts.length > 0 ? (
+                                    <div className="space-y-1 min-w-0">
+                                      {taskTexts.map((text, i) => (
+                                        <div key={i} className="group/tt relative min-w-0">
+                                          <p className="truncate text-xs text-gray-700">
+                                            {text}
+                                          </p>
+                                          <span className="pointer-events-none absolute left-0 top-full mt-1 z-30 max-w-xs whitespace-normal break-words rounded-lg bg-white text-gray-700 text-xs font-medium px-3 py-2 shadow-lg border border-gray-100 opacity-0 scale-95 origin-top transition-all duration-150 group-hover/tt:opacity-100 group-hover/tt:scale-100">
+                                            {text}
+                                          </span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  ) : (
+                                    <p className="text-[10px] text-gray-400">No task set.</p>
+                                  )
+                                })()}
+                              </td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )
+              })()
+            ) : (
+              <p className="text-[10px] text-amber-500">No operators defined yet — add one in the Operators tab.</p>
+            )}
+          </div>
+        )}
+
+        {isWorkplace && workplaceWarnings.length > 0 && (
+          <div className="rounded-lg border border-amber-200 bg-amber-50 p-2 space-y-1">
+            {workplaceWarnings.map((w, i) => (
+              <p key={i} className="text-[10px] text-amber-700 flex items-start gap-1">
+                <span className="shrink-0">⚠</span>
+                <span>{w}</span>
+              </p>
+            ))}
+          </div>
         )}
 
         {/* Exit controller / routing — only shown once this station has more
@@ -1016,20 +1835,27 @@ function PropertyEditor({
 // amber/yellow) and would be hard to tell apart at a glance in a compact
 // palette list, so the icon shape is the primary differentiator and color
 // is the secondary one.
+// `displayLabel` (when present) is shown in the UI in place of `label` —
+// `label` stays the real internal type identifier (stationType, icon/color
+// map key, what gets saved as "Station Type") so existing scenarios saved
+// with e.g. "Station Type": "Source" keep working unchanged. Only Source and
+// Drain currently use this — their user-facing names ("Start"/"End") read
+// better than the internal type names they're stored under.
 const PALETTE_ITEMS = [
-  { label: 'Source',           description: 'Job entry point',    color: 'bg-sky-50 text-sky-500 border-sky-400' },
+  { label: 'Source',           displayLabel: 'Start', description: 'Job entry point',    color: 'bg-emerald-50 text-emerald-500 border-emerald-400' },
   { label: 'Station',          description: 'Processing station', color: 'bg-teal-50 text-teal-500 border-teal-400' },
   { label: 'Parallel Station', description: 'Multi-lane station', color: 'bg-cyan-50 text-cyan-500 border-cyan-400' },
   { label: 'Assembly',         description: 'Assembly station',   color: 'bg-green-50 text-green-500 border-green-400' },
   { label: 'Dismantle',        description: 'Disassembly station', color: 'bg-lime-50 text-lime-600 border-lime-400' },
-  { label: 'Inspection',       description: 'QA station',         color: 'bg-purple-50 text-purple-500 border-purple-400' },
-  { label: 'Packaging',        description: 'Pack & dispatch',    color: 'bg-orange-50 text-orange-500 border-orange-400' },
   { label: 'Buffer',           description: 'Queue / buffer',     color: 'bg-amber-50 text-amber-700 border-amber-700' },
   { label: 'Conveyor',         description: 'Material transport', color: 'bg-yellow-50 text-yellow-600 border-yellow-500' },
   { label: 'Robot',            description: 'Robotic handler',    color: 'bg-indigo-50 text-indigo-500 border-indigo-400' },
   { label: 'Connector',        description: 'Routing junction',   color: 'bg-slate-100 text-slate-500 border-slate-400' },
   { label: 'Movable Part',     description: 'Part / WIP token',   color: 'bg-rose-50 text-rose-500 border-rose-400' },
-  { label: 'Drain',            description: 'Job exit point',     color: 'bg-red-50 text-red-500 border-red-400' },
+  { label: 'Workplace',        description: 'Station requiring a worker', color: 'bg-blue-50 text-blue-500 border-blue-400' },
+  { label: 'Worker',           description: 'Assigned operator',  color: 'bg-amber-50 text-amber-600 border-amber-500' },
+  { label: 'Worker Controller', description: 'Skill/availability gate', color: 'bg-violet-50 text-violet-500 border-violet-400' },
+  { label: 'Drain',            displayLabel: 'End',   description: 'Job exit point',     color: 'bg-red-50 text-red-500 border-red-400' },
 ]
 
 // A step's `resource` is either a plain station name, or a routing dict
@@ -1049,7 +1875,7 @@ function buildFlowGraph(
   processflow: Record<string, { operation: string; resource: string | { mode: string; options: string[] }; duration: number }[]>,
   variant: string,
   stationStats: Record<string, { utilization: number; jobs: number }>,
-  stationsData: Record<string, { capacity?: number; 'Station Type'?: string }> = {},
+  stationsData: Record<string, { capacity?: number; 'Station Type'?: string; shifts_per_day?: number | number[]; 'Worker Controller'?: string }> = {},
 ): { nodes: Node<FlowNodeData>[]; edges: Edge[] } {
   const steps = processflow[variant] ?? []
   // FlowNode is now icon-first (112px icon + name/resource/duration/util rows
@@ -1101,6 +1927,8 @@ function buildFlowGraph(
             utilization: stat?.utilization,
             jobs: stat?.jobs,
             stationType: stationsData[resourceName]?.['Station Type'],
+            shiftsPerDay: normalizeShiftsPerDay(stationsData[resourceName]?.shifts_per_day),
+            workerController: stationsData[resourceName]?.['Worker Controller'],
           },
         })
         rowCursor += 1
@@ -1134,25 +1962,38 @@ function buildFlowGraph(
   if (stepNodeIds.length > 0) {
     const firstCol = stepNodeIds[0]
     const lastCol = stepNodeIds[stepNodeIds.length - 1]
+    // Skip the synthetic Start/End pill when the first/last column already
+    // IS a real Source/Drain station — otherwise the flow shows two "Start"
+    // (or "End") nodes stacked back to back for the same entry/exit point.
+    const firstColIsSource = firstCol.some(
+      (id) => nodes.find((n) => n.id === id)?.data.stationType === 'Source'
+    )
+    const lastColIsDrain = lastCol.some(
+      (id) => nodes.find((n) => n.id === id)?.data.stationType === 'Drain'
+    )
     const firstColYs = firstCol.map((id) => nodes.find((n) => n.id === id)!.position.y)
     const lastColYs = lastCol.map((id) => nodes.find((n) => n.id === id)!.position.y)
     const entryY = firstColYs.reduce((a, b) => a + b, 0) / firstColYs.length
     const exitY = lastColYs.reduce((a, b) => a + b, 0) / lastColYs.length
 
-    nodes.push({
-      id: 'entry',
-      type: 'endpoint',
-      position: { x: -160, y: entryY },
-      data: { label: 'Entry', kind: 'entry' },
-    })
-    nodes.push({
-      id: 'exit',
-      type: 'endpoint',
-      position: { x: stepNodeIds.length * COL_GAP + 40, y: exitY },
-      data: { label: 'Exit', kind: 'exit' },
-    })
+    if (!firstColIsSource) {
+      nodes.push({
+        id: 'entry',
+        type: 'endpoint',
+        position: { x: -160, y: entryY },
+        data: { label: 'Start', kind: 'entry' },
+      })
+    }
+    if (!lastColIsDrain) {
+      nodes.push({
+        id: 'exit',
+        type: 'endpoint',
+        position: { x: stepNodeIds.length * COL_GAP + 40, y: exitY },
+        data: { label: 'End', kind: 'exit' },
+      })
+    }
 
-    for (const tgt of firstCol) {
+    for (const tgt of (firstColIsSource ? [] : firstCol)) {
       edges.push({
         id: `e_entry__${tgt}`,
         source: 'entry',
@@ -1162,7 +2003,7 @@ function buildFlowGraph(
         style: { stroke: '#86efac', strokeWidth: 2 },
       })
     }
-    for (const src of lastCol) {
+    for (const src of (lastColIsDrain ? [] : lastCol)) {
       edges.push({
         id: `e_${src}__exit`,
         source: src,
@@ -1195,7 +2036,7 @@ function buildEditableGraph(
   // machines almost directly on top of each other once the icon grew that
   // much larger. Both gaps now clear the icon's actual footprint (128px
   // tall/wide) with real breathing room instead of overlapping.
-  const COL_GAP = 200
+  const COL_GAP = 260
   const ROW_GAP = 190
 
   const nodes: Node<StationNodeData>[] = []
@@ -1231,9 +2072,11 @@ function buildEditableGraph(
             transportTime: cfg?.['Transport Time'],
             assemblyCount: cfg?.['Assembly Count'],
             assemblyInputs: cfg?.['Assembly Inputs'],
-            workingDaysByShift: extractWorkingDaysByShift(cfg),
-            shiftHoursByShift: extractShiftHoursByShift(cfg),
-            breaksByShift: extractBreaksByShift(cfg),
+            // Worker/Worker Controller/Workplace are never real processflow
+            // steps, so they never reach this per-step loop at all — they're
+            // reconstructed separately, straight from stationsData, right
+            // before this function returns (see the "controllerEntries" pass
+            // below), which is also where their own fields get restored.
           },
         })
         rowCursor += 1
@@ -1276,12 +2119,110 @@ function buildEditableGraph(
     }
   }
 
+  // Worker/Worker Controller/Workplace never appear as processflow_data
+  // steps (they're zero-time pool-wiring passthroughs — see _is_passthrough
+  // in sim_core.py), so the per-step loop above never creates nodes for
+  // them. Reconstruct them here directly from stationsData so reopening a
+  // saved scenario in Build mode restores the wiring instead of silently
+  // dropping it (previously only the propagated effect — "Worker
+  // Controller"/"Pool Workers" on stationsData — survived a reload; the
+  // canvas nodes themselves reset to nothing). One Workplace is synthesized
+  // per real station a Controller staffs, and one Worker per pool member —
+  // this doesn't reproduce the exact original canvas layout (a Worker node's
+  // specific identity isn't separately recorded, only which operator it
+  // picked), but it IS a fully equivalent, re-editable wiring.
+  const controllerEntries = Object.entries(stationsData)
+    .filter(([, cfg]) => cfg['Station Type'] === 'Worker Controller')
+  if (controllerEntries.length > 0) {
+    // Real stations this Controller staffs — anything in stationsData whose
+    // "Worker Controller" names it (base names, so a parallel-machine
+    // station's #2/#3 boxes don't each get their own separate Workplace).
+    const staffedByController: Record<string, string[]> = {}
+    for (const [stationBase, cfg] of Object.entries(stationsData)) {
+      const ctrl = cfg['Worker Controller']
+      if (ctrl) (staffedByController[ctrl] ??= []).push(stationBase)
+    }
+
+    let poolNodeIndex = 0
+    const poolY = (nodes.length > 0 ? Math.max(...nodes.map((n) => n.position.y)) : 0) + ROW_GAP * 1.5
+    controllerEntries.forEach(([controllerBase, controllerCfg], ci) => {
+      const controllerNodeId = `wctl_${ci}_${controllerBase}`
+      const controllerX = ci * EDITABLE_COL_GAP + 40
+
+      nodes.push({
+        id: controllerNodeId,
+        type: 'station',
+        position: { x: controllerX, y: poolY },
+        data: {
+          label: controllerBase,
+          stationType: 'Worker Controller',
+          capacity: 1,
+          cycleTime: 0,
+          operators: 0,
+          controllerEnabled: controllerCfg['Enabled'] ?? true,
+          assignmentStrategy: controllerCfg['Assignment Strategy'] ?? 'first_available',
+          queuePolicy: controllerCfg['Queue Policy'] ?? 'queue',
+          maxQueueSize: controllerCfg['Max Queue Size'] ?? 20,
+          shiftStart: controllerCfg['Shift Start'],
+          shiftEnd: controllerCfg['Shift End'],
+          allowOvertime: controllerCfg['Allow Overtime'] ?? true,
+          useWorkerTravelTime: controllerCfg['Use Worker Travel Time'] ?? true,
+        },
+      })
+
+      // One Worker node per pool member, stacked above the Controller.
+      const poolWorkers = controllerCfg['Pool Workers'] ?? []
+      poolWorkers.forEach((w, wi) => {
+        const workerId = `worker_${poolNodeIndex++}_${controllerBase}_${wi}`
+        nodes.push({
+          id: workerId,
+          type: 'station',
+          position: { x: controllerX - 90 + wi * 90, y: poolY - ROW_GAP },
+          data: {
+            label: w.name || `Worker ${wi + 1}`,
+            stationType: 'Worker',
+            capacity: 1,
+            cycleTime: 0,
+            operators: 0,
+            assignedOperator: w.name || undefined,
+            travelTime: w.travel_time ?? 0,
+          },
+        })
+        edges.push({ id: `e_${workerId}__${controllerNodeId}`, source: workerId, target: controllerNodeId })
+      })
+
+      // One Workplace per real station this Controller staffs, wired
+      // Station -> Workplace -> Worker Controller (edges point INTO the
+      // Controller, matching how Canvas.tsx's save mutation walks them).
+      const staffed = staffedByController[controllerBase] ?? []
+      staffed.forEach((stationBase, si) => {
+        const stationNodeId = nodes.find((n) => baseStationName(n.data.label) === stationBase)?.id
+        if (!stationNodeId) return
+        const workplaceId = `wp_${poolNodeIndex++}_${controllerBase}_${si}`
+        nodes.push({
+          id: workplaceId,
+          type: 'station',
+          position: { x: controllerX + 90 + si * 90, y: poolY - ROW_GAP },
+          data: {
+            label: `${stationBase} Workplace`,
+            stationType: 'Workplace',
+            capacity: 1,
+            cycleTime: 0,
+            operators: 0,
+          },
+        })
+        edges.push({ id: `e_${stationNodeId}__${workplaceId}`, source: stationNodeId, target: workplaceId })
+        edges.push({ id: `e_${workplaceId}__${controllerNodeId}`, source: workplaceId, target: controllerNodeId })
+      })
+    })
+  }
+
   return { nodes, edges }
 }
 
 // Column/row spacing matching buildEditableGraph's own layout, needed again
 // here since ensureSourceAndDrain positions its inserted boxes relative to it.
-const EDITABLE_COL_GAP = 200
+const EDITABLE_COL_GAP = 260
 
 /**
  * Ensures a Build-mode graph starts with a Source and ends with a Drain —
@@ -1324,7 +2265,7 @@ function ensureSourceAndDrain(
     nextNodes.push({
       id, type: 'station',
       position: { x: minX - EDITABLE_COL_GAP, y: avgY },
-      data: { label: 'Source', stationType: 'Source', capacity: 1, cycleTime: 0, operators: 0, shiftsPerDay: [1] },
+      data: { label: 'Start', stationType: 'Source', capacity: 1, cycleTime: 0, operators: 0, shiftsPerDay: [1] },
     })
     for (const n of entryNodes) nextEdges.push({ id: `e_${id}__${n.id}`, source: id, target: n.id })
   }
@@ -1333,7 +2274,7 @@ function ensureSourceAndDrain(
     nextNodes.push({
       id, type: 'station',
       position: { x: maxX + EDITABLE_COL_GAP, y: avgY },
-      data: { label: 'Drain', stationType: 'Drain', capacity: 1, cycleTime: 0, operators: 0, shiftsPerDay: [1] },
+      data: { label: 'End', stationType: 'Drain', capacity: 1, cycleTime: 0, operators: 0, shiftsPerDay: [1] },
     })
     for (const n of exitNodes) nextEdges.push({ id: `e_${n.id}__${id}`, source: n.id, target: id })
   }
@@ -1357,65 +2298,6 @@ function normalizeShiftsPerDay(value: number | number[] | undefined): number[] {
   if (Array.isArray(value)) return value.filter((n) => Number.isInteger(n) && n >= 1)
   const n = value ?? 1
   return Array.from({ length: Math.max(0, n) }, (_, i) => i + 1)
-}
-
-/**
- * Collect a saved station's per-shift working-days overrides
- * (workingDays1, workingDays2, ...) back into the { shiftNum: days[] } shape
- * StationNodeData.workingDaysByShift uses, so reopening a saved scenario in
- * Build mode restores exactly what was toggled — not just the global
- * default every station starts from before any override is made.
- */
-function extractWorkingDaysByShift(cfg: StationConfig | undefined): Record<number, number[]> | undefined {
-  if (!cfg) return undefined
-  const out: Record<number, number[]> = {}
-  for (const key of Object.keys(cfg)) {
-    const match = /^workingDays(\d+)$/.exec(key)
-    if (!match) continue
-    const days = cfg[key]
-    if (Array.isArray(days)) out[Number(match[1])] = days as number[]
-  }
-  return Object.keys(out).length > 0 ? out : undefined
-}
-
-/**
- * Collect a saved station's per-shift hour-window overrides (shift1,
- * shift2, ... parsed as "HH:MM-HH:MM") back into the
- * { shiftNum: {start, end} } shape StationNodeData.shiftHoursByShift uses.
- * A value that ISN'T a valid window string (e.g. a real operator name, or
- * blank) is simply not a station-level hour override — silently skipped
- * rather than restored as garbage.
- */
-function extractShiftHoursByShift(cfg: StationConfig | undefined): Record<number, { start: number; end: number }> | undefined {
-  if (!cfg) return undefined
-  const out: Record<number, { start: number; end: number }> = {}
-  for (const key of Object.keys(cfg)) {
-    const match = /^shift(\d+)$/.exec(key)
-    if (!match) continue
-    const raw = cfg[key]
-    if (typeof raw !== 'string') continue
-    const windowMatch = /^(\d{1,2}):\d{2}-(\d{1,2}):\d{2}$/.exec(raw.trim())
-    if (!windowMatch) continue
-    out[Number(match[1])] = { start: Number(windowMatch[1]), end: Number(windowMatch[2]) }
-  }
-  return Object.keys(out).length > 0 ? out : undefined
-}
-
-/**
- * Collect a saved station's per-shift break overrides (breaks1, breaks2,
- * ...) back into the { shiftNum: BreakWindow[] } shape
- * StationNodeData.breaksByShift uses.
- */
-function extractBreaksByShift(cfg: StationConfig | undefined): Record<number, { start: number; duration: number }[]> | undefined {
-  if (!cfg) return undefined
-  const out: Record<number, { start: number; duration: number }[]> = {}
-  for (const key of Object.keys(cfg)) {
-    const match = /^breaks(\d+)$/.exec(key)
-    if (!match) continue
-    const breaks = cfg[key]
-    if (Array.isArray(breaks)) out[Number(match[1])] = breaks as { start: number; duration: number }[]
-  }
-  return Object.keys(out).length > 0 ? out : undefined
 }
 
 // ─── Page ─────────────────────────────────────────────────────────────────────
@@ -1443,6 +2325,27 @@ export default function Canvas() {
   // Build mode state
   const [nodes, setNodes, onNodesChange] = useNodesState<StationNodeData>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState([])
+  // Worker/Worker Controller/Workplace wiring is a data relationship, not a
+  // process-flow connection — hide those edges' lines on the canvas however
+  // they were created (drag-drawn, or via a picker checkbox), so the
+  // diagram only shows the actual production flow. The edges themselves
+  // still exist in `edges` and are used exactly as before for save/pool
+  // logic; only the rendered ReactFlow instance gets this filtered view.
+  const visibleEdges = useMemo(
+    () =>
+      edges.map((e) => {
+        const src = nodes.find((n) => n.id === e.source)
+        const dst = nodes.find((n) => n.id === e.target)
+        const srcType = src ? inferStationType(src.data.label, src.data.stationType) : undefined
+        const dstType = dst ? inferStationType(dst.data.label, dst.data.stationType) : undefined
+        const isPoolWiring = (t?: string) => t === 'Worker' || t === 'Worker Controller' || t === 'Workplace'
+        if (isPoolWiring(srcType) || isPoolWiring(dstType)) {
+          return { ...e, style: { ...e.style, opacity: 0, pointerEvents: 'none' as const } }
+        }
+        return e
+      }),
+    [edges, nodes]
+  )
   const [selectedNode, setSelectedNode] = useState<Node<StationNodeData> | null>(null)
   const [scenarioName, setScenarioName] = useState('')
 
@@ -1454,6 +2357,26 @@ export default function Canvas() {
   const nextNodeId = () => {
     nodeCounterRef.current += 1
     return nodeCounterRef.current
+  }
+
+  // Per-type display label — a monotonic "highest number ever assigned"
+  // counter, e.g. add Controller 1/2/3, delete #2, add another: the next
+  // one is Controller 4, not a reused 2 — a delete never frees a number.
+  // Seeded (and re-seeded on every call, via Math.max) from the highest
+  // EXACT "BaseLabel N" match currently on the canvas, so a reload picks up
+  // from the right point without needing separate persistence, but the ref
+  // itself never moves backward once advanced, so a mid-session delete
+  // can't cause reuse the way scanning live nodes alone would.
+  const labelCounterRef = useRef<Record<string, number>>({})
+  const nextLabel = (baseLabel: string, currentNodes: Node<StationNodeData>[]) => {
+    const highestOnCanvas = currentNodes.reduce((max, n) => {
+      const m = n.data.label.match(/^(.*)\s+(\d+)$/)
+      return m && m[1] === baseLabel ? Math.max(max, Number(m[2])) : max
+    }, 0)
+    const prev = labelCounterRef.current[baseLabel] ?? 0
+    const next = Math.max(prev, highestOnCanvas) + 1
+    labelCounterRef.current[baseLabel] = next
+    return `${baseLabel} ${next}`
   }
 
   // View mode: derive graph from scenario
@@ -1624,15 +2547,30 @@ export default function Canvas() {
     // convention) — added automatically for scenarios saved before this
     // existed, or imported from Excel/YAML, which never have them.
     const { nodes: finalNodes, edges: finalEdges } = ensureSourceAndDrain(editNodes, editEdges, nextNodeId)
+    // Reconstructed/imported edges carry no handle info of their own —
+    // normalized the same way onConnect normalizes new edges, so a reload
+    // renders the same clean right-to-left flow instead of React Flow
+    // picking default (possibly backward-looking) anchor points.
     setNodes(finalNodes)
-    setEdges(finalEdges)
+    setEdges(finalEdges.map((e) => ({ ...e, sourceHandle: 'right', targetHandle: 'left' })))
     setScenarioName(activeScenario.name)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, activeScenario, selectedVariant])
 
-  // Build mode handlers
+  // Build mode handlers.
+  // Every station has a "left" and "right" dot, both declared type="source"
+  // under connectionMode={Loose} so either dot can start OR receive a drag
+  // (see StationNode's comment) — but that means a connection can just as
+  // easily land left-to-left or right-to-right, which React Flow then
+  // renders as a curved, backward-looking line instead of the clean
+  // left-to-right flow the sketch shows. New connections are normalized
+  // here to always leave a node's right dot and arrive at the other node's
+  // left dot, regardless of which two dots the user actually dragged
+  // between, so every edge reads the same direction on the canvas.
   const onConnect = useCallback(
-    (params: Connection | Edge) => setEdges((eds) => addEdge(params, eds)),
+    (params: Connection | Edge) => {
+      setEdges((eds) => addEdge({ ...params, sourceHandle: 'right', targetHandle: 'left' }, eds))
+    },
     [setEdges]
   )
 
@@ -1642,13 +2580,34 @@ export default function Canvas() {
   const updateEdgeLabel = (id: string, label: string) => {
     setEdges((eds) => eds.map((e) => (e.id === id ? { ...e, label } : e)))
   }
+  const deleteEdge = (id: string) => {
+    setEdges((eds) => eds.filter((e) => e.id !== id))
+    setSelectedEdgeId(null)
+  }
 
   // `dropPosition` (already in flow coordinates) places the new node exactly
   // there — used when a palette item is dragged onto the canvas, Tecomatix-
   // style. Omitted for a plain click on the palette item, which keeps the
   // old auto-placement (rightmost node + offset) as a one-click fallback.
-  const addNode = (label: string, dropPosition?: { x: number; y: number }) => {
+  // `typeName` is the real internal type (stationType, e.g. "Source") — kept
+  // unchanged so existing scenarios stay compatible. `initialName` (when
+  // given, e.g. "Start" for Source) is just what the station's own editable
+  // Name field starts as, since the internal type name isn't always the
+  // nicest thing to show a user as the station's actual name.
+  const addNode = (typeName: string, dropPosition?: { x: number; y: number }, initialName?: string) => {
     const id = nextNodeId()
+    // Every drop of the same palette item otherwise gets the identical label
+    // (e.g. two "Worker" nodes) — a monotonically increasing per-type
+    // counter suffixes the next number so each instance is distinct out of
+    // the box ("Worker 1", "Worker 2", ...). Skipped when the caller passes
+    // an explicit initialName (e.g. Source/Drain's "Start"/"End" — those
+    // stay singular by convention). Computed here, OUTSIDE setNodes's
+    // updater, because React 18 Strict Mode (dev only) invokes a functional
+    // setState updater twice — nextLabel has a side effect (advancing
+    // labelCounterRef), so calling it from inside the updater silently burnt
+    // two numbers per add (only odd numbers ever appearing: Worker 1, 3, 5).
+    const label = initialName ?? nextLabel(initialName ?? typeName, nodes)
+    const newNodeId = `station_${id}`
     setNodes((nds) => {
       const rightmostX = nds.length > 0 ? Math.max(...nds.map((n) => n.position.x)) : 40
       const avgY = nds.length > 0 ? nds.reduce((sum, n) => sum + n.position.y, 0) / nds.length : 160
@@ -1657,25 +2616,115 @@ export default function Canvas() {
       // them: a Connector never processes (0 cycle time, no operator) and a
       // Conveyor moves rather than works (transport time, no operator).
       const data: StationNodeData =
-        label === 'Connector'
-          ? { label, stationType: label, capacity: 1, cycleTime: 0, operators: 0, shiftsPerDay: [1] }
-          : label === 'Conveyor'
-            ? { label, stationType: label, capacity: 1, cycleTime: 0, operators: 0, transportTime: 5, shiftsPerDay: [1] }
-            : { label, stationType: label, capacity: 1, cycleTime: 30, operators: 1, shiftsPerDay: [1] }
+        typeName === 'Connector' || typeName === 'Worker' || typeName === 'Worker Controller'
+          ? { label, stationType: typeName, capacity: 1, cycleTime: 0, operators: 0, shiftsPerDay: [1] }
+          : typeName === 'Conveyor'
+            ? { label, stationType: typeName, capacity: 1, cycleTime: 0, operators: 0, transportTime: 5, shiftsPerDay: [1] }
+            : { label, stationType: typeName, capacity: 1, cycleTime: 30, operators: 1, shiftsPerDay: [1] }
       return [
         ...nds,
         {
-          id: `station_${id}`,
+          id: newNodeId,
           type: 'station',
           position,
           data,
         },
       ]
     })
+    return newNodeId
+  }
+
+  // Workplace panel's Operator picker — checking an operator name either
+  // wires an existing unassigned Worker for that operator into this
+  // Workplace's Controller, or creates a fresh Worker node (positioned near
+  // the Controller) preset to that operator and wires it in. Reuses the same
+  // Worker -> Controller edge toggleWire already creates by hand. Also
+  // records this Workplace on the Worker's own assignedWorkplaceIds, so two
+  // Workers sharing one Controller pool can each serve different
+  // Workplace(s) instead of a checkbox for one silently applying to both.
+  const assignOperatorToController = (operatorName: string, controllerId: string, workplaceId: string) => {
+    const controllerNode = nodes.find((n) => n.id === controllerId)
+    // Any Worker node already representing this operator — whether or not
+    // it's wired to this Controller yet — is reused rather than duplicated.
+    // A duplicate would previously get created whenever the operator was
+    // already wired to THIS SAME Controller (just for a different
+    // Workplace), since the old check only looked for an unwired Worker.
+    const existingWorker = nodes.find(
+      (n) => inferStationType(n.data.label, n.data.stationType) === 'Worker' && n.data.assignedOperator === operatorName
+    )
+    if (existingWorker) {
+      if (!edges.some((e) => e.source === existingWorker.id && e.target === controllerId)) {
+        toggleWire(existingWorker.id, controllerId, true)
+      }
+      updateNode(existingWorker.id, {
+        assignedWorkplaceIds: [...(existingWorker.data.assignedWorkplaceIds ?? []), workplaceId],
+      })
+      return
+    }
+    const controllerPos = controllerNode?.position ?? { x: 80, y: 160 }
+    // Stagger each newly-created Worker vertically by how many Workers are
+    // already wired into this Controller, so repeatedly picking new
+    // operators from the Workplace panel doesn't stack them on top of each
+    // other at the exact same spot.
+    const existingWorkerCount = nodes.filter(
+      (n) =>
+        inferStationType(n.data.label, n.data.stationType) === 'Worker' &&
+        edges.some((e) => e.source === n.id && e.target === controllerId)
+    ).length
+    const newWorkerId = addNode('Worker', {
+      x: controllerPos.x - 220,
+      y: controllerPos.y + existingWorkerCount * 40,
+    })
+    updateNode(newWorkerId, { assignedOperator: operatorName, label: operatorName, assignedWorkplaceIds: [workplaceId] })
+    toggleWire(newWorkerId, controllerId, true)
+  }
+
+  // Unchecking an operator in ONE Workplace's picker should only exclude it
+  // from THAT Workplace, not evict it from the whole Controller pool if it
+  // still serves other Workplaces there. Only fully unwire (toggleWire ...
+  // false) when this was the Worker's last Workplace on this Controller —
+  // mirrors assignOperatorToController, which is the only other place that
+  // creates this edge from the Workplace side.
+  const unassignOperatorFromController = (operatorName: string, controllerId: string, workplaceId: string) => {
+    const allWorkplacesOnController = nodes
+      .filter((n) => inferStationType(n.data.label, n.data.stationType) === 'Workplace')
+      .filter((wp) => edges.some((e) => e.source === wp.id && e.target === controllerId))
+      .map((wp) => wp.id)
+    nodes
+      .filter(
+        (n) =>
+          inferStationType(n.data.label, n.data.stationType) === 'Worker' &&
+          n.data.assignedOperator === operatorName &&
+          edges.some((e) => e.source === n.id && e.target === controllerId)
+      )
+      .forEach((n) => {
+        // No assignedWorkplaceIds yet means "serves every Workplace on this
+        // Controller" (see workplaceOperatorNames) — unchecking one specific
+        // Workplace has to first spell out the full list minus this one,
+        // otherwise there'd be no way to record "all but this Workplace".
+        const currentList = n.data.assignedWorkplaceIds ?? allWorkplacesOnController
+        const remaining = currentList.filter((id) => id !== workplaceId)
+        updateNode(n.id, { assignedWorkplaceIds: remaining })
+        if (remaining.length === 0) toggleWire(n.id, controllerId, false)
+      })
   }
 
   const updateNode = (id: string, patch: Partial<StationNodeData>) => {
-    setNodes((nds) => nds.map((n) => (n.id === id ? { ...n, data: { ...n.data, ...patch } } : n)))
+    // A station's own Shift Available selection propagates onto any
+    // Workplace(s) it created via "Requires Workplace" — the Workplace
+    // exists only to staff this one station, so it should never claim
+    // availability on a shift the station itself doesn't run.
+    const workplaceIds = patch.shiftsPerDay
+      ? new Set(
+          edges.filter((e) => e.source === id).map((e) => e.target)
+            .filter((wid) => nodes.find((n) => n.id === wid)?.data.stationType === 'Workplace')
+        )
+      : null
+    setNodes((nds) => nds.map((n) => {
+      if (n.id === id) return { ...n, data: { ...n.data, ...patch } }
+      if (workplaceIds?.has(n.id)) return { ...n, data: { ...n.data, shiftsPerDay: patch.shiftsPerDay } }
+      return n
+    }))
     if (selectedNode?.id === id) setSelectedNode((p) => p ? { ...p, data: { ...p.data, ...patch } } : null)
   }
 
@@ -1683,6 +2732,77 @@ export default function Canvas() {
     setNodes((nds) => nds.filter((n) => n.id !== id))
     setEdges((eds) => eds.filter((e) => e.source !== id && e.target !== id))
     setSelectedNode(null)
+  }
+
+  /** Worker Controller panel's Worker/Workplace picker tables: checking a
+   *  row draws (or unchecking removes) the exact same source->target edge
+   *  the canvas wiring itself uses, so no other pool-wiring logic needs to
+   *  change to support this alternate way of building the pool. */
+  const toggleWire = (sourceId: string, targetId: string, connect: boolean) => {
+    setEdges((eds) => {
+      if (connect) {
+        if (eds.some((e) => e.source === sourceId && e.target === targetId)) return eds
+        // style: opacity 0 keeps this a fully normal React Flow edge (so save
+        // and the pool-wiring graph-walk see it exactly like a hand-drawn
+        // connection, and it survives React Flow's own change-tracking)
+        // without drawing a visible line on the canvas — picker-driven
+        // wiring shouldn't clutter the diagram the way an intentional
+        // drag-drawn connection does. (hidden: true was tried first but
+        // React Flow silently dropped those edges on re-render.)
+        return [
+          ...eds,
+          {
+            id: `e_${sourceId}__${targetId}`,
+            source: sourceId,
+            target: targetId,
+            style: { opacity: 0, pointerEvents: 'none' as const },
+          },
+        ]
+      }
+      return eds.filter((e) => !(e.source === sourceId && e.target === targetId))
+    })
+  }
+
+  /** "Requires Workplace" checkbox on a plain station: creates a Workplace node
+   *  next to it, pre-wired Station -> Workplace, so the user only has to draw
+   *  the remaining Workplace -> Worker Controller edge themselves. */
+  const addWorkplaceFor = (stationId: string) => {
+    const workplaceId = `station_${nextNodeId()}`
+    setNodes((nds) => {
+      const station = nds.find((n) => n.id === stationId)
+      if (!station) return nds
+      const label = `${baseStationName(station.data.label)} Workplace`
+      return [
+        ...nds,
+        {
+          id: workplaceId,
+          type: 'station',
+          position: { x: station.position.x, y: station.position.y + 170 },
+          data: {
+            label, stationType: 'Workplace', capacity: 1, cycleTime: 0, operators: 1,
+            // Mirrors the station's own shift availability — a Workplace only
+            // ever exists to staff its one station, so it should never be
+            // "available" on a shift the station itself doesn't run.
+            shiftsPerDay: station.data.shiftsPerDay ?? [1],
+          },
+        },
+      ]
+    })
+    setEdges((eds) => [...eds, { id: `e_${stationId}__${workplaceId}`, source: stationId, target: workplaceId }])
+    return workplaceId
+  }
+
+  /** Removes the Workplace node(s) this station created when its "Requires
+   *  Worker" checkbox is unchecked, so toggling it off doesn't leave an
+   *  orphaned Workplace dangling on the canvas. */
+  const removeWorkplaceFor = (stationId: string) => {
+    const workplaceIds = new Set(
+      edges.filter((e) => e.source === stationId).map((e) => e.target)
+        .filter((id) => nodes.find((n) => n.id === id)?.data.stationType === 'Workplace')
+    )
+    if (workplaceIds.size === 0) return
+    setNodes((nds) => nds.filter((n) => !workplaceIds.has(n.id)))
+    setEdges((eds) => eds.filter((e) => !workplaceIds.has(e.source) && !workplaceIds.has(e.target)))
   }
 
   // How many shifts/day this scenario defines — derived from the highest
@@ -1698,42 +2818,6 @@ export default function Canvas() {
   const shiftNames: Record<number, string | undefined> = Object.fromEntries(
     Array.from({ length: numShifts }, (_, i) => i + 1).map((n) => [n, simCfgRaw[`SHIFT_${n}_NAME`] as string | undefined])
   )
-  // The scenario's GLOBAL working-days pattern per shift number (Simulation
-  // Config's Shift Calendar) — the baseline a station's own per-station
-  // override (workingDaysByShift) starts from and can diverge away from.
-  // Matches the engine's own default (SimulationUtils.working_days): Mon-Fri
-  // for shifts 1/2, every day for shift 3+, when the scenario hasn't set one.
-  const globalWorkingDays: Record<number, number[]> = Object.fromEntries(
-    Array.from({ length: numShifts }, (_, i) => i + 1).map((n) => [
-      n,
-      (simCfgRaw[`WORKING_DAYS_${n}`] as number[] | undefined) ?? (n <= 2 ? [0, 1, 2, 3, 4] : [0, 1, 2, 3, 4, 5, 6]),
-    ])
-  )
-  // The scenario's GLOBAL shift hours per shift number — same fallback
-  // constants as RunDashboard's Simulation Config dialog (SHIFT_DEFAULTS),
-  // so a station's "no override" state shows the same hours the user would
-  // see in Simulation Config, not an arbitrary placeholder.
-  const SHIFT_HOUR_DEFAULTS: Record<number, { start: number; end: number }> = {
-    1: { start: 6, end: 14 }, 2: { start: 14, end: 22 }, 3: { start: 22, end: 6 },
-  }
-  const globalShiftHours: Record<number, { start: number; end: number }> = Object.fromEntries(
-    Array.from({ length: numShifts }, (_, i) => i + 1).map((n) => [
-      n,
-      {
-        start: (simCfgRaw[`SHIFT_${n}_START`] as number | undefined) ?? SHIFT_HOUR_DEFAULTS[n]?.start ?? 8,
-        end: (simCfgRaw[`SHIFT_${n}_END`] as number | undefined) ?? SHIFT_HOUR_DEFAULTS[n]?.end ?? 16,
-      },
-    ])
-  )
-  // The scenario's GLOBAL break windows per shift number — no default breaks
-  // for a shift the scenario hasn't configured any for.
-  const globalBreaks: Record<number, { start: number; duration: number }[]> = Object.fromEntries(
-    Array.from({ length: numShifts }, (_, i) => i + 1).map((n) => [
-      n,
-      (simCfgRaw[`BREAKS_${n}`] as { start: number; duration: number }[] | undefined) ?? [],
-    ])
-  )
-
   /** Add another parallel machine for this station: duplicates the box, renames
    *  both to "Name #1" / "Name #2" (etc.), and wires the copy to the same
    *  predecessors/successors so it stays a proper parallel branch. */
@@ -1807,28 +2891,6 @@ export default function Canvas() {
       })
       nodes.forEach((n) => {
         const base = baseStationName(n.data.label)
-        // Expand { 1: [0,1,2], 3: [5,6] } into workingDays1/workingDays3 keys
-        // — the shape build_station_shift_config reads per shift number.
-        const workingDaysFields: Record<string, number[]> = {}
-        for (const [shiftNum, days] of Object.entries(n.data.workingDaysByShift ?? {})) {
-          workingDaysFields[`workingDays${shiftNum}`] = days
-        }
-        // Per-station hour-window override, written into the SAME shift{n}
-        // field the engine's build_station_shift_config already parses as
-        // an "HH:MM-HH:MM" window (see parse_shift_window) — stations built
-        // here have never actually used shift{n} for an operator name (that
-        // was always a hardcoded 'Op1'/'' placeholder), so repurposing it
-        // for the real hour override doesn't collide with anything.
-        const shiftHourFields: Record<string, string> = {}
-        for (const [shiftNum, hours] of Object.entries(n.data.shiftHoursByShift ?? {})) {
-          const pad = (h: number) => String(Math.floor(h) % 24).padStart(2, '0')
-          shiftHourFields[`shift${shiftNum}`] = `${pad(hours.start)}:00-${pad(hours.end)}:00`
-        }
-        // Expand { 1: [...] } into breaks1/breaks3 keys.
-        const breaksFields: Record<string, { start: number; duration: number }[]> = {}
-        for (const [shiftNum, breaks] of Object.entries(n.data.breaksByShift ?? {})) {
-          breaksFields[`breaks${shiftNum}`] = breaks
-        }
         stationsData[base] = {
           capacity: capacityCount[base], shifts_per_day: n.data.shiftsPerDay ?? [1],
           operator_per_station: n.data.operators,
@@ -1836,12 +2898,109 @@ export default function Canvas() {
           ...(n.data.transportTime !== undefined ? { 'Transport Time': n.data.transportTime } : {}),
           ...(n.data.assemblyCount !== undefined ? { 'Assembly Count': n.data.assemblyCount } : {}),
           ...(n.data.assemblyInputs !== undefined ? { 'Assembly Inputs': n.data.assemblyInputs } : {}),
-          ...workingDaysFields,
-          ...breaksFields,
           'Failure rate': 0, 'Repair Time': 10, 'PM Schedule': 'Monthly',
           'Material Shortage Probability (%)': 0, 'Rework Probability (%)': 0,
           shift1: '', shift2: '', shift3: '', STATION_DOWNTIME: 0,
-          ...shiftHourFields,
+        }
+      })
+
+      // Worker Controller is a live dispatch pool at run time (see
+      // backend/engine/worker_pool.py). Everything it needs is wired UPSTREAM
+      // of it (edges point INTO the Controller, same direction for both):
+      //   Worker -> Worker Controller               (a pool member)
+      //   Station -> Workplace -> Worker Controller  (a station it staffs)
+      // A Workplace itself never processes anything — it's the staffing
+      // point that names which ONE real station a dispatched Worker actually
+      // goes to. Worker/Connector/Workplace nodes are all zero-time
+      // passthroughs for this walk, so walking upstream from the Controller
+      // resolves straight through a Workplace to the real Station wired into
+      // it, and through a Connector to whatever's further upstream still.
+      const isPassthroughForPoolWiring = (n: Node<StationNodeData>): boolean => {
+        const t = inferStationType(n.data.label, n.data.stationType)
+        return t === 'Worker' || t === 'Connector' || t === 'Workplace'
+      }
+      const walkRealStations = (
+        startId: string, direction: 'upstream' | 'downstream',
+      ): Node<StationNodeData>[] => {
+        const seen = new Set<string>()
+        const found: Node<StationNodeData>[] = []
+        let frontierIds = [startId]
+        while (frontierIds.length > 0) {
+          const nextIds: string[] = []
+          for (const id of frontierIds) {
+            if (seen.has(id)) continue
+            seen.add(id)
+            const neighborEdges = direction === 'downstream'
+              ? edges.filter((e) => e.source === id)
+              : edges.filter((e) => e.target === id)
+            for (const e of neighborEdges) {
+              const neighborId = direction === 'downstream' ? e.target : e.source
+              const neighbor = nodes.find((nn) => nn.id === neighborId)
+              if (!neighbor) continue
+              if (isPassthroughForPoolWiring(neighbor)) {
+                nextIds.push(neighbor.id)
+              } else {
+                found.push(neighbor)
+              }
+            }
+          }
+          frontierIds = nextIds
+        }
+        return found
+      }
+
+      nodes.forEach((n) => {
+        const nodeType = inferStationType(n.data.label, n.data.stationType)
+        if (nodeType !== 'Worker Controller') return
+        const controllerBase = baseStationName(n.data.label)
+        const controllerConfig = stationsData[controllerBase]
+        if (!controllerConfig) return
+
+        // Everything reachable upstream of this Controller (through any
+        // chain of Worker/Connector/Workplace passthroughs) — Worker nodes
+        // become this Controller's pool; anything else found here is a REAL
+        // station reached by walking straight through a Workplace, i.e. the
+        // one station that Workplace stands in for (Station -> Workplace ->
+        // Worker Controller, all edges pointing INTO the Controller).
+        const upstreamNodes = walkRealStations(n.id, 'upstream')
+
+        // Pool Workers — each contributing its picked operator's
+        // Availability (from operators_data) plus its own Travel Time.
+        const workerNodes = upstreamNodes
+          .filter((w) => inferStationType(w.data.label, w.data.stationType) === 'Worker')
+        controllerConfig['Pool Workers'] = workerNodes
+          .filter((w) => w.data.assignedOperator)
+          .map((w) => {
+            const op = w.data.assignedOperator!
+            const opCfg = activeScenario?.operators_data?.[op]
+            return {
+              name: op,
+              availability: opCfg?.['Availability (%)'] ?? 100,
+              travel_time: w.data.travelTime ?? 0,
+            }
+          })
+
+        // This Controller's own dispatch settings.
+        controllerConfig['Enabled'] = n.data.controllerEnabled ?? true
+        controllerConfig['Assignment Strategy'] = n.data.assignmentStrategy ?? 'first_available'
+        controllerConfig['Queue Policy'] = n.data.queuePolicy ?? 'queue'
+        controllerConfig['Max Queue Size'] = n.data.maxQueueSize ?? 20
+        if (n.data.shiftStart !== undefined && n.data.shiftStart !== 0) controllerConfig['Shift Start'] = n.data.shiftStart
+        if (n.data.shiftEnd !== undefined && n.data.shiftEnd !== 24) controllerConfig['Shift End'] = n.data.shiftEnd
+        controllerConfig['Allow Overtime'] = n.data.allowOvertime ?? true
+        controllerConfig['Use Worker Travel Time'] = n.data.useWorkerTravelTime ?? true
+
+        // Everything found upstream that ISN'T a Worker is a real station
+        // reached by walking straight through one of this Controller's
+        // connected Workplaces — i.e. the station that Workplace stands in
+        // for. That real station is what actually names this Controller as
+        // its pool (never the Workplace itself, which stays zero-time).
+        const staffedStations = upstreamNodes
+          .filter((s) => inferStationType(s.data.label, s.data.stationType) !== 'Worker')
+        for (const target of staffedStations) {
+          const targetConfig = stationsData[baseStationName(target.data.label)]
+          if (!targetConfig) continue
+          targetConfig['Worker Controller'] = controllerBase
         }
       })
 
@@ -1864,9 +3023,22 @@ export default function Canvas() {
       // to the step duration), and a Connector never takes any time at all.
       const stepDuration = (n: Node<StationNodeData>): number => {
         const t = inferStationType(n.data.label, n.data.stationType)
-        if (t === 'Connector') return 0
+        if (t === 'Connector' || t === 'Worker' || t === 'Worker Controller' || t === 'Workplace') return 0
         if (t === 'Conveyor') return n.data.transportTime ?? n.data.cycleTime
         return n.data.cycleTime
+      }
+      // Edges into a Worker, Worker Controller, or Workplace exist ONLY for
+      // the pool-wiring pass above (Station -> Workplace -> Worker Controller,
+      // Worker -> Worker Controller) — they are never a real "next step in
+      // the job's path," so this walk must not follow them. Without this
+      // filter, a Station wired to a Workplace would have the Workplace (and
+      // whatever it's wired to in turn) spliced into the middle of the job's
+      // actual flow, scrambling downstream routing.
+      const isPoolWiringTarget = (nodeId: string): boolean => {
+        const target = nodes.find((nn) => nn.id === nodeId)
+        if (!target) return false
+        const t = inferStationType(target.data.label, target.data.stationType)
+        return t === 'Worker' || t === 'Worker Controller' || t === 'Workplace'
       }
 
       let frontier = entryNodes
@@ -1880,7 +3052,7 @@ export default function Canvas() {
           if (seenStations.has(base)) continue
           seenStations.add(base)
 
-          const outgoing = edges.filter((e) => e.source === n.id)
+          const outgoing = edges.filter((e) => e.source === n.id && !isPoolWiringTarget(e.target))
           const destNodes = outgoing
             .map((e) => nodes.find((nn) => nn.id === e.target))
             .filter((nn): nn is Node<StationNodeData> => !!nn)
@@ -2122,14 +3294,14 @@ export default function Canvas() {
                       e.dataTransfer.setData('application/linksim-palette-item', item.label)
                       e.dataTransfer.effectAllowed = 'move'
                     }}
-                    onClick={() => addNode(item.label)}
+                    onClick={() => addNode(item.label, undefined, item.displayLabel)}
                     className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl border border-l-4 border-gray-100 hover:shadow-sm text-left transition-all group cursor-grab active:cursor-grabbing ${borderColor}`}
                   >
                     <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${bgColor}`}>
                       <IsoIcon type={item.label} color={STATION_TYPE_HEX[item.label] ?? DEFAULT_STATION_HEX} />
                     </div>
                     <div>
-                      <div className="text-xs font-semibold text-gray-800">{item.label}</div>
+                      <div className="text-xs font-semibold text-gray-800">{item.displayLabel ?? item.label}</div>
                       <div className="text-[10px] text-gray-400 mt-0.5">{item.description}</div>
                     </div>
                   </button>
@@ -2269,16 +3441,32 @@ export default function Canvas() {
                   const label = e.dataTransfer.getData('application/linksim-palette-item')
                   if (!label || !buildFlowInstance) return
                   const position = buildFlowInstance.screenToFlowPosition({ x: e.clientX, y: e.clientY })
-                  addNode(label, position)
+                  const displayLabel = PALETTE_ITEMS.find((item) => item.label === label)?.displayLabel
+                  addNode(label, position, displayLabel)
                 }}
               >
               <ReactFlow
                 nodes={nodes}
-                edges={edges}
+                edges={visibleEdges}
                 onNodesChange={onNodesChange}
                 onEdgesChange={onEdgesChange}
                 onConnect={onConnect}
                 nodeTypes={stableNodeTypes}
+                // Default "strict" connection mode only lets a drag START on
+                // a source handle (right dot) and END on a target handle
+                // (left dot) — easy to grab the wrong one on a compact node
+                // like Worker/Workplace/Worker Controller where both dots
+                // sit close together, silently failing the connection with
+                // no visible error. Loose mode accepts a drag started/ended
+                // on either handle type, in either direction.
+                connectionMode={ConnectionMode.Loose}
+                // Default snap radius (20px) grabs whichever handle is
+                // nearest the drop point even if it's the "wrong" one on a
+                // compact node — e.g. dragging toward a station's right dot
+                // can still snap to its left dot if that's a hair closer.
+                // Shrinking the radius makes a drop only snap when the
+                // cursor is nearly on top of the intended dot.
+                connectionRadius={8}
                 onNodeClick={(_, node) => { setSelectedNode(node as Node<StationNodeData>); setSelectedEdgeId(null) }}
                 onEdgeClick={(_, edge) => { setSelectedEdgeId(edge.id); setSelectedNode(null) }}
                 onPaneClick={() => { setSelectedNode(null); setSelectedEdgeId(null) }}
@@ -2307,7 +3495,7 @@ export default function Canvas() {
           {mode === 'view' && selectedEndpoint === 'entry' && (
             <div className="w-72 border-l border-gray-200 bg-white p-4 overflow-y-auto">
               <div className="flex items-center justify-between mb-1">
-                <p className="text-xs font-bold text-green-700 uppercase tracking-widest">Entry Station</p>
+                <p className="text-xs font-bold text-green-700 uppercase tracking-widest">Start Station</p>
                 <button
                   onClick={() => setSelectedEndpoint(null)}
                   className="w-6 h-6 flex items-center justify-center rounded-lg text-gray-400 hover:bg-gray-50 transition-colors"
@@ -2348,7 +3536,7 @@ export default function Canvas() {
           {mode === 'view' && selectedEndpoint === 'exit' && (
             <div className="w-72 border-l border-gray-200 bg-white p-4 overflow-y-auto">
               <div className="flex items-center justify-between mb-1">
-                <p className="text-xs font-bold text-red-700 uppercase tracking-widest">Exit Station</p>
+                <p className="text-xs font-bold text-red-700 uppercase tracking-widest">End Station</p>
                 <button
                   onClick={() => setSelectedEndpoint(null)}
                   className="w-6 h-6 flex items-center justify-center rounded-lg text-gray-400 hover:bg-gray-50 transition-colors"
@@ -2457,6 +3645,96 @@ export default function Canvas() {
                 </div>
               </div>
 
+              {/* A station dispatched by a Worker Controller pool looks
+                  identical to one using the plain static shift1/2/3
+                  assignment unless flagged — this is that flag. Not shown on
+                  the Controller's own panel (redundant with its Worker Pool
+                  stats section just below). */}
+              {selectedFlowNode.data.workerController && selectedFlowNode.data.stationType !== 'Worker Controller' && (
+                <div className="mb-3">
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-violet-50 text-violet-700 border border-violet-200">
+                    Staffed by {selectedFlowNode.data.workerController}
+                  </span>
+                </div>
+              )}
+
+              <div className="mb-3">
+                <p className="text-[10px] text-gray-400 mb-1">Shifts available</p>
+                {(selectedFlowNode.data.shiftsPerDay ?? []).length > 0 ? (
+                  <ShiftPillList shiftNums={selectedFlowNode.data.shiftsPerDay ?? []} shiftNames={shiftNames} />
+                ) : (
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-50 text-amber-600 border border-amber-200">
+                    No shifts selected
+                  </span>
+                )}
+              </div>
+
+              {/* Worker Controller pool stats — from worker_pool.py's
+                  WorkerPool.get_stats(), reached via activeRun.result.
+                  worker_pool_stats (see types/index.ts's WorkerPoolStat).
+                  Only meaningful once a run has actually completed; a
+                  Controller with no pool wired (no Workers connected) simply
+                  has no entry here at all. */}
+              {selectedFlowNode.data.stationType === 'Worker Controller' && (
+                <div className="mb-4">
+                  <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1.5">
+                    Worker Pool
+                  </p>
+                  {(() => {
+                    const stats = activeRun?.result?.worker_pool_stats?.[baseStationName(selectedFlowNode.data.resource)]
+                    if (!stats) {
+                      return (
+                        <p className="text-[11px] text-gray-400">
+                          {activeRun ? 'No pool data — no Workers wired to this Controller.' : 'Run a simulation to see pool stats.'}
+                        </p>
+                      )
+                    }
+                    return (
+                      <div className="space-y-2">
+                        <div className="grid grid-cols-2 gap-2">
+                          <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
+                            <p className="text-sm font-bold text-gray-800">{stats.workers_busy} / {stats.workers_busy + stats.workers_idle}</p>
+                            <p className="text-[9px] text-gray-500">Workers busy</p>
+                          </div>
+                          <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
+                            <p className="text-sm font-bold text-gray-800">{stats.queue_length}</p>
+                            <p className="text-[9px] text-gray-500">Queue length</p>
+                          </div>
+                          <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
+                            <p className="text-sm font-bold text-gray-800">{stats.jobs_completed}</p>
+                            <p className="text-[9px] text-gray-500">Jobs completed</p>
+                          </div>
+                          <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
+                            <p className="text-sm font-bold text-gray-800">{stats.jobs_rejected}</p>
+                            <p className="text-[9px] text-gray-500">Jobs rejected</p>
+                          </div>
+                        </div>
+                        <div className="bg-gray-50 border border-gray-100 rounded-lg p-2">
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-[10px] text-gray-400">Worker utilization</span>
+                            <span
+                              className="text-[10px] font-bold px-2 py-0.5 rounded-full"
+                              style={{ color: utilColor(stats.worker_utilization), background: utilColor(stats.worker_utilization) + '20' }}
+                            >
+                              {stats.worker_utilization.toFixed(0)}%
+                            </span>
+                          </div>
+                          <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
+                            <div
+                              className="h-full rounded-full"
+                              style={{ width: `${Math.min(stats.worker_utilization, 100)}%`, background: utilColor(stats.worker_utilization) }}
+                            />
+                          </div>
+                        </div>
+                        <p className="text-[10px] text-gray-500">
+                          Average wait: <span className="font-semibold text-gray-700">{stats.avg_wait_time.toFixed(1)} min</span>
+                        </p>
+                      </div>
+                    )
+                  })()}
+                </div>
+              )}
+
               {selectedFlowNode.data.utilization !== undefined ? (
                 <div className="mb-4">
                   <div className="flex items-center justify-between mb-1">
@@ -2544,11 +3822,14 @@ export default function Canvas() {
                 onDelete={deleteNode}
                 onSaveStation={() => { setSelectedNode(null); showToast('Station saved') }}
                 onAddParallel={addParallelMachine}
+                onAddWorkplace={addWorkplaceFor}
+                onRemoveWorkplace={removeWorkplaceFor}
+                onToggleWire={toggleWire}
+                onAssignOperator={assignOperatorToController}
+                onUnassignOperator={unassignOperatorFromController}
                 numShifts={numShifts}
                 shiftNames={shiftNames}
-                globalWorkingDays={globalWorkingDays}
-                globalShiftHours={globalShiftHours}
-                globalBreaks={globalBreaks}
+                operatorsData={activeScenario?.operators_data ?? {}}
               />
             </div>
           )}
@@ -2563,12 +3844,21 @@ export default function Canvas() {
                     <p className="text-xs font-bold text-blue-900 leading-none">Connection</p>
                     <p className="text-[10px] text-blue-400 mt-0.5">Label this arrow</p>
                   </div>
-                  <button
-                    onClick={() => setSelectedEdgeId(null)}
-                    className="w-6 h-6 flex items-center justify-center rounded-lg text-gray-400 hover:bg-gray-50 transition-colors"
-                  >
-                    ✕
-                  </button>
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() => deleteEdge(selectedEdgeId)}
+                      className="w-6 h-6 flex items-center justify-center rounded-lg text-red-400 hover:bg-red-50 hover:text-red-600 transition-colors"
+                      title="Delete connection"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                    <button
+                      onClick={() => setSelectedEdgeId(null)}
+                      className="w-6 h-6 flex items-center justify-center rounded-lg text-gray-400 hover:bg-gray-50 transition-colors"
+                    >
+                      ✕
+                    </button>
+                  </div>
                 </div>
                 <div className="p-4 space-y-3">
                   <div>
@@ -2584,12 +3874,18 @@ export default function Canvas() {
                     />
                   </div>
                 </div>
-                <div className="px-4 pb-4">
+                <div className="px-4 pb-4 space-y-2">
                   <button
                     onClick={() => setSelectedEdgeId(null)}
                     className="w-full py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl transition-colors"
                   >
                     Done
+                  </button>
+                  <button
+                    onClick={() => deleteEdge(selectedEdgeId)}
+                    className="w-full py-2 text-xs font-semibold text-red-600 bg-red-50 hover:bg-red-100 rounded-xl transition-colors"
+                  >
+                    Delete Connection
                   </button>
                 </div>
               </div>

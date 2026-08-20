@@ -87,6 +87,90 @@ def _is_blank_row(row: Dict[str, Any]) -> bool:
     return all(not _clean_str(v) for v in row.values())
 
 
+def _parse_variant_setup_map(raw: Any) -> Dict[str, float]:
+    """Parse a "Setup Time by Variant" cell like "variant1:15, variant2:25"
+    into {variant_name_lowercased: minutes}. Product-dependent setup: the
+    time to prepare a station for an incoming variant, independent of
+    whatever variant ran before it (unlike the sequence-dependent
+    from|to setup_matrix). Blank/malformed entries are skipped rather than
+    raising, so one typo doesn't break the whole sheet."""
+    text = _clean_str(raw)
+    if not text:
+        return {}
+    result: Dict[str, float] = {}
+    for part in text.split(","):
+        if ":" not in part:
+            continue
+        variant, _, minutes = part.partition(":")
+        variant = variant.strip().lower()
+        if not variant:
+            continue
+        try:
+            result[variant] = float(minutes.strip())
+        except ValueError:
+            continue
+    return result
+
+
+def _station_row_from(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build one stations_data entry from a Stations-sheet row dict — factored
+    out of CsvParser.parse_stations so a station that's only ever mentioned
+    in the Worker Controllers sheet (never listed as its own Stations row)
+    can still get a fully-defaulted entry by calling this with `{}`.
+    """
+    return {
+        "capacity": _safe_int(_find_col(row, "Capacity", "capacity"), 1),
+        "shifts_per_day": _safe_int(_find_col(row, "shifts_per_day", "shifts/day", "shifts per day"), 1),
+        "operator_per_station": _safe_int(_find_col(row, "operator_per_station", "operators"), 1),
+        "Failure rate": _safe_float(_find_col(row, "Failure rate", "failure_rate"), 0),
+        "Repair Time": _safe_float(_find_col(row, "Repair Time", "repair_time"), 10),
+        "Setup time": _safe_float(_find_col(row, "Setup time", "setup_time"), 0),
+        # Product-dependent setup — "variant1:15, variant2:25" — the time to
+        # prepare this station for an incoming variant, regardless of what
+        # ran before it. Checked before the flat "Setup time" fallback but
+        # after the sequence-dependent setup_matrix (see TimingEngine's
+        # get_setup_time for the lookup order). Blank/absent = {}, meaning
+        # this station has no per-variant setup, unchanged existing behaviour.
+        "Setup Time by Variant": _parse_variant_setup_map(
+            _find_col(row, "Setup Time by Variant", "setup_time_by_variant")
+        ),
+        # Batch-dependent setup — setup is charged once every N units of the
+        # SAME variant processed back-to-back (a "batch"), instead of on
+        # every single variant change. Batch Size = 0/blank means this
+        # station has no batching — unchanged existing (per-changeover only)
+        # behaviour. See TimingEngine.is_batch_setup_due for the counter.
+        "Batch Size": _safe_int(_find_col(row, "Batch Size", "batch_size"), 0),
+        "Batch Setup Time": _safe_float(_find_col(row, "Batch Setup Time", "batch_setup_time"), 0),
+        "Buffer Capacity": _safe_int(_find_col(row, "Buffer Capacity", "buffer_capacity"), 0),
+        "Buffer Discipline": _clean_str(_find_col(row, "Buffer Discipline", "buffer_discipline"), "FIFO"),
+        "Buffer Width": _safe_int(_find_col(row, "Buffer Width", "buffer_width"), 0),
+        "Buffer Depth": _safe_int(_find_col(row, "Buffer Depth", "buffer_depth"), 0),
+        "Buffer Height": _safe_int(_find_col(row, "Buffer Height", "buffer_height"), 0),
+        "PM Schedule": _clean_str(_find_col(row, "PM Schedule", "pm_schedule"), "Monthly"),
+        "Material Shortage Probability (%)": _safe_float(
+            _find_col(row, "Material Shortage Probability (%)", "material shortage"), 0),
+        "Rework Probability (%)": _safe_float(_find_col(row, "Rework Probability (%)", "rework"), 10),
+        "shift1": _clean_str(_find_col(row, "shift1", "shift 1")),
+        "shift2": _clean_str(_find_col(row, "shift2", "shift 2")),
+        "shift3": _clean_str(_find_col(row, "shift3", "shift 3")),
+        "STATION_DOWNTIME": _safe_float(_find_col(row, "STATION_DOWNTIME", "station_downtime"), 0),
+        # Optional — blank/absent means "plain machine station", the
+        # engine's default (sim_core.py's _station_type). A row whose
+        # Station Type is literally "Worker Controller" is expected to
+        # ALSO have a matching entry from the optional Worker Controllers
+        # sheet (see CsvParser.parse_worker_controllers) for its Pool
+        # Workers/dispatch settings; absent there, it's a controller with
+        # no pool wired (falls back to unblocked/no-gate behaviour).
+        "Station Type": _clean_str(_find_col(row, "Station Type", "station_type")),
+        # Names which Worker Controller this station draws its operator
+        # from (worker_pool.py) instead of the static shift1/2/3 assignment
+        # above. Blank/absent = no pool wired, unchanged static behaviour —
+        # every pre-existing scenario.
+        "Worker Controller": _clean_str(_find_col(row, "Worker Controller", "worker_controller")),
+    }
+
+
 class CsvParser:
     """
     Parse CSV files into the structured dicts expected by ManufacturingSimulation.
@@ -140,27 +224,7 @@ class CsvParser:
             name = _clean_str(_find_col(row, "Station", "station"))
             if not name:
                 continue  # skip blank/trailing rows
-            stations[name] = {
-                "capacity": _safe_int(_find_col(row, "Capacity", "capacity"), 1),
-                "shifts_per_day": _safe_int(_find_col(row, "shifts_per_day", "shifts/day", "shifts per day"), 1),
-                "operator_per_station": _safe_int(_find_col(row, "operator_per_station", "operators"), 1),
-                "Failure rate": _safe_float(_find_col(row, "Failure rate", "failure_rate"), 0),
-                "Repair Time": _safe_float(_find_col(row, "Repair Time", "repair_time"), 10),
-                "Setup time": _safe_float(_find_col(row, "Setup time", "setup_time"), 0),
-                "Buffer Capacity": _safe_int(_find_col(row, "Buffer Capacity", "buffer_capacity"), 0),
-                "Buffer Discipline": _clean_str(_find_col(row, "Buffer Discipline", "buffer_discipline"), "FIFO"),
-                "Buffer Width": _safe_int(_find_col(row, "Buffer Width", "buffer_width"), 0),
-                "Buffer Depth": _safe_int(_find_col(row, "Buffer Depth", "buffer_depth"), 0),
-                "Buffer Height": _safe_int(_find_col(row, "Buffer Height", "buffer_height"), 0),
-                "PM Schedule": _clean_str(_find_col(row, "PM Schedule", "pm_schedule"), "Monthly"),
-                "Material Shortage Probability (%)": _safe_float(
-                    _find_col(row, "Material Shortage Probability (%)", "material shortage"), 0),
-                "Rework Probability (%)": _safe_float(_find_col(row, "Rework Probability (%)", "rework"), 10),
-                "shift1": _clean_str(_find_col(row, "shift1", "shift 1")),
-                "shift2": _clean_str(_find_col(row, "shift2", "shift 2")),
-                "shift3": _clean_str(_find_col(row, "shift3", "shift 3")),
-                "STATION_DOWNTIME": _safe_float(_find_col(row, "STATION_DOWNTIME", "station_downtime"), 0),
-            }
+            stations[name] = _station_row_from(row)
         return stations
 
     def parse_operators(self, source: Union[str, bytes]) -> Dict[str, Dict]:
@@ -296,7 +360,7 @@ class CsvParser:
         Returns: {station: {"from|to": setup_time_minutes}}
         (from/to are lowercased variant names, joined with "|" as the dict
         key since JSON — used throughout storage/API — cannot have tuple
-        keys; see sim_core.py's _setup_time_for for how this is consumed.)
+        keys; see TimingEngine.get_setup_time for how this is consumed.)
         """
         records = self.parse(source)
         matrix: Dict[str, Dict[str, float]] = {}
@@ -313,3 +377,79 @@ class CsvParser:
             setup_time = _safe_float(_find_col(row, "Setup Time", "setup_time", "setup time"), 0)
             matrix.setdefault(station, {})[f"{from_variant}|{to_variant}"] = setup_time
         return matrix
+
+    def parse_worker_controllers(self, source: Union[str, bytes]) -> Dict[str, Dict[str, Any]]:
+        """
+        Optional sheet/CSV: Controller, Worker, Worker Availability (%),
+        Worker Travel Time, Assignment Strategy, Queue Policy, Max Queue Size,
+        Shift Start, Shift End, Allow Overtime, Enabled, Use Worker Travel Time.
+
+        ONE ROW PER POOL WORKER — a Controller with 3 workers gets 3 rows
+        sharing the same "Controller" name; the Controller-level settings
+        columns (Assignment Strategy, Queue Policy, ...) only need to be
+        filled in on that Controller's FIRST row (subsequent rows for the
+        same Controller may leave them blank — the first non-blank value
+        wins), same "fill in once, repeat the row for each list item" shape
+        spreadsheet users already expect from a one-row-per-item sheet.
+
+        Returns: {controller_name: {"Pool Workers": [...], "Enabled": ...,
+        "Assignment Strategy": ..., ...}} — merged directly into that
+        controller's stations_data entry by whoever calls this (see
+        ExcelParser.parse_all), NOT returned as part of parse_stations()
+        itself, since a controller's settings live inside its OWN station
+        entry rather than as a separate top-level scenario field.
+        """
+        records = self.parse(source)
+        controllers: Dict[str, Dict[str, Any]] = {}
+        for row in records:
+            if _is_blank_row(row):
+                break
+            controller = _clean_str(_find_col(row, "Controller", "worker_controller"))
+            if not controller:
+                continue  # skip blank/trailing rows
+            entry = controllers.setdefault(controller, {"Pool Workers": []})
+
+            worker_name = _clean_str(_find_col(row, "Worker", "worker"))
+            if worker_name:
+                entry["Pool Workers"].append({
+                    "name": worker_name,
+                    "availability": _safe_float(
+                        _find_col(row, "Worker Availability (%)", "worker availability", "availability"), 100),
+                    "travel_time": _safe_float(
+                        _find_col(row, "Worker Travel Time", "travel_time", "travel time"), 0),
+                })
+
+            # Controller-level settings — only set once (first non-blank
+            # value across this controller's rows wins), so they don't need
+            # repeating on every pool-worker row.
+            def _set_once(key: str, value: Any, blank: Any = ""):
+                if key not in entry and value != blank:
+                    entry[key] = value
+
+            _set_once("Assignment Strategy", _clean_str(_find_col(row, "Assignment Strategy", "assignment_strategy")))
+            _set_once("Queue Policy", _clean_str(_find_col(row, "Queue Policy", "queue_policy")))
+            max_queue = _find_col(row, "Max Queue Size", "max_queue_size")
+            if max_queue is not None and "Max Queue Size" not in entry:
+                entry["Max Queue Size"] = _safe_int(max_queue, 20)
+            shift_start = _find_col(row, "Shift Start", "shift_start")
+            if shift_start is not None and "Shift Start" not in entry:
+                entry["Shift Start"] = _safe_float(shift_start, 0)
+            shift_end = _find_col(row, "Shift End", "shift_end")
+            if shift_end is not None and "Shift End" not in entry:
+                entry["Shift End"] = _safe_float(shift_end, 24)
+
+            def _set_bool_once(key: str, candidates: tuple, default: bool = True):
+                if key in entry:
+                    return
+                raw = _find_col(row, *candidates)
+                if raw is None:
+                    return
+                text = _clean_str(raw).strip().lower()
+                if text:
+                    entry[key] = text in ("1", "true", "yes", "y")
+
+            _set_bool_once("Allow Overtime", ("Allow Overtime", "allow_overtime"))
+            _set_bool_once("Enabled", ("Enabled", "enabled"))
+            _set_bool_once("Use Worker Travel Time", ("Use Worker Travel Time", "use_worker_travel_time"))
+
+        return controllers

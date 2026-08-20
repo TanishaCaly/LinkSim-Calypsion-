@@ -94,36 +94,25 @@ class SimulationUtils:
     @staticmethod
     def build_station_shift_config(base_config: dict, station_data: dict) -> dict:
         """
-        Return a copy of base_config with SHIFT_n_START/SHIFT_n_END,
-        WORKING_DAYS_n, and BREAKS_n overridden by the station's own
-        per-shift settings where present (any number of shifts, not just 1-3).
-
-        This lets each station honour its own shift hours, weekly working-days
-        calendar, AND break windows instead of the global default — e.g. one
-        station running Shift 1 6am-2pm with no break while another runs
-        Shift 1 8am-4pm with a lunch break, despite both using "Shift 1".
-        Stations that don't define a given override keep the global value, so
-        behaviour is unchanged for every station that doesn't set one (every
-        Excel/YAML-imported scenario, and any station saved before these
-        fields existed).
+        Return a copy of base_config with SHIFT_n_START/SHIFT_n_END
+        overridden by the station's own per-shift hour windows where present
+        (any number of shifts, not just 1-3) — e.g. one station running
+        Shift 1 6am-2pm while another runs Shift 1 8am-4pm, despite both
+        using "Shift 1". Stations that don't define a window keep the global
+        value, so behaviour is unchanged for every station that doesn't set
+        one (every Excel/YAML-imported scenario, and any station saved
+        before this field existed).
 
         The returned dict is genuinely PER-STATION — sim_core.py builds one
         of these per station name at init and uses it (not the global
-        sim_config) everywhere a shift-active/working-day/break check
-        happens, so this override reaches every one of those checks
-        automatically.
+        sim_config) everywhere a shift-active check happens, so this
+        override reaches every one of those checks automatically.
         """
         cfg = dict(base_config)
         for i in range(1, SimulationUtils.num_shifts(base_config) + 1):
             window = SimulationUtils.parse_shift_window(station_data.get(f"shift{i}"))
             if window:
                 cfg[f"SHIFT_{i}_START"], cfg[f"SHIFT_{i}_END"] = window
-            working_days = station_data.get(f"workingDays{i}")
-            if working_days:
-                cfg[f"WORKING_DAYS_{i}"] = list(working_days)
-            station_breaks = station_data.get(f"breaks{i}")
-            if station_breaks is not None:
-                cfg[f"BREAKS_{i}"] = list(station_breaks)
         return cfg
 
     @staticmethod
@@ -391,11 +380,21 @@ class SimulationUtils:
         if isinstance(assigned, str):
             assigned = [op.strip() for op in assigned.split(",")]
 
+        # A Worker Controller connected ahead of this station (Canvas.tsx)
+        # writes "Min Skill Rating" onto it — an operator below that skill is
+        # rejected outright, same as an unavailable one, so the processing
+        # loop just keeps waiting for a different/next-available operator.
+        # 0 (unset) means no gate, so scenarios without a Worker Controller
+        # behave exactly as before.
+        min_skill = stations_data.get(resource_name, {}).get("Min Skill Rating", 0) or 0
+
         available = []
         for operator in assigned:
             if operator in operators_data:
                 availability = operators_data[operator]["Availability (%)"]
                 skill = operators_data[operator]["Skill Rating"]
+                if skill < min_skill:
+                    continue
                 if random.uniform(0, 100) <= availability:
                     available.append((operator, skill))
 

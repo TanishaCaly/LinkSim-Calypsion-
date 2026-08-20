@@ -16,7 +16,7 @@ import re
 import pandas as pd
 from typing import Dict, List, Any, Union, Optional
 
-from .csv_parser import CsvParser, _clean_str, _safe_float, _find_col, _is_blank_row
+from .csv_parser import CsvParser, _clean_str, _safe_float, _find_col, _is_blank_row, _station_row_from
 
 _csv = CsvParser()
 
@@ -35,6 +35,7 @@ class ExcelParser:
         "processflow":  ["processflow", "process flow", "processflows"],
         "quantities":   ["variantquantities", "variant quantities", "quantities", "variant_quantities"],
         "setup_matrix": ["setupmatrix", "setup matrix", "setup_matrix", "changeover matrix"],
+        "worker_controllers": ["workercontrollers", "worker controllers", "worker_controllers", "worker pools", "workerpools"],
     }
 
     def __init__(self, sheet_names=None):
@@ -45,6 +46,7 @@ class ExcelParser:
     _HEADER_KEYWORDS = [
         "station", "capacity", "operator", "variant", "operation", "resource",
         "duration", "quantity", "skill", "availability", "failure", "repair",
+        "controller", "worker",
     ]
 
     def _load(self, source):
@@ -162,8 +164,23 @@ class ExcelParser:
 
     def parse_all(self, source):
         sheets = self._load(source)
+        stations = self.parse_stations(sheets)
+        # Worker Controller settings/Pool Workers live INSIDE that
+        # controller's own stations_data entry (not a separate top-level
+        # scenario field, unlike setup_matrix) — merge them in here rather
+        # than exposing a sibling key. A controller named only in this sheet
+        # (not present in the Stations sheet at all) still gets a stations_data
+        # entry created for it, tagged "Worker Controller", so it works even
+        # if a user only fills in the pool sheet and forgets to also list the
+        # controller as a Stations row.
+        for controller_name, settings in self.parse_worker_controllers(sheets).items():
+            is_new = controller_name not in stations
+            entry = stations.setdefault(controller_name, _station_row_from({}))
+            if is_new or not entry.get("Station Type"):
+                entry["Station Type"] = "Worker Controller"
+            entry.update(settings)
         return {
-            "stations":           self.parse_stations(sheets),
+            "stations":           stations,
             "operators":          self.parse_operators(sheets),
             "processflow":        self.parse_processflow(sheets),
             "variant_quantities": self.parse_variant_quantities(sheets),
@@ -260,6 +277,17 @@ class ExcelParser:
         if df is None or df.empty:
             return {}
         return _csv.parse_setup_matrix(df.to_csv(index=False))
+
+    def parse_worker_controllers(self, source):
+        """Optional 'Worker Controllers' sheet: Controller, Worker, Worker
+        Availability (%), Worker Travel Time, Assignment Strategy, Queue
+        Policy, Max Queue Size, Shift Start, Shift End, Allow Overtime,
+        Enabled, Use Worker Travel Time — one row per pool worker. Entirely
+        absent from most files, which is fine (returns {})."""
+        df = self._resolve(source, "worker_controllers")
+        if df is None or df.empty:
+            return {}
+        return _csv.parse_worker_controllers(df.to_csv(index=False))
 
     def _resolve(self, source, key):
         sheets = source if isinstance(source, dict) else self._load(source)

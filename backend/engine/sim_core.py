@@ -18,6 +18,8 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .machine import Machine
+from .timing_engine import TimingEngine
+from .worker_pool import WorkerPool, WorkerToken, PoolRejected
 from .formulas import (
     calc_station_throughput, build_summary,
     calc_station_utilization, calc_operator_utilization,
@@ -55,6 +57,31 @@ MAX_SIM_TIME = 525_600.0
 # so existing scenarios behave exactly as before.
 STATION_TYPE_CONNECTOR = "Connector"
 STATION_TYPE_CONVEYOR = "Conveyor"
+# Worker, Worker Controller, AND Workplace are all canvas-only annotation
+# nodes — none of them is itself a work station, so all three pass through
+# with zero time/capacity, same as Connector:
+#   Worker            — picks which named operator (from operators_data) is
+#                        assigned; contributes into whichever Worker
+#                        Controller's pool it's wired to.
+#   Worker Controller — the live dispatch pool/brain (see worker_pool.py).
+#   Workplace         — sits beside ONE real station (wired via an edge:
+#                        Station -> Workplace -> Worker Controller) and is
+#                        that station's staffing point — the propagation at
+#                        save time (Canvas.tsx) walks THROUGH the Workplace
+#                        to write "Worker Controller" onto the REAL station
+#                        it's paired with, not onto the Workplace itself.
+STATION_TYPE_WORKER = "Worker"
+STATION_TYPE_WORKER_CONTROLLER = "Worker Controller"
+STATION_TYPE_WORKPLACE = "Workplace"
+# Per the CT/PT/ST spec's object-specific behavior table: Source/Start
+# ("usually no" Process Time), Drain/End, and Buffer all take no Process
+# Time and no Setup Time — unlike Connector/Worker/etc. these three are
+# still meaningful flow points (entity creation, final exit, queue/wait),
+# but neither carries the "do work for a duration" behavior _perform_operation
+# implements, so they pass through the same zero-time path.
+STATION_TYPE_SOURCE = "Source"
+STATION_TYPE_DRAIN = "Drain"
+STATION_TYPE_BUFFER = "Buffer"
 
 # Stand-in for "unbounded" concurrency on a conveyor. A real belt has no
 # meaningful server count, but SimPy resources need a finite capacity, so use
@@ -69,13 +96,28 @@ def _station_type(station: Dict[str, Any]) -> str:
 
 
 def _is_passthrough(station: Dict[str, Any]) -> bool:
-    """True for Connector — a zero-time routing junction, not a work station."""
-    return _station_type(station) == STATION_TYPE_CONNECTOR
+    """True for Connector/Worker/Worker Controller/Workplace/Source/Drain/
+    Buffer — zero Process Time, zero Setup Time nodes. Connector/Worker/
+    Worker Controller/Workplace are canvas-only annotations that don't
+    represent a real station at all; Source, Drain, and Buffer ARE real
+    flow points (entity creation, exit, queueing) but per the CT/PT/ST
+    spec's object-specific behavior table take no Process Time or Setup
+    Time of their own, so they share the same zero-time path."""
+    return _station_type(station) in (
+        STATION_TYPE_CONNECTOR, STATION_TYPE_WORKER, STATION_TYPE_WORKER_CONTROLLER, STATION_TYPE_WORKPLACE,
+        STATION_TYPE_SOURCE, STATION_TYPE_DRAIN, STATION_TYPE_BUFFER,
+    )
 
 
 def _is_conveyor(station: Dict[str, Any]) -> bool:
     """True for Conveyor — transport delay, no operator, unbounded capacity."""
     return _station_type(station) == STATION_TYPE_CONVEYOR
+
+
+def _is_worker_controller(station: Dict[str, Any]) -> bool:
+    """True for Worker Controller — the station whose "Pool Workers" list
+    becomes a live WorkerPool (see _init_worker_pools)."""
+    return _station_type(station) == STATION_TYPE_WORKER_CONTROLLER
 
 
 def _transport_time(station: Dict[str, Any], fallback: float) -> float:
@@ -273,11 +315,13 @@ class ManufacturingSimulation:
         # Runtime state (reset on each run)
         self.env: Optional[simpy.Environment] = None
         self.resources: Dict[str, Machine] = {}
+        self.worker_pools: Dict[str, WorkerPool] = {}
         self.job_log: Dict[str, List] = {}
         self.completion_log: Dict[str, List] = {}
         self.bottleneck_store: Dict[str, Any] = {}
         self.simulation_state: Dict[str, Any] = {}
         self.cycle_times: Dict[str, float] = {}
+        self.timing = TimingEngine()
 
     # ------------------------------------------------------------------
     # Public API
@@ -410,6 +454,7 @@ class ManufacturingSimulation:
             "total_simulated_time": 0,
             "completed_jobs": 0,
             "in_progress_jobs": 0,
+            "rejected_jobs": 0,
             "job_count": 0,
             "current_jobs": {},
             "running_jobs": [],
@@ -439,6 +484,7 @@ class ManufacturingSimulation:
         self.cycle_times = self._compute_cycle_times()
         self.resources = self._init_resources()
         self.rack_buffers = self._init_rack_buffers()
+        self.worker_pools = self._init_worker_pools()
         # Build case-insensitive/stripped lookup: normalized_key → original station key
         self._resource_key_map: Dict[str, str] = {
             k.lower().strip(): k for k in self.stations_data
@@ -450,24 +496,6 @@ class ManufacturingSimulation:
             name: SimulationUtils.build_station_shift_config(self.sim_config, st)
             for name, st in self.stations_data.items()
         }
-
-    def _setup_time_for(self, resource_name: str, last_variant: Optional[str], variant_type: str) -> float:
-        """
-        Changeover time for switching `resource_name` from `last_variant` to
-        `variant_type`. Looks up the optional per-station setup matrix
-        ({"from|to": minutes}, keyed on lowercased variant names — see
-        CsvParser.parse_setup_matrix) for a pair-specific time first; falls
-        back to the station's flat "Setup time" column when no matrix entry
-        covers this exact (from, to) pair, which also covers the common case
-        of no matrix being defined at all (existing behaviour, unchanged).
-        """
-        if last_variant is not None:
-            matrix = self.setup_matrix.get(resource_name)
-            if matrix:
-                key = f"{last_variant.lower()}|{variant_type.lower()}"
-                if key in matrix:
-                    return matrix[key]
-        return self.stations_data[resource_name].get("Setup time", 0) or 0
 
     def _resolve_resource(self, raw_name: str) -> Optional[str]:
         """Return the canonical station key for raw_name, or None if not found."""
@@ -604,24 +632,94 @@ class ManufacturingSimulation:
                 buffers[name] = RackBuffer(int(width), int(depth), int(height))
         return buffers
 
-    def _run_simpy(self):
-        total_jobs = sum(self.variant_quantities.values())
-        spawned = 0
+    def _init_worker_pools(self) -> Dict[str, WorkerPool]:
+        """
+        One WorkerPool per Worker Controller station — built from that
+        Controller's "Pool Workers" list (each entry: name, availability,
+        travel_time) plus its dispatch settings (Assignment Strategy, Queue
+        Policy, Max Queue Size, Shift Start/End, Allow Overtime, Enabled, Use
+        Worker Travel Time). A Controller with no workers wired (empty/
+        missing "Pool Workers") gets no pool at all, so a Workplace naming it
+        falls back to unblocked/no-gate behaviour rather than deadlocking
+        forever waiting on an empty pool.
+        """
+        pools = {}
+        for name, station in self.stations_data.items():
+            if not _is_worker_controller(station):
+                continue
+            raw_workers = station.get("Pool Workers") or []
+            if not raw_workers:
+                continue
+            tokens = [
+                WorkerToken(
+                    name=w.get("name", ""),
+                    availability=float(w.get("availability", 100) or 100),
+                    travel_time=float(w.get("travel_time", 0) or 0),
+                )
+                for w in raw_workers
+            ]
+            shift_start = station.get("Shift Start")
+            shift_end = station.get("Shift End")
+            pools[name] = WorkerPool(
+                self.env, name, tokens,
+                strategy=str(station.get("Assignment Strategy", "first_available") or "first_available"),
+                queue_policy=str(station.get("Queue Policy", "queue") or "queue"),
+                max_queue_size=station.get("Max Queue Size"),
+                shift_start=float(shift_start) if shift_start not in (None, "") else None,
+                shift_end=float(shift_end) if shift_end not in (None, "") else None,
+                allow_overtime=bool(station.get("Allow Overtime", True)),
+                enabled=bool(station.get("Enabled", True)),
+                use_travel_time=bool(station.get("Use Worker Travel Time", True)),
+            )
+        return pools
 
+    def _run_simpy(self):
+        sim_time = self.sim_config["SIM_TIME"]
+
+        # A job whose (i-1) * interval arrival falls after SIM_TIME will
+        # never get a chance to run — the simulation clock stops before it
+        # arrives. Pre-creating its SimPy process anyway (the old
+        # `for i in range(1, qty+1)` loop did this unconditionally) still
+        # costs real setup time per job for zero effect on the result, and
+        # at 200k+ jobs/variant that setup cost dominates the run. Cap how
+        # many are actually spawned to those that can arrive in time —
+        # arrivals are in increasing order, so once one is too late, every
+        # later one is too.
+        spawnable_jobs = 0
+        for variant, qty in self.variant_quantities.items():
+            interval = self.variant_intervals.get(variant, 0) or 0
+            if interval > 0:
+                max_arrivals = int(sim_time // interval) + 1
+                spawnable_jobs += min(qty, max_arrivals)
+            else:
+                spawnable_jobs += qty
+        spawnable_jobs = max(1, spawnable_jobs)
+
+        spawned = 0
         for variant, qty in self.variant_quantities.items():
             interval = self.variant_intervals.get(variant, 0) or 0
             for i in range(1, qty + 1):
                 if interval > 0:
+                    arrival = (i - 1) * interval
+                    if arrival > sim_time:
+                        # Every later i for this variant arrives even later —
+                        # nothing left to spawn for it.
+                        break
                     # Space this job's arrival out by (i-1) * interval minutes
                     # instead of spawning it immediately at t=0, so jobs of this
                     # variant enter the system on a fixed, predictable schedule.
-                    self.env.process(self._delayed_spawn(i, variant, (i - 1) * interval))
+                    self.env.process(self._delayed_spawn(i, variant, arrival))
                 else:
                     self.env.process(self._process_variant(i, variant))
                 spawned += 1
-                self.progress_cb(spawned / total_jobs * 0.5, f"Scheduling {variant} #{i}")
+                # Report at most ~50 times total instead of once per job —
+                # per-job callbacks (logger.info + progress_store.push) were
+                # adding real overhead in the spawn loop for large job counts.
+                report_every = max(1, spawnable_jobs // 50)
+                if spawned % report_every == 0 or spawned == spawnable_jobs:
+                    self.progress_cb(spawned / spawnable_jobs * 0.5, f"Scheduling {variant} #{i}")
 
-        self.simulation_state["in_progress_jobs"] = total_jobs
+        self.simulation_state["in_progress_jobs"] = spawned
         self.progress_cb(0.5, "Running simulation…")
 
         # Run in steps rather than one single env.run(until=SIM_TIME) call so
@@ -631,7 +729,7 @@ class ManufacturingSimulation:
         # env.run() — SimPy resumes from wherever it left off — this only
         # adds checkpoints to report progress from, not different behavior.
         sim_time = self.sim_config["SIM_TIME"]
-        num_steps = 100
+        num_steps = 20
         step = max(1.0, sim_time / num_steps)
         target = 0.0
         while target < sim_time:
@@ -720,10 +818,11 @@ class ManufacturingSimulation:
                 self._log_passthrough(resource_name, variant_id, variant_type, step.get("operation", ""))
                 continue
 
+            outcome = None
             try:
                 if isinstance(durations, list):
                     for i, duration in enumerate(durations):
-                        yield from self._perform_operation(
+                        outcome = yield from self._perform_operation(
                             resource_name, variant_id, variant_type,
                             step["operation"],
                             self.stations_data[resource_name].get("operator_per_station", 1),
@@ -731,8 +830,10 @@ class ManufacturingSimulation:
                             duration,
                             on_machine_acquired=release_cb if i == 0 else None,
                         )
+                        if outcome == "rejected":
+                            break
                 else:
-                    yield from self._perform_operation(
+                    outcome = yield from self._perform_operation(
                         resource_name, variant_id, variant_type,
                         step["operation"],
                         self.stations_data[resource_name].get("operator_per_station", 1),
@@ -748,6 +849,13 @@ class ManufacturingSimulation:
                 )
                 # Continue to next step so job can still complete
                 continue
+
+            # A Worker Controller rejected this job outright (Queue Policy =
+            # reject, queue full) — the job leaves the line here entirely,
+            # same as reaching the simulation horizon mid-cycle: it must NOT
+            # continue to the next step or be counted as completed below.
+            if outcome == "rejected":
+                return
 
             # --- Buffer hand-off: hold this job at resource_name until the
             # NEXT station has room to accept it. The job has already
@@ -869,6 +977,47 @@ class ManufacturingSimulation:
             resource_name, variant_type, variant_id, operation,
         )
 
+    def _reject_job(
+        self,
+        resource_name: str,
+        variant_name: str,
+        trace_entry: Dict[str, Any],
+        start_date: datetime,
+    ) -> None:
+        """
+        A job turned away outright by a Worker Controller (Queue Policy =
+        reject, queue already at Max Queue Size) — a genuinely new terminal
+        outcome distinct from Completed or the horizon-cutoff "In Progress".
+        Called from inside _perform_operation's `with resource.request()`
+        block, AFTER blocked-time/setup bookkeeping already ran (the job did
+        occupy the machine and get set up before discovering no Worker could
+        be dispatched) — so this only undoes the "processing" job_count this
+        job's own step already added, and appends the terminal outcome.
+        Mirrors _log_passthrough's job-trace bookkeeping (so it doesn't just
+        vanish from the log) but marks the outcome "Rejected" and does NOT
+        count toward completed_jobs.
+        """
+        now_real = start_date + timedelta(minutes=self.env.now)
+        stamp = now_real.strftime("%Y-%m-%d %H:%M:%S")
+
+        self.stations_data[resource_name]["job_counts"]["processing"] -= 1
+        self.stations_data[resource_name]["rejected_jobs"] = (
+            self.stations_data[resource_name].get("rejected_jobs", 0) + 1
+        )
+
+        trace_entry.update({
+            "status": "Rejected",
+            "process_start_time_real": None,
+            "process_end_time_real": stamp,
+            "delay_reason": "Rejected — Worker Controller queue full",
+        })
+
+        self.simulation_state["rejected_jobs"] += 1
+        self.simulation_state["current_jobs"][variant_name] = f"Rejected at {resource_name}"
+        self.simulation_state["job_exit_times"][variant_name] = self.env.now
+        self.simulation_state["in_progress_jobs"] = max(0, self.simulation_state["in_progress_jobs"] - 1)
+        logger.debug("'%s' rejected at '%s' — Worker Controller queue full", variant_name, resource_name)
+
     # ------------------------------------------------------------------
     # Operation execution (core logic from ManufacturingSimulation._perform_operation)
     # ------------------------------------------------------------------
@@ -886,6 +1035,14 @@ class ManufacturingSimulation:
     ):
         resource = self.resources[resource_name]
         station_cfg = self.stations_data[resource_name]
+        # A Workplace naming a Worker Controller ("Worker Controller" field,
+        # written by Canvas when a Worker Controller is wired to it) draws its
+        # operator from that Controller's live WorkerPool instead of the
+        # older static shift1/2/3 assignment below — see the acquire/release
+        # around the main processing loop. Absent, or naming a Controller
+        # with no pool (e.g. it has no Workers wired), falls back entirely
+        # to the unchanged existing behaviour.
+        pool = self.worker_pools.get(station_cfg.get("Worker Controller"))
         # A Conveyor transports rather than processes: the job rides it for a
         # transport time, but no operator is consumed (a belt runs itself) and
         # there is no changeover or rework, since nothing is being worked on.
@@ -897,13 +1054,14 @@ class ManufacturingSimulation:
         has_operators = bool(num_operators) and not is_conveyor
         num_operators = num_operators or 1
         if is_conveyor:
-            # Transport time is wall-clock travel along the belt — it is not
-            # work split between operators, so it must NOT be divided by the
-            # operator count the way a machine's cycle time is.
+            # Transport time is wall-clock travel along the belt — separate
+            # from Process Time (see TimingEngine.get_process_time).
             adjusted_ct = _transport_time(station_cfg, duration)
             num_operators = 1
         else:
-            adjusted_ct = duration / num_operators
+            # Process Time per the CT/PT/ST spec: the station's configured
+            # operation duration, unmodified — see TimingEngine.
+            adjusted_ct = self.timing.get_process_time({"duration": duration})
         # Per-station shift schedule (honours the station's own shift windows;
         # falls back to the global config when the station defines none).
         shift_cfg = self._station_shift_cfg.get(resource_name, self.sim_config)
@@ -1001,18 +1159,45 @@ class ManufacturingSimulation:
                             start_date=start_date)
 
             # --- Setup / changeover ---
-            # Charged only when this station's next job is a different variant
-            # than the one it last processed (matches Simul8/FlexSim/Arena's
-            # "changeover on type change" model) — same variant back-to-back
-            # incurs zero setup time. Runs while still holding the resource,
-            # shift-aware, before cycle time starts.
-            # A conveyor has no tooling to change over — a different variant
-            # simply rides the same belt, so setup is always skipped for it.
+            # Two independent triggers:
+            #  - Variant-change setup: charged when this station's next job
+            #    is a different variant than the one it last processed
+            #    (matches Simul8/FlexSim/Arena's "changeover on type change"
+            #    model) — same variant back-to-back incurs zero setup time
+            #    from THIS trigger. Duration comes from TimingEngine.get_setup_time's
+            #    sequence/product/fixed lookup.
+            #  - Batch-dependent setup: charged every Nth unit of the SAME
+            #    variant run back-to-back (see TimingEngine.is_batch_setup_due), using the
+            #    station's separate "Batch Setup Time" duration. Independent
+            #    of variant-change setup — a station can have either, both,
+            #    or neither configured.
+            # Runs while still holding the resource, shift-aware, before
+            # process time starts. A conveyor has no tooling to change over —
+            # a different variant simply rides the same belt, so both
+            # triggers are skipped for it.
             last_variant = self.stations_data[resource_name].get("last_variant_type")
-            setup_time = 0 if is_conveyor else self._setup_time_for(resource_name, last_variant, variant_type)
-            if setup_time > 0 and variant_type != last_variant:
+            variant_changed = last_variant is not None and variant_type != last_variant
+            if is_conveyor:
+                setup_time = 0
+            elif variant_changed or last_variant is None:
+                setup_time = self.timing.get_setup_time(
+                    self.stations_data[resource_name], self.setup_matrix.get(resource_name),
+                    last_variant, variant_type,
+                )
+            elif self.timing.is_batch_setup_due(self.stations_data[resource_name], last_variant, variant_type):
+                setup_time = self.stations_data[resource_name].get("Batch Setup Time", 0) or 0
+            else:
+                setup_time = 0
+            if setup_time > 0:
                 setup_time_remaining = setup_time
                 su_start = self.env.now
+                # Any out-of-shift wait inside THIS loop still advances
+                # env.now, which su_dur (below) is measured across — track it
+                # separately so it can be subtracted back out, otherwise that
+                # wait gets billed to BOTH total_setup_time (via su_dur, which
+                # spans the whole loop) AND total_pause (its own accumulator),
+                # double-counting the same minutes under two different KPIs.
+                su_pause = 0.0
                 while setup_time_remaining > 0:
                     real_time = start_date + timedelta(minutes=self.env.now)
                     if SimulationUtils.is_active_shift(shift_cfg, real_time, shifts_per_day):
@@ -1038,8 +1223,9 @@ class ManufacturingSimulation:
                             break
                         yield self.env.timeout(wait)
                         total_pause += wait
+                        su_pause += wait
 
-                su_dur = self.env.now - su_start
+                su_dur = self.env.now - su_start - su_pause
                 total_setup += su_dur
                 self.stations_data[resource_name]["total_setup_time"] = (
                     self.stations_data[resource_name].get("total_setup_time", 0) + su_dur
@@ -1052,13 +1238,35 @@ class ManufacturingSimulation:
             self.stations_data[resource_name]["last_variant_type"] = variant_type
 
             self.stations_data[resource_name]["job_counts"]["processing"] += 1
-            cycle_time = adjusted_ct
+            process_time = adjusted_ct
             process_start = self.env.now
             processing_time = 0.0
             horizon_cutoff = False
 
+            # --- Worker pool acquire (Workplace wired to a Worker Controller) ---
+            # Held for the job's WHOLE stay at this station (not re-acquired
+            # per chunk, unlike the static operator check below) — a pooled
+            # Worker is genuinely occupied here until the job leaves, exactly
+            # like the machine resource itself. If the Controller's Queue
+            # Policy is "reject" and its queue is already full, the request
+            # is turned away outright (PoolRejected) — a genuinely new
+            # terminal outcome distinct from Completed/In Progress, handled
+            # by _reject_job below and released resource.request() context.
+            pool_worker = None
+            if pool is not None:
+                try:
+                    pool_worker = yield from pool.acquire(resource_name)
+                except PoolRejected:
+                    self._reject_job(resource_name, variant_name, trace_entry, start_date)
+                    return "rejected"
+                travel_time = pool.travel_time_for(pool_worker, resource_name)
+                if travel_time > 0:
+                    travel_start = self.env.now
+                    yield self.env.timeout(travel_time)
+                    total_operator_dt += self.env.now - travel_start
+
             # --- Main processing loop (shift-aware) ---
-            while cycle_time > 0:
+            while process_time > 0:
                 real_time = start_date + timedelta(minutes=self.env.now)
 
                 if SimulationUtils.is_active_shift(shift_cfg, real_time, shifts_per_day):
@@ -1076,8 +1284,12 @@ class ManufacturingSimulation:
                         total_station_dt += dt_added
                         station_downtime_budget -= dt_added
 
-                        # Operator availability
-                        if self.operators_data and has_operators:
+                        # Operator availability — the older static shift1/2/3
+                        # assignment. Skipped entirely once a Worker Controller
+                        # pool is wired (pool is not None): that Worker's own
+                        # acquire/release above already gates this station,
+                        # and running both would double-gate the same job.
+                        if pool is None and self.operators_data and has_operators:
                             current_shift = SimulationUtils.get_active_shift(
                                 self.env, self.simulation_state, shift_cfg, shifts_per_day
                             )
@@ -1089,9 +1301,9 @@ class ManufacturingSimulation:
                                     operator = SimulationUtils.operator_available(
                                         self.stations_data, self.operators_data, resource_name, current_shift
                                     )
-                                    available, op_dt_added, cycle_time = yield from self._handle_operator(
+                                    available, op_dt_added, process_time = yield from self._handle_operator(
                                         operator, resource_name, variant_name, shifts_per_day,
-                                        available, cycle_time, start_date
+                                        available, process_time, start_date
                                     )
                                     total_operator_dt += op_dt_added
 
@@ -1109,9 +1321,9 @@ class ManufacturingSimulation:
                             available = max(0.0, available)
 
                         # Process chunk
-                        if cycle_time <= 0:
+                        if process_time <= 0:
                             break
-                        chunk = min(cycle_time, available)
+                        chunk = min(process_time, available)
                         # Cap at the next break so a break shorter than this
                         # chunk still actually pauses processing — otherwise
                         # a single env.timeout() could run straight through a
@@ -1124,9 +1336,9 @@ class ManufacturingSimulation:
                         yield self.env.timeout(chunk)
                         processing_time += chunk
                         available -= chunk
-                        cycle_time -= chunk
+                        process_time -= chunk
                         available = max(0.0, available)
-                        cycle_time = max(0.0, cycle_time)
+                        process_time = max(0.0, process_time)
 
                     remaining_dt = max(0.0, station_downtime_budget)
                     total_station_dt += remaining_dt
@@ -1148,13 +1360,21 @@ class ManufacturingSimulation:
 
             total_processing += processing_time
 
+            # --- Worker pool release --- the Worker is free for the
+            # Controller to dispatch elsewhere as soon as this job leaves the
+            # station, win or lose (horizon cutoff included) — it remembers
+            # THIS station as its last_workplace either way, since it did
+            # physically stay here for however long it just processed.
+            if pool is not None and pool_worker is not None:
+                yield from pool.release(pool_worker, resource_name)
+
             # Job was cut short by the simulation horizon before finishing its
-            # cycle time — do not count it as completed or bill its full
+            # process time — do not count it as completed or bill its full
             # nominal duration; only the real partial processing_time happened.
             # Still record a completion_log entry (status "In Progress") so
             # the job trace doesn't silently drop it — a common gap in other
             # DES tools' entity logs (see _format_job_id's docstring context).
-            if horizon_cutoff and cycle_time > 0:
+            if horizon_cutoff and process_time > 0:
                 self.stations_data[resource_name]["job_counts"]["processing"] -= 1
                 self.stations_data[resource_name]["busy_time"] = (
                     self.stations_data[resource_name].get("busy_time", 0) + processing_time
@@ -1188,6 +1408,11 @@ class ManufacturingSimulation:
                 self.stations_data[resource_name]["rework_events"] = (
                     self.stations_data[resource_name].get("rework_events", 0) + 1
                 )
+                # Same double-counting risk as the setup loop above: any
+                # out-of-shift wait inside THIS loop still advances env.now,
+                # which rw_dur (below) is measured across — track it
+                # separately so it can be subtracted back out.
+                rw_pause = 0.0
                 # Process rework respecting shifts
                 while rework_time > 0:
                     real_time = start_date + timedelta(minutes=self.env.now)
@@ -1213,8 +1438,9 @@ class ManufacturingSimulation:
                             break
                         yield self.env.timeout(wait)
                         total_pause += wait
+                        rw_pause += wait
 
-                rw_dur = self.env.now - rw_start
+                rw_dur = self.env.now - rw_start - rw_pause
                 total_rework += rw_dur
                 self.stations_data[resource_name]["total_rework_time"] = (
                     self.stations_data[resource_name].get("total_rework_time", 0) + rw_dur
@@ -1269,6 +1495,12 @@ class ManufacturingSimulation:
             "Blocked Time": total_blocked,
             "Waiting Time": self.stations_data[resource_name].get("total_waiting_time", 0),
             "Processing Time": total_processing,
+            # Per-station Cycle Time (CT/PT/ST spec): arrival (block_start,
+            # set before this job requested the station) to departure
+            # (process_end, just above) — the entity's TOTAL elapsed time at
+            # this one station, distinct from Processing Time above (which
+            # is only the active working portion of that same span).
+            "Cycle Time": self.timing.get_cycle_time(block_start, process_end),
             "process_start_time_real": (start_date + timedelta(minutes=process_start)).strftime("%Y-%m-%d %H:%M:%S"),
             "process_end_time_real": (start_date + timedelta(minutes=process_end)).strftime("%Y-%m-%d %H:%M:%S"),
             "station_downtime": total_station_dt,
@@ -1313,10 +1545,10 @@ class ManufacturingSimulation:
         return max(0.0, available), dt_added
 
     def _handle_operator(self, operator, resource_name, variant_name, shifts_per_day,
-                          available, cycle_time, start_date):
+                          available, process_time, start_date):
         """
-        Wait for operator if unavailable; adjust cycle_time by skill.
-        Returns (available, op_downtime_added, cycle_time).
+        Wait for operator if unavailable; adjust process_time by skill.
+        Returns (available, op_downtime_added, process_time).
         """
         op_dt_added = 0.0
         op_dt_start = None
@@ -1346,12 +1578,12 @@ class ManufacturingSimulation:
             self._log_event(variant_name, resource_name, shifts_per_day, "operator downtime",
                             op_dt_start, op_dt_end, operator_downtime=op_dt, start_date=start_date)
 
-        # Adjust cycle_time by operator skill
+        # Adjust process_time by operator skill
         if operator:
-            adjusted_times = [cycle_time * 1.0 for _, _ in operator]  # skill factor placeholder → 1.0
-            cycle_time = sum(adjusted_times) / len(adjusted_times)
+            adjusted_times = [process_time * 1.0 for _, _ in operator]  # skill factor placeholder → 1.0
+            process_time = sum(adjusted_times) / len(adjusted_times)
 
-        return max(0.0, available), op_dt_added, cycle_time
+        return max(0.0, available), op_dt_added, process_time
 
     # ------------------------------------------------------------------
     # Post-processing
@@ -1441,6 +1673,7 @@ class ManufacturingSimulation:
             "job_log": self.job_log,
             "completion_log": self.completion_log,
             "bottleneck_store": self.bottleneck_store,
+            "worker_pool_stats": {name: pool.get_stats() for name, pool in self.worker_pools.items()},
         }
 
     # ------------------------------------------------------------------
@@ -1496,6 +1729,36 @@ class ManufacturingSimulation:
         avg_sim_time = stats_lib.mean(
             [r.get("simulation_state", {}).get("total_simulated_time", 0) for r in results]
         )
+        # rejected_jobs (Worker Controller Queue Policy = reject) was
+        # previously dropped here entirely for multi-replication runs — a
+        # scenario using a rejecting pool would show 0 rejections the moment
+        # more than one replication was run, even though single-run results
+        # correctly reported it.
+        avg_rejected = round(stats_lib.mean(
+            [r.get("simulation_state", {}).get("rejected_jobs", 0) for r in results]
+        ))
+
+        # Average each Worker Controller's pool stats across replications —
+        # previously dropped entirely (worker_pool_stats had no key at all in
+        # this method's return value), so the View-mode "Worker Pool" panel
+        # showed "no pool data" for a properly-wired Controller the moment a
+        # multi-replication run was used instead of a single run.
+        controller_names = set()
+        for r in results:
+            controller_names.update(r.get("worker_pool_stats", {}).keys())
+        aggregated_pool_stats: Dict[str, Any] = {}
+        for name in controller_names:
+            def _p(key, _name=name):
+                return [r.get("worker_pool_stats", {}).get(_name, {}).get(key, 0) for r in results]
+            aggregated_pool_stats[name] = {
+                "workers_busy":       stats_lib.mean(_p("workers_busy")),
+                "workers_idle":       stats_lib.mean(_p("workers_idle")),
+                "queue_length":       stats_lib.mean(_p("queue_length")),
+                "jobs_completed":     round(stats_lib.mean(_p("jobs_completed"))),
+                "jobs_rejected":      round(stats_lib.mean(_p("jobs_rejected"))),
+                "avg_wait_time":      stats_lib.mean(_p("avg_wait_time")),
+                "worker_utilization": stats_lib.mean(_p("worker_utilization")),
+            }
 
         # Use completion_log from the last replication for Gantt
         last_log = results[-1].get("completion_log", {})
@@ -1529,11 +1792,13 @@ class ManufacturingSimulation:
             "simulation_state": {
                 "completed_jobs": total_jobs,
                 "in_progress_jobs": avg_in_progress,
+                "rejected_jobs": avg_rejected,
                 "total_simulated_time": avg_sim_time,
                 "summary": agg_summary,
             },
             "completion_log": last_log,
             "bottleneck_store": aggregated_bottlenecks,
+            "worker_pool_stats": aggregated_pool_stats,
             "raw_replications": results,
         }
 

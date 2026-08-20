@@ -1077,7 +1077,7 @@ function hourWindowsOverlap(aStart: number, aEnd: number, bStart: number, bEnd: 
 /**
  * Warnings for the Shift Calendar — non-blocking (Apply/Save always works
  * regardless; see the "warning only" decision this mirrors from elsewhere in
- * the app, e.g. Source/Drain). Flags two real misconfigurations:
+ * the app, e.g. Source/Drain). Flags five real misconfigurations:
  *
  *   1. Two shifts overlapping in time on a day both are actually active —
  *      e.g. Shift 1 6am-2pm and Shift 4 8am-4pm both running Monday means
@@ -1085,9 +1085,20 @@ function hourWindowsOverlap(aStart: number, aEnd: number, bStart: number, bEnd: 
  *   2. A break scheduled outside its OWN shift's hours — it would never
  *      actually happen, since the engine only checks breaks while that
  *      shift is active.
+ *   3. A shift with every day of the week unchecked — it will never run at
+ *      all, silently, with nothing else in the UI explaining why.
+ *   4. A shift whose start and end hour are identical — ambiguous: could
+ *      mean "runs the full 24 hours" but is far more often a forgotten edit
+ *      to the end-hour dropdown.
+ *   5. A day of the week with zero shifts active across the WHOLE
+ *      calendar — flagged only when at least one OTHER day does have
+ *      coverage, so an intentionally fully-idle scenario (e.g. a paused
+ *      line) doesn't get warned on every single day.
  *
- * Does not flag: shifts with no active days (a valid way to temporarily
- * disable a shift), or days with zero shifts active (a valid off day).
+ * Does NOT flag: a day with zero shifts when the whole week has no active
+ * shifts anywhere (that's covered by #3 on every shift instead), or a
+ * break that's merely long (already caught by #2 once it spills past the
+ * shift's own end).
  */
 function shiftCalendarWarnings(shifts: ShiftEntry[]): string[] {
   const warnings: string[] = []
@@ -1101,10 +1112,7 @@ function shiftCalendarWarnings(shifts: ShiftEntry[]): string[] {
       if (!hourWindowsOverlap(a.start, a.end, b.start, b.end)) continue
       const sharedDays = a.workingDays.filter((d) => b.workingDays.includes(d))
       if (sharedDays.length === 0) continue
-      warnings.push(
-        `${shiftLabel(a)} (${fmtHour(a.start)}–${fmtHour(a.end)}) overlaps ${shiftLabel(b)} ` +
-        `(${fmtHour(b.start)}–${fmtHour(b.end)}) on ${sharedDays.map(dayLabel).join(', ')}`
-      )
+      warnings.push(`${shiftLabel(a)} and ${shiftLabel(b)} overlap on ${sharedDays.map(dayLabel).join(', ')}`)
     }
   }
 
@@ -1112,11 +1120,28 @@ function shiftCalendarWarnings(shifts: ShiftEntry[]): string[] {
     for (const bw of s.breaks) {
       const breakEnd = bw.start + bw.duration / 60
       if (!hourWindowsOverlap(s.start, s.end, bw.start, breakEnd)) {
-        warnings.push(
-          `${shiftLabel(s)}'s break at ${fmtHour(bw.start)} falls outside its own ` +
-          `${fmtHour(s.start)}–${fmtHour(s.end)} hours — it will never actually occur`
-        )
+        warnings.push(`${shiftLabel(s)}'s break is outside its own hours — it won't happen`)
       }
+    }
+  }
+
+  for (const s of shifts) {
+    if (s.workingDays.length === 0) {
+      warnings.push(`${shiftLabel(s)} has no working days — it will never run`)
+    }
+  }
+
+  for (const s of shifts) {
+    if (s.start === s.end) {
+      warnings.push(`${shiftLabel(s)} start and end time are the same`)
+    }
+  }
+
+  const anyShiftHasAnyDay = shifts.some((s) => s.workingDays.length > 0)
+  if (anyShiftHasAnyDay) {
+    for (let d = 0; d < 7; d++) {
+      const covered = shifts.some((s) => s.workingDays.includes(d))
+      if (!covered) warnings.push(`No shift runs on ${dayLabel(d)}`)
     }
   }
 

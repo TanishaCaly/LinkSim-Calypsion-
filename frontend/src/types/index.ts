@@ -25,26 +25,27 @@ export interface StationConfig {
   'PM Schedule': string
   'Material Shortage Probability (%)': number
   'Rework Probability (%)': number
+  // A Workplace/Station wired downstream of a Worker Controller names that
+  // Controller here — the engine draws its operator from that Controller's
+  // live pool (backend/engine/worker_pool.py) instead of the static
+  // shift1/2/3 assignment below. Absent means no pool wired (unchanged
+  // static behaviour, every pre-existing scenario).
+  'Worker Controller'?: string
+  // The rest of these fields are only present on a Worker Controller's own
+  // entry — its dispatch settings, built by Canvas at save time. See
+  // worker_pool.py's WorkerPool for exactly how each is used.
+  'Pool Workers'?: { name: string; availability: number; travel_time: number }[]
+  'Enabled'?: boolean
+  'Assignment Strategy'?: 'first_available' | 'round_robin'
+  'Queue Policy'?: 'queue' | 'reject'
+  'Max Queue Size'?: number
+  'Shift Start'?: number
+  'Shift End'?: number
+  'Allow Overtime'?: boolean
+  'Use Worker Travel Time'?: boolean
   shift1: string
   shift2: string
   shift3: string
-  // Per-station override of which weekdays a given shift number runs on for
-  // THIS station only (Python weekday numbering: Monday=0 ... Sunday=6).
-  // Absent/undefined falls back to the scenario's global Shift Calendar
-  // (WORKING_DAYS_n in simulation_config) for that shift number — set only
-  // when a station's own calendar genuinely differs from every other
-  // station using the same shift number. A 4th+ shift's override lives at
-  // the same `workingDays{n}` key, covered by the index signature below.
-  workingDays1?: number[]
-  workingDays2?: number[]
-  workingDays3?: number[]
-  // Per-station override of a shift's break windows (e.g. lunch), same
-  // override-or-fall-back-to-global pattern as workingDaysN above. A 4th+
-  // shift's override lives at the same `breaks{n}` key, covered by the
-  // index signature below.
-  breaks1?: { start: number; duration: number }[]
-  breaks2?: { start: number; duration: number }[]
-  breaks3?: { start: number; duration: number }[]
   STATION_DOWNTIME: number
   [key: string]: unknown
 }
@@ -163,6 +164,19 @@ export interface StationStat {
   top_bottleneck_metric: string | null
 }
 
+// Per Worker Controller, from worker_pool.py's WorkerPool.get_stats() —
+// reaches the frontend via RunDetail.result.worker_pool_stats (run.result is
+// persisted and returned wholesale, so this needed no backend API change).
+export interface WorkerPoolStat {
+  workers_busy: number
+  workers_idle: number
+  queue_length: number
+  jobs_completed: number
+  jobs_rejected: number
+  avg_wait_time: number
+  worker_utilization: number
+}
+
 export interface RunDetail {
   id: number
   scenario_id: number
@@ -175,7 +189,7 @@ export interface RunDetail {
   num_replications: number | null
   error_message: string | null
   station_stats: StationStat[]
-  result: Record<string, unknown> | null
+  result: (Record<string, unknown> & { worker_pool_stats?: Record<string, WorkerPoolStat> }) | null
 
   // Pre-computed KPIs from backend
   kpi_throughput: number | null
@@ -239,24 +253,6 @@ export interface StationNodeData {
   // Which of the day's shifts (1, 2, 3) this station runs on — any
   // combination, not just a contiguous count (e.g. [2, 3] to skip shift 1).
   shiftsPerDay?: number[]
-  // Per-shift-number override of which weekdays THIS station runs that
-  // shift on (Monday=0 ... Sunday=6), keyed by shift number. Absent for a
-  // given shift number falls back to the scenario's global Shift Calendar
-  // for that shift — this only holds entries where a station's own
-  // calendar genuinely differs from the global one.
-  workingDaysByShift?: Record<number, number[]>
-  // Per-shift-number override of THIS station's start/end hour for that
-  // shift (e.g. { 1: { start: 8, end: 16 } } for an 8am-4pm Shift 1),
-  // independent of the scenario's global Shift Calendar hours for that
-  // shift number. Absent for a given shift number falls back to the global
-  // hours.
-  shiftHoursByShift?: Record<number, { start: number; end: number }>
-  // Per-shift-number override of THIS station's break windows for that
-  // shift, independent of the scenario's global breaks for that shift
-  // number. Absent for a given shift number falls back to the global
-  // breaks; an explicit empty array means "no breaks for this station on
-  // this shift", not "unset".
-  breaksByShift?: Record<number, { start: number; duration: number }[]>
   assemblyCount?: number
   // Minutes for a unit to travel the length of a Conveyor. Used instead of
   // cycleTime for Conveyor stations, since transport is wall-clock travel
@@ -269,4 +265,52 @@ export interface StationNodeData {
   routingWeights?: Record<string, number>
   routingRules?: { variantType: string; resource: string }[]
   routingDefault?: string
+  // Worker only — which named operator (a key in the scenario's
+  // operators_data) this node represents. Contributes that operator's
+  // Availability into the Worker Controller's pool it's wired to (Canvas.tsx's
+  // save mutation) — see worker_pool.py.
+  assignedOperator?: string
+  // Worker only — minutes this Worker takes to move to a DIFFERENT
+  // Workplace than the one it was last dispatched to. No cost when its
+  // Worker Controller reassigns it to the SAME Workplace as last time.
+  travelTime?: number
+  // Worker only — which of its Worker Controller's controllerTasks (by id)
+  // this Worker is assigned to (a Worker can hold more than one task at
+  // once), chosen from the Controller panel's combined Workers/Tasks table.
+  // Purely a UI assignment, not read by the engine.
+  assignedTaskIds?: string[]
+  // Worker only — free-text task descriptions typed directly into the
+  // Worker Controller panel's Workers & Tasks row (e.g. "blank space to
+  // write the task" from the company's Excel template). A Worker can hold
+  // more than one, added via the row's "+" button. UI-only, not read by
+  // the engine.
+  taskTexts?: string[]
+  // Worker only — which specific Workplace(s) (by node id) this Worker
+  // actually serves, chosen from the Worker panel's Workplaces picker.
+  // Independent of the Controller-level Workplace wiring: two Workers can
+  // share one Worker Controller pool while each still only lists the
+  // Workplace(s) relevant to them. UI-only, not read by the engine (the
+  // engine only sees the shared pool via the Controller).
+  assignedWorkplaceIds?: string[]
+  // Worker Controller only — the dispatch brain's own settings (see
+  // worker_pool.py's WorkerPool for exactly how each is used). Written onto
+  // the Controller's own stations_data entry at save time, alongside the
+  // Pool Workers list built from every Worker wired into it.
+  controllerEnabled?: boolean
+  assignmentStrategy?: 'first_available' | 'round_robin'
+  queuePolicy?: 'queue' | 'reject'
+  maxQueueSize?: number
+  shiftStart?: number
+  shiftEnd?: number
+  allowOvertime?: boolean
+  useWorkerTravelTime?: boolean
+  // Worker Controller only — demo task checklist shown in the panel (not
+  // read by the simulation engine; purely a UI list for now).
+  controllerTasks?: { id: string; label: string; done: boolean }[]
+  // Plain station only — purely a UI convenience flag: checking it in the
+  // property panel auto-creates a Workplace node wired Station -> Workplace
+  // (see Canvas.tsx's addWorkplaceFor). Not read at save time; the actual
+  // staffing is the Workplace node/edges it created, same as if a user had
+  // dragged one in by hand.
+  requiresWorker?: boolean
 }
