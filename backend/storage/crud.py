@@ -108,12 +108,12 @@ def mark_run_running(db: Session, run_id: int) -> Optional[SimulationRun]:
     return run
 
 
-def complete_run(db: Session, run_id: int, result: Dict[str, Any]) -> Optional[SimulationRun]:
+def complete_run(db: Session, run_id: int, result: Dict[str, Any], status: str = "completed") -> Optional[SimulationRun]:
     run = get_run(db, run_id)
     if not run:
         return None
 
-    run.status = "completed"
+    run.status = status
     run.completed_at = datetime.utcnow()
     run.result = _json_safe(result)
 
@@ -160,6 +160,7 @@ def complete_run(db: Session, run_id: int, result: Dict[str, Any]) -> Optional[S
             capacity=stats.get("capacity", 1),
             top_bottleneck_type=top_bn.get("type"),
             top_bottleneck_metric=top_bn.get("metric"),
+            avg_cycle_time=stats.get("avg_cycle_time", 0.0),
         ))
 
     db.commit()

@@ -244,7 +244,7 @@ class ExcelParser:
                 break  # stop at a spacer row; anything after is not data
             operation = _clean_str(_find_col(row, "operation", "operation name"))
             resource  = _clean_str(_find_col(row, "resource", "station", "machine"))
-            duration  = _safe_float(_find_col(row, "duration", "cycle time", "cycle_time"), 0)
+            duration  = _safe_float(_find_col(row, "duration", "cycle time", "cycle_time", "process time"), 0)
             if operation:
                 steps.append({"operation": operation, "resource": resource, "duration": duration})
         return steps

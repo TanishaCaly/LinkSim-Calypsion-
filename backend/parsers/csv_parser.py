@@ -144,7 +144,7 @@ def _station_row_from(row: Dict[str, Any]) -> Dict[str, Any]:
         "Batch Setup Time": _safe_float(_find_col(row, "Batch Setup Time", "batch_setup_time"), 0),
         "Buffer Capacity": _safe_int(_find_col(row, "Buffer Capacity", "buffer_capacity"), 0),
         "Buffer Discipline": _clean_str(_find_col(row, "Buffer Discipline", "buffer_discipline"), "FIFO"),
-        "Buffer Width": _safe_int(_find_col(row, "Buffer Width", "buffer_width"), 0),
+        "Buffer Width": _safe_int(_find_col(row, "Buffer Width", "buffer_width", "BufferWidth"), 0),
         "Buffer Depth": _safe_int(_find_col(row, "Buffer Depth", "buffer_depth"), 0),
         "Buffer Height": _safe_int(_find_col(row, "Buffer Height", "buffer_height"), 0),
         "PM Schedule": _clean_str(_find_col(row, "PM Schedule", "pm_schedule"), "Monthly"),
@@ -272,7 +272,7 @@ class CsvParser:
                 continue  # skip blank/trailing rows
             operation = _clean_str(row.get("Operation", row.get("operation")))
             resource = _clean_str(row.get("Resource", row.get("resource")))
-            duration = _safe_float(row.get("Duration", row.get("duration")), 0)
+            duration = _safe_float(_find_col(row, "Duration", "duration", "process time", "cycle time"), 0)
             rule = _clean_str(_find_col(row, "Rule", "rule")).strip().lower()
             weight_raw = _find_col(row, "Condition/Weight", "condition_weight", "weight", "condition")
 

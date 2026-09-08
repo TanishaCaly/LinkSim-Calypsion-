@@ -46,6 +46,24 @@ def trigger_run(
     return run
 
 
+@router.post("/{run_id}/stop", status_code=status.HTTP_202_ACCEPTED)
+def stop_run(run_id: int, db: Session = Depends(get_db)):
+    """
+    Request cancellation of an in-progress run. Sets a flag the running
+    simulation thread polls at its existing progress checkpoints (see
+    sim_core.py's stepped env.run() loop) — there's no hard kill, so the
+    run stops at its NEXT checkpoint, not instantly, and still returns
+    whatever partial results it accumulated up to that point.
+    """
+    run = crud.get_run(db, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run.status != "running":
+        raise HTTPException(status_code=400, detail=f"Run is '{run.status}', not running — nothing to stop")
+    progress_store.request_stop(run_id)
+    return {"status": "stop_requested"}
+
+
 # ---------------------------------------------------------------------------
 # SSE progress stream
 # ---------------------------------------------------------------------------
@@ -205,6 +223,7 @@ def _execute_run(run_id: int, scenario_id: int, sim_config_override: dict):
             progress_callback=_push,
             variant_intervals=scenario.variant_intervals,
             setup_matrix=scenario.setup_matrix,
+            stop_check=lambda: progress_store.is_stop_requested(run_id),
         )
 
         run_record = crud.get_run(db, run_id)
@@ -219,16 +238,17 @@ def _execute_run(run_id: int, scenario_id: int, sim_config_override: dict):
         _t_sim_done = _time.time()
 
         completed = result.get("simulation_state", {}).get("completed_jobs", 0)
-        logger.info(f"[RUN {run_id}] sim.run() took {_t_sim_done-_t_sim:.2f}s | completed_jobs={completed}")
+        stopped_early = result.get("simulation_state", {}).get("stopped_early", False)
+        logger.info(f"[RUN {run_id}] sim.run() took {_t_sim_done-_t_sim:.2f}s | completed_jobs={completed} | stopped_early={stopped_early}")
         logger.info(f"[RUN {run_id}] saving to DB… (elapsed: {_time.time()-_t_start:.1f}s)")
         for sname, ss in result.get("station_stats", {}).items():
             logger.info(f"[RUN {run_id}]   {sname}: jobs={ss.get('completed_jobs',0)}, util={ss.get('station_utilization',0):.1f}%")
 
-        crud.complete_run(db, run_id, result)
+        crud.complete_run(db, run_id, result, status="stopped" if stopped_early else "completed")
         progress_store.push(run_id, {
             "type": "done",
             "pct": 100,
-            "msg": "Simulation complete",
+            "msg": "Simulation stopped by user" if stopped_early else "Simulation complete",
             "completed_jobs": completed,
         })
 

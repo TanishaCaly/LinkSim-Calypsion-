@@ -655,6 +655,19 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
     setMatrixDirty(true)
   }
 
+  // Every tab's "Save changes" button saves ALL dirty tabs, not just its own —
+  // so switching tabs before saving never silently drops edits.
+  const anyDirty = stationsDirty || matrixDirty || flowDirty || operatorsDirty || quantitiesDirty
+  const anySaving = saveStationsMutation.isPending || saveMatrixMutation.isPending
+    || saveFlowMutation.isPending || saveOperatorsMutation.isPending || saveQuantitiesMutation.isPending
+  const saveAllDirty = () => {
+    if (stationsDirty) saveStationsMutation.mutate(stationRows)
+    if (matrixDirty) saveMatrixMutation.mutate(matrixRows)
+    if (flowDirty) saveFlowMutation.mutate(flowRows)
+    if (operatorsDirty) saveOperatorsMutation.mutate(operatorRows)
+    if (quantitiesDirty) saveQuantitiesMutation.mutate(quantityRows)
+  }
+
   return (
     <div className="fixed inset-0 z-[9999] flex items-center justify-center">
       <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={onClose} />
@@ -820,15 +833,15 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                 Add station
               </button>
               <div className="flex items-center gap-3">
-                {stationsSaved && <span className="text-xs text-green-600 font-medium">Saved</span>}
+                {(stationsSaved || matrixSaved || flowSaved || operatorsSaved || quantitiesSaved) && <span className="text-xs text-green-600 font-medium">Saved</span>}
                 <Button
                   size="sm"
-                  disabled={!stationsDirty || saveStationsMutation.isPending}
-                  onClick={() => saveStationsMutation.mutate(stationRows)}
+                  disabled={!anyDirty || anySaving}
+                  onClick={saveAllDirty}
                   className="bg-blue-600 hover:bg-blue-700"
                 >
                   <Save className="h-3.5 w-3.5 mr-1.5" />
-                  {saveStationsMutation.isPending ? 'Saving…' : 'Save changes'}
+                  {anySaving ? 'Saving…' : 'Save changes'}
                 </Button>
               </div>
             </div>
@@ -918,15 +931,15 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                     Add row
                   </button>
                   <div className="flex items-center gap-3">
-                    {matrixSaved && <span className="text-xs text-green-600 font-medium">Saved</span>}
+                    {(stationsSaved || matrixSaved || flowSaved || operatorsSaved || quantitiesSaved) && <span className="text-xs text-green-600 font-medium">Saved</span>}
                     <Button
                       size="sm"
-                      disabled={!matrixDirty || saveMatrixMutation.isPending}
-                      onClick={() => saveMatrixMutation.mutate(matrixRows)}
+                      disabled={!anyDirty || anySaving}
+                      onClick={saveAllDirty}
                       className="bg-blue-600 hover:bg-blue-700"
                     >
                       <Save className="h-3.5 w-3.5 mr-1.5" />
-                      {saveMatrixMutation.isPending ? 'Saving…' : 'Save changes'}
+                      {anySaving ? 'Saving…' : 'Save changes'}
                     </Button>
                   </div>
                 </div>
@@ -941,7 +954,7 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-gray-100">
-                      {['Variant', 'Operation', 'Station / Resource', 'Exit Controller (branching)', 'Duration (min)', 'Station Availability (%)', 'Repair Time', 'Setup Time', ''].map(h => (
+                      {['Variant', 'Operation', 'Station / Resource', 'Exit Controller (branching)', 'Process Time (min)', 'Station Availability (%)', 'Repair Time', 'Setup Time', ''].map(h => (
                         <th key={h} className="text-left text-[10px] font-bold text-gray-400 uppercase tracking-widest pb-3 pr-4 whitespace-nowrap">{h}</th>
                       ))}
                     </tr>
@@ -1146,22 +1159,15 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                   Add step
                 </button>
                 <div className="flex items-center gap-3">
-                  {(flowSaved || stationsSaved) && <span className="text-xs text-green-600 font-medium">Saved</span>}
+                  {(stationsSaved || matrixSaved || flowSaved || operatorsSaved || quantitiesSaved) && <span className="text-xs text-green-600 font-medium">Saved</span>}
                   <Button
                     size="sm"
-                    disabled={(!flowDirty && !stationsDirty) || saveFlowMutation.isPending || saveStationsMutation.isPending}
-                    onClick={() => {
-                      // Repair Time / Setup Time edited on this tab live in
-                      // stationRows (see stationNum above), so saving here
-                      // must persist both mutations, not just the
-                      // process-flow rows.
-                      if (flowDirty) saveFlowMutation.mutate(flowRows)
-                      if (stationsDirty) saveStationsMutation.mutate(stationRows)
-                    }}
+                    disabled={!anyDirty || anySaving}
+                    onClick={saveAllDirty}
                     className="bg-blue-600 hover:bg-blue-700"
                   >
                     <Save className="h-3.5 w-3.5 mr-1.5" />
-                    {(saveFlowMutation.isPending || saveStationsMutation.isPending) ? 'Saving…' : 'Save changes'}
+                    {anySaving ? 'Saving…' : 'Save changes'}
                   </Button>
                 </div>
               </div>
@@ -1236,15 +1242,15 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                   Add operator
                 </button>
                 <div className="flex items-center gap-3">
-                  {operatorsSaved && <span className="text-xs text-green-600 font-medium">Saved</span>}
+                  {(stationsSaved || matrixSaved || flowSaved || operatorsSaved || quantitiesSaved) && <span className="text-xs text-green-600 font-medium">Saved</span>}
                   <Button
                     size="sm"
-                    disabled={!operatorsDirty || saveOperatorsMutation.isPending}
-                    onClick={() => saveOperatorsMutation.mutate(operatorRows)}
+                    disabled={!anyDirty || anySaving}
+                    onClick={saveAllDirty}
                     className="bg-blue-600 hover:bg-blue-700"
                   >
                     <Save className="h-3.5 w-3.5 mr-1.5" />
-                    {saveOperatorsMutation.isPending ? 'Saving…' : 'Save changes'}
+                    {anySaving ? 'Saving…' : 'Save changes'}
                   </Button>
                 </div>
               </div>
@@ -1320,15 +1326,15 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                   Add variant
                 </button>
                 <div className="flex items-center gap-3">
-                  {quantitiesSaved && <span className="text-xs text-green-600 font-medium">Saved</span>}
+                  {(stationsSaved || matrixSaved || flowSaved || operatorsSaved || quantitiesSaved) && <span className="text-xs text-green-600 font-medium">Saved</span>}
                   <Button
                     size="sm"
-                    disabled={!quantitiesDirty || saveQuantitiesMutation.isPending}
-                    onClick={() => saveQuantitiesMutation.mutate(quantityRows)}
+                    disabled={!anyDirty || anySaving}
+                    onClick={saveAllDirty}
                     className="bg-blue-600 hover:bg-blue-700"
                   >
                     <Save className="h-3.5 w-3.5 mr-1.5" />
-                    {saveQuantitiesMutation.isPending ? 'Saving…' : 'Save changes'}
+                    {anySaving ? 'Saving…' : 'Save changes'}
                   </Button>
                 </div>
               </div>

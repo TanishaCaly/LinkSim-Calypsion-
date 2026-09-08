@@ -296,6 +296,7 @@ class ManufacturingSimulation:
         progress_callback: Optional[Callable[..., None]] = None,
         variant_intervals: Optional[Dict[str, float]] = None,
         setup_matrix: Optional[Dict[str, Dict[str, float]]] = None,
+        stop_check: Optional[Callable[[], bool]] = None,
     ):
         self.stations_data = {k: dict(v) for k, v in stations_data.items()}
         self.processflow_data = processflow_data
@@ -311,6 +312,12 @@ class ManufacturingSimulation:
         self.operators_data = operators_data
         self.sim_config = simulation_config
         self.progress_cb = progress_callback or (lambda pct, msg, **extra: None)
+        # Polled from the stepped env.run() loop in _run_simpy — True means
+        # the Stop button was pressed for this run (see progress_store's
+        # is_stop_requested). No thread-kill involved: the sim just checks
+        # this at its existing checkpoints and raises SimulationStopped to
+        # unwind cleanly, same as any other exception path.
+        self.stop_check = stop_check or (lambda: False)
 
         # Runtime state (reset on each run)
         self.env: Optional[simpy.Environment] = None
@@ -348,7 +355,49 @@ class ManufacturingSimulation:
             result = self._collect_results()
         finally:
             self.sim_config["SIM_TIME"] = full_sim_time
+        self._log_variant_cycle_times()
         return result
+
+    def _log_variant_cycle_times(self):
+        """
+        Per-variant "complete cycle time" summary, logged once per run — for
+        each variant, sum one job's per-station Cycle Time entries (already
+        computed per station-visit — see _perform_operation's trace_entry,
+        stored per station in self.completion_log) across every station it
+        visited, giving an approximate total elapsed time for that job
+        start-to-finish; then average that across every completed job of the
+        variant. This is assembled entirely from the existing per-station CT
+        numbers — it does NOT introduce the doc's separate whole-job/Drain
+        "Final entity CT" metric, which remains deliberately unimplemented
+        (per-station CT only, as decided).
+        """
+        # job_id (e.g. "widget-001") -> sum of "Cycle Time" across every
+        # station visit that job completed.
+        job_totals: Dict[str, float] = {}
+        for entries in self.completion_log.values():
+            for e in entries:
+                if e.get("status") != "Completed":
+                    continue
+                job_id = e.get("job_id")
+                if not job_id:
+                    continue
+                job_totals[job_id] = job_totals.get(job_id, 0.0) + e.get("Cycle Time", 0)
+
+        # Group job totals by variant TYPE — job_id is "{CleanType}-{003}".
+        variant_job_totals: Dict[str, list] = {}
+        for job_id, total in job_totals.items():
+            variant_type = job_id.rsplit("-", 1)[0] if "-" in job_id else job_id
+            variant_job_totals.setdefault(variant_type, []).append(total)
+
+        for variant_type, totals in variant_job_totals.items():
+            if not totals:
+                continue
+            avg_total = sum(totals) / len(totals)
+            logger.info(
+                "[run_complete] variant=%s jobs=%d avg_complete_cycle_time=%.2f min "
+                "(sum of per-station Cycle Time across all stations visited, averaged over completed jobs)",
+                variant_type, len(totals), avg_total,
+            )
 
     def _validate_config(self):
         """
@@ -419,6 +468,13 @@ class ManufacturingSimulation:
             random.seed(42 + rep)
             result = self.run()
             all_results.append(result)
+            # A stop mid-replication already cut that replication's own
+            # _run_simpy loop short (see stop_check there) — this additional
+            # check just stops us from starting a WHOLE NEW replication
+            # after the button was pressed, rather than running num_replications
+            # regardless.
+            if result.get("simulation_state", {}).get("stopped_early"):
+                break
 
         self.progress_cb(1.0, "Aggregating replications")
         return self._aggregate_replications(all_results)
@@ -732,6 +788,7 @@ class ManufacturingSimulation:
         num_steps = 20
         step = max(1.0, sim_time / num_steps)
         target = 0.0
+        stopped = False
         while target < sim_time:
             target = min(sim_time, target + step)
             self.env.run(until=target)
@@ -744,6 +801,16 @@ class ManufacturingSimulation:
                 sim_time_now=target,
                 sim_time_total=sim_time,
             )
+            # Stop button was pressed (see progress_store.request_stop) —
+            # break out of the stepped loop now rather than running the
+            # remaining chunks. Every job still in flight at this instant
+            # simply never reaches its "Completed" trace_entry, the same
+            # shape as a job cut short by hitting SIM_TIME naturally.
+            if self.stop_check():
+                stopped = True
+                break
+
+        self.simulation_state["stopped_early"] = stopped
 
         # Copy machine failure/PM counts back into station data
         for name, machine in self.resources.items():
@@ -1069,8 +1136,6 @@ class ManufacturingSimulation:
         first_station = SimulationUtils.is_first_station(resource_name, self.processflow_data)
 
         variant_name = f"{variant_type} {variant_id}"
-        if variant_name not in self.job_log:
-            self.job_log[variant_name] = []
 
         # --- Handle machine idle (no jobs waiting) ---
         if resource.wait_start_time is not None:
@@ -1359,6 +1424,14 @@ class ManufacturingSimulation:
                                     pause_start, self.env.now, pause_time=wait, start_date=start_date)
 
             total_processing += processing_time
+            # Process Time itself was only ever visible indirectly (inferred
+            # from the gap to the NEXT station's arrival) — log it directly
+            # so it's traceable the same way setup/blocked/waiting already
+            # are. processing_time is the REAL elapsed work time (may be
+            # less than adjusted_ct if horizon_cutoff ended the job early).
+            self._log_event(variant_name, resource_name, shifts_per_day, "process completed",
+                            process_start, self.env.now, process_time=processing_time,
+                            horizon_cutoff=horizon_cutoff, start_date=start_date)
 
             # --- Worker pool release --- the Worker is free for the
             # Controller to dispatch elsewhere as soon as this job leaves the
@@ -1637,6 +1710,11 @@ class ManufacturingSimulation:
     # Result collection
     # ------------------------------------------------------------------
 
+    def _calc_avg_cycle_time(self, station_name: str) -> float:
+        entries = self.completion_log.get(station_name, [])
+        cts = [e["Cycle Time"] for e in entries if e.get("status") == "Completed" and "Cycle Time" in e]
+        return round(sum(cts) / len(cts), 2) if cts else 0.0
+
     def _collect_results(self) -> Dict[str, Any]:
         sim_time = self.sim_config.get("SIM_TIME", 1) or 1
         station_stats = {
@@ -1660,6 +1738,7 @@ class ManufacturingSimulation:
                 "pm_breakdowns": s.get("pm_breakdowns", 0),
                 "operator_per_station": s.get("operator_per_station", 1),
                 "capacity": s.get("capacity", 1),
+                "avg_cycle_time": self._calc_avg_cycle_time(name),
             }
             for name, s in self.stations_data.items()
         }
@@ -1670,7 +1749,7 @@ class ManufacturingSimulation:
         return {
             "simulation_state": self.simulation_state,
             "station_stats": station_stats,
-            "job_log": self.job_log,
+            "job_log": {},
             "completion_log": self.completion_log,
             "bottleneck_store": self.bottleneck_store,
             "worker_pool_stats": {name: pool.get_stats() for name, pool in self.worker_pools.items()},
@@ -1717,6 +1796,7 @@ class ManufacturingSimulation:
                 "pm_breakdowns":          round(stats_lib.mean(_s("pm_breakdowns"))),
                 "operator_per_station":   results[0]["station_stats"][name].get("operator_per_station", 1),
                 "capacity":               results[0]["station_stats"][name].get("capacity", 1),
+                "avg_cycle_time":         round(stats_lib.mean(_s("avg_cycle_time")), 2),
             }
 
         # Aggregate simulation_state (avg completed_jobs across reps, avg sim time)
@@ -1795,6 +1875,12 @@ class ManufacturingSimulation:
                 "rejected_jobs": avg_rejected,
                 "total_simulated_time": avg_sim_time,
                 "summary": agg_summary,
+                # True if ANY replication was cut short by a Stop request —
+                # _execute_run uses this to mark the whole run "stopped"
+                # rather than "completed" even under multi-replication.
+                "stopped_early": any(
+                    r.get("simulation_state", {}).get("stopped_early") for r in results
+                ),
             },
             "completion_log": last_log,
             "bottleneck_store": aggregated_bottlenecks,
@@ -1831,7 +1917,17 @@ class ManufacturingSimulation:
             "end_time_real": (start_date + timedelta(minutes=end)).strftime("%H:%M:%S"),
             **kwargs,
         }
-        self.job_log.setdefault(variant_name, []).append(entry)
+        # job_log used to accumulate every entry here too, but nothing reads
+        # it back (the frontend's Job Trace tab uses completion_log, not
+        # job_log) and on large scenarios it grows into gigabytes of live
+        # objects, which was crashing the backend on big runs. The full
+        # timeline is still available via the logger.info call below.
+        logger.info(
+            "[%s] variant=%s station=%s sim_t=%.2f->%.2f real=%s->%s%s",
+            event, variant_name, station, start, end,
+            entry["start_time_real"], entry["end_time_real"],
+            (" " + " ".join(f"{k}={v}" for k, v in kwargs.items())) if kwargs else "",
+        )
 
     @staticmethod
     def _calc_pcts(processing, blocked, station_dt, pause, op_dt, rework, mat_unavail, waiting, total_shift_min, setup=0.0):

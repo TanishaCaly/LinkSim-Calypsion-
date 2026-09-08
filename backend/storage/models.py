@@ -110,6 +110,7 @@ class StationStat(Base):
     pm_breakdowns = Column(Integer, default=0)
     operator_per_station = Column(Integer, default=1)
     capacity = Column(Integer, default=1)
+    avg_cycle_time = Column(Float, default=0.0)
 
     # Bottleneck summary (top issue type)
     top_bottleneck_type = Column(String(100), nullable=True)

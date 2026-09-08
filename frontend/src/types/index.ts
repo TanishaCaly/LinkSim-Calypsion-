@@ -162,6 +162,7 @@ export interface StationStat {
   capacity: number
   top_bottleneck_type: string | null
   top_bottleneck_metric: string | null
+  avg_cycle_time: number
 }
 
 // Per Worker Controller, from worker_pool.py's WorkerPool.get_stats() —
@@ -250,6 +251,12 @@ export interface StationNodeData {
   capacity: number
   cycleTime: number
   operators: number
+  // Display-only fields shown alongside Cycle Time on the Station panel —
+  // not yet read by the simulation engine (Cycle Time keeps feeding the
+  // engine's process duration exactly as before). setupTime saves to the
+  // scenario's existing 'Setup time' station field.
+  setupTime?: number
+  processTime?: number
   // Which of the day's shifts (1, 2, 3) this station runs on — any
   // combination, not just a contiguous count (e.g. [2, 3] to skip shift 1).
   shiftsPerDay?: number[]

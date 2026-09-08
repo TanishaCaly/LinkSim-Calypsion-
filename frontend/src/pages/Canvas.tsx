@@ -1040,10 +1040,18 @@ function PropertyEditor({
       // nothing here, so only Name is shown.
       : isWorkplace
         ? [{ key: 'label', label: 'Name', type: 'text' }]
-        : [
-            { key: 'label',     label: 'Name',            type: 'text'   },
-            { key: 'cycleTime', label: 'Cycle Time (min)', type: 'number' },
-            { key: 'operators', label: 'Operators',        type: 'number' },
+        // A Buffer/Queue node has no process/setup duration and no
+        // operator of its own — it's a waiting slot, not a work station —
+        // so Cycle/Setup/Process Time and Operators would all be inert
+        // here, same reasoning as Workplace above.
+        : isBuffer
+          ? [{ key: 'label', label: 'Name', type: 'text' }]
+          : [
+            { key: 'label',       label: 'Name',              type: 'text'   },
+            { key: 'cycleTime',   label: 'Cycle Time (min)',   type: 'number' },
+            { key: 'setupTime',   label: 'Setup Time (min)',   type: 'number' },
+            { key: 'processTime', label: 'Process Time (min)', type: 'number' },
+            { key: 'operators',   label: 'Operators',          type: 'number' },
           ]
 
   // An operator is one real person — the same one can't be two separate
@@ -1128,31 +1136,52 @@ function PropertyEditor({
 
       {/* Fields */}
       <div className="p-4 space-y-3">
-        {fields.map(({ key, label, type }) => (
-          <div key={key}>
-            <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
-              {label}
-            </label>
-            {type === 'number' ? (
-              <NumericField
-                // Fields that only exist on some station types (e.g. a
-                // Conveyor's transportTime) are undefined on a freshly added
-                // node — Number(undefined) is NaN, which would render an empty
-                // uneditable box, so fall back to 0.
-                value={Number(node.data[key as keyof StationNodeData] ?? 0)}
-                onCommit={(n) => onChange(node.id, { [key]: n })}
-                className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
-              />
-            ) : (
-              <Input
-                type={type}
-                value={String(node.data[key as keyof StationNodeData])}
-                onChange={(e) => onChange(node.id, { [key]: e.target.value })}
-                className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
-              />
-            )}
-          </div>
-        ))}
+        {(() => {
+          const renderField = ({ key, label, type }: (typeof fields)[number]) => (
+            <div key={key}>
+              <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5 leading-tight min-h-[2.2em] flex items-end">
+                {label}
+              </label>
+              {type === 'number' ? (
+                <NumericField
+                  // Fields that only exist on some station types (e.g. a
+                  // Conveyor's transportTime) are undefined on a freshly added
+                  // node — Number(undefined) is NaN, which would render an empty
+                  // uneditable box, so fall back to 0.
+                  value={Number(node.data[key as keyof StationNodeData] ?? 0)}
+                  onCommit={(n) => onChange(node.id, { [key]: n })}
+                  className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+                />
+              ) : (
+                <Input
+                  type={type}
+                  value={String(node.data[key as keyof StationNodeData])}
+                  onChange={(e) => onChange(node.id, { [key]: e.target.value })}
+                  className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+                />
+              )}
+            </div>
+          )
+          // Text fields (Name) stay full-width; number fields (Cycle/Setup/
+          // Process Time, Operators, ...) are paired two-per-row so they
+          // don't each burn a full row of vertical space.
+          const textFields = fields.filter((f) => f.type !== 'number')
+          const numberFields = fields.filter((f) => f.type === 'number')
+          const numberRows: (typeof fields)[number][][] = []
+          for (let i = 0; i < numberFields.length; i += 2) {
+            numberRows.push(numberFields.slice(i, i + 2))
+          }
+          return (
+            <>
+              {textFields.map(renderField)}
+              {numberRows.map((row, i) => (
+                <div key={i} className="grid grid-cols-2 gap-3">
+                  {row.map(renderField)}
+                </div>
+              ))}
+            </>
+          )
+        })()}
 
         {/* Plain station — check to auto-create a Workplace node wired to
             this station (Station -> Workplace); wire that Workplace on to a
@@ -2072,6 +2101,7 @@ function buildEditableGraph(
             transportTime: cfg?.['Transport Time'],
             assemblyCount: cfg?.['Assembly Count'],
             assemblyInputs: cfg?.['Assembly Inputs'],
+            setupTime: cfg?.['Setup time'],
             // Worker/Worker Controller/Workplace are never real processflow
             // steps, so they never reach this per-step loop at all — they're
             // reconstructed separately, straight from stationsData, right
@@ -2898,6 +2928,7 @@ export default function Canvas() {
           ...(n.data.transportTime !== undefined ? { 'Transport Time': n.data.transportTime } : {}),
           ...(n.data.assemblyCount !== undefined ? { 'Assembly Count': n.data.assemblyCount } : {}),
           ...(n.data.assemblyInputs !== undefined ? { 'Assembly Inputs': n.data.assemblyInputs } : {}),
+          ...(n.data.setupTime !== undefined ? { 'Setup time': n.data.setupTime } : {}),
           'Failure rate': 0, 'Repair Time': 10, 'PM Schedule': 'Monthly',
           'Material Shortage Probability (%)': 0, 'Rework Probability (%)': 0,
           shift1: '', shift2: '', shift3: '', STATION_DOWNTIME: 0,

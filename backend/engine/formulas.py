@@ -130,7 +130,12 @@ def calc_station_utilization(station: dict, sim_config: dict) -> float:
     warmup_time = sim_config.get("WARMUP_TIME", 0) or 0
     per_day = _available_minutes_per_day(shifts, shift_duration)
     available = per_day * _working_days(sim_time, shifts, warmup_time, sim_config.get(f"WORKING_DAYS_{shifts}")) * capacity
-    return round((busy / available * 100) if available > 0 else 0.0, 2)
+    # A utilization % above 100 is only ever a modeling/measurement edge case
+    # (e.g. busy_time accrued outside the "available" window this divides
+    # by) — never a real "used more than 100% of the time" result, so it's
+    # clamped here rather than shown as a misleading 300%+ figure.
+    pct = (busy / available * 100) if available > 0 else 0.0
+    return round(min(pct, 100.0), 2)
 
 
 def calc_operator_utilization(station: dict, sim_config: dict) -> float:
@@ -150,7 +155,9 @@ def calc_operator_utilization(station: dict, sim_config: dict) -> float:
     warmup_time = sim_config.get("WARMUP_TIME", 0) or 0
     per_day = _available_minutes_per_day(shifts, shift_duration)
     available = per_day * _working_days(sim_time, shifts, warmup_time, sim_config.get(f"WORKING_DAYS_{shifts}")) * operators * capacity
-    return round((busy / available * 100) if available > 0 else 0.0, 2)
+    # See calc_station_utilization's comment — same clamp, same reasoning.
+    pct = (busy / available * 100) if available > 0 else 0.0
+    return round(min(pct, 100.0), 2)
 
 
 def calc_rework_pct(station: dict) -> float:

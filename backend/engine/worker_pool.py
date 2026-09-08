@@ -16,9 +16,13 @@ same pool.
 Kept as its own module (not folded into machine.py) since a WorkerToken is a
 plain data holder passed through a FilterStore, not a SimPy Resource itself.
 """
+import logging
 import random
 import simpy
+from datetime import datetime
 from typing import Optional
+
+logger = logging.getLogger("linksim.engine")
 
 
 class WorkerToken:
@@ -158,6 +162,11 @@ class WorkerPool:
         """
         if self.queue_policy == "reject" and self.max_queue_size is not None and len(self._queue) >= self.max_queue_size:
             self.rejected_jobs += 1
+            logger.info(
+                "[worker_rejected] controller=%s resource=%s sim_t=%.2f real=%s queue_full=%d/%s",
+                self.name, resource_name, self.env.now, datetime.now().isoformat(timespec="seconds"),
+                len(self._queue), self.max_queue_size,
+            )
             raise PoolRejected(f"Worker Controller '{self.name}' queue is full")
 
         request_id = object()
@@ -176,8 +185,14 @@ class WorkerPool:
                 break
         finally:
             self._queue.remove(request_id)
-        self.wait_times.append(self.env.now - wait_start)
+        wait_time = self.env.now - wait_start
+        self.wait_times.append(wait_time)
         self.checked_out.add(token)
+        logger.info(
+            "[worker_dispatched] controller=%s worker=%s resource=%s sim_t=%.2f real=%s waited=%.2f",
+            self.name, token.name, resource_name, self.env.now,
+            datetime.now().isoformat(timespec="seconds"), wait_time,
+        )
         return token
 
     def _acquire_one(self):
@@ -215,6 +230,11 @@ class WorkerPool:
         token.last_workplace = resource_name
         self.checked_out.discard(token)
         self.completed_jobs += 1
+        logger.info(
+            "[worker_released] controller=%s worker=%s resource=%s sim_t=%.2f real=%s",
+            self.name, token.name, resource_name, self.env.now,
+            datetime.now().isoformat(timespec="seconds"),
+        )
         yield self.store.put(token)
 
     def travel_time_for(self, token: WorkerToken, resource_name: str) -> float:

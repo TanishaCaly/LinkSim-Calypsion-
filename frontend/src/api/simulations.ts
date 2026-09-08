@@ -34,6 +34,9 @@ export const simulationsApi = {
   getRun: (runId: number) =>
     api.get<RunDetail>(`/simulations/runs/${runId}`).then(r => r.data),
 
+  stopRun: (runId: number) =>
+    api.post(`/simulations/${runId}/stop`).then(r => r.data),
+
   listRuns: (scenarioId: number) =>
     api.get<RunDetail[]>(`/simulations/${scenarioId}/runs`).then(r => r.data),
 

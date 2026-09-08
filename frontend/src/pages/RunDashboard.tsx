@@ -7,7 +7,7 @@ import {
 import {
   Play, RefreshCw, AlertTriangle, CheckCircle, Clock, ChevronRight, ChevronLeft,
   TrendingUp, Zap, Activity, Target, AlertCircle, BarChart2, Settings,
-  CalendarDays, Layers, X, Lightbulb, Printer, Expand, Shrink, List, Search,
+  CalendarDays, Layers, X, Lightbulb, Printer, Expand, Shrink, List, Search, Square, Timer,
 } from 'lucide-react'
 import { simulationsApi } from '@/api/simulations'
 import type { SimConfigOverride } from '@/api/simulations'
@@ -200,7 +200,7 @@ function AvgUtilCard({ avgUtil, stats }: { avgUtil: number; stats: StationStat[]
         <CardContent className="pt-5 pb-4 h-full">
           <div className="flex items-start justify-between">
             <div>
-              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Avg Station Util.</p>
+              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Station Util.</p>
               <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{avgUtil.toFixed(1)}%</p>
               <p className="text-xs text-gray-400 mt-1">average across stations</p>
             </div>
@@ -306,6 +306,69 @@ function AvgSetupCard({ stats }: { stats: StationStat[] }) {
                   <span className="text-sm text-gray-800 font-medium flex-1">{s.station_name}</span>
                   <span className="text-sm font-bold text-purple-600 tabular-nums w-24 text-right">{(s.setup_time_ratio ?? 0).toFixed(1)}%</span>
                   <span className="text-sm text-gray-600 tabular-nums w-28 text-right">{(s.total_setup_time ?? 0).toFixed(1)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Cycle time modal card ─────────────────────────────────────────────────────
+
+function AvgCycleTimeCard({ stats }: { stats: StationStat[] }) {
+  const [open, setOpen] = useState(false)
+  const withCt = stats.filter(s => (s.avg_cycle_time ?? 0) > 0)
+  const avgCycleTime = withCt.length
+    ? withCt.reduce((sum, s) => sum + (s.avg_cycle_time ?? 0), 0) / withCt.length
+    : 0
+  const sorted = [...stats].sort((a, b) => (b.avg_cycle_time ?? 0) - (a.avg_cycle_time ?? 0))
+
+  return (
+    <div className="relative h-full">
+      <Card className="border border-gray-200 cursor-pointer hover:border-teal-300 transition-colors h-full" onClick={() => setOpen(true)}>
+        <CardContent className="pt-5 pb-4 h-full">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Avg Cycle Time</p>
+              <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{avgCycleTime.toFixed(1)} min</p>
+              <p className="text-xs text-gray-400 mt-1">arrival to completion, across stations</p>
+            </div>
+            <div className="p-2 rounded-lg bg-teal-50"><Timer className="h-4 w-4 text-teal-500" /></div>
+          </div>
+        </CardContent>
+      </Card>
+      {open && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => setOpen(false)} />
+          <div className="relative bg-white rounded-2xl shadow-2xl w-[640px] max-h-[80vh] flex flex-col overflow-hidden">
+            <div className="flex items-center justify-between px-6 py-5 border-b border-gray-100 bg-gradient-to-r from-teal-50 to-cyan-50">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-teal-100 flex items-center justify-center"><Timer className="h-5 w-5 text-teal-600" /></div>
+                <div>
+                  <h2 className="text-base font-bold text-gray-900">Cycle Time per Station</h2>
+                  <p className="text-xs text-gray-400 mt-0.5">Per-station breakdown · sorted by cycle time · avg time from a job's arrival at the station to its completion there</p>
+                </div>
+              </div>
+              <button onClick={() => setOpen(false)} className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors"><X className="h-4 w-4" /></button>
+            </div>
+            <div className="flex items-center gap-6 px-6 py-3 bg-gray-50 border-b border-gray-100">
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Avg Cycle Time</p><p className="text-sm font-bold text-teal-600">{avgCycleTime.toFixed(1)} min</p></div>
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Stations</p><p className="text-sm font-bold text-gray-800">{stats.length}</p></div>
+            </div>
+            <div className="flex items-center gap-3 px-6 py-2 border-b border-gray-100">
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-6">#</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase flex-1">Station</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-32 text-right">Cycle Time (min)</span>
+            </div>
+            <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-teal-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+              {sorted.map((s, i) => (
+                <div key={s.station_name} className={`flex items-center gap-3 px-6 py-3.5 border-b border-gray-50 last:border-0 ${i === 0 ? 'bg-teal-50/40' : 'hover:bg-gray-50'}`}>
+                  <span className="text-xs font-bold text-gray-300 w-6 tabular-nums shrink-0">{i + 1}</span>
+                  <span className="text-sm text-gray-800 font-medium flex-1">{s.station_name}</span>
+                  <span className="text-sm font-bold text-teal-600 tabular-nums w-32 text-right">{(s.avg_cycle_time ?? 0).toFixed(1)}</span>
                 </div>
               ))}
             </div>
@@ -3146,6 +3209,11 @@ export default function RunDashboard() {
   const [historyWidth, setHistoryWidth] = useState(224) // matches the old fixed w-56
   const isResizingHistory = useRef(false)
   const esRef = useRef<EventSource | null>(null)
+  // The run currently being streamed — the Stop button needs this id to
+  // call stopRun(), and there's no other single place holding "the run
+  // that's actively in progress right now" (activeRun/displayRun can also
+  // point at a past, already-finished run selected from history).
+  const runningRunIdRef = useRef<number | null>(null)
   // Bumped on every Reset click. In-flight async callbacks from a run that
   // was triggered before Reset (the SSE "done" handler, its onerror poll
   // retry, and the mutation's safety-net setTimeout below) capture the
@@ -3184,6 +3252,7 @@ export default function RunDashboard() {
 
   const startStream = (runId: number) => {
     stopStream()
+    runningRunIdRef.current = runId
     const token = resetTokenRef.current
     const url = simulationsApi.streamUrl(runId)
     const es = new EventSource(url)
@@ -3196,6 +3265,7 @@ export default function RunDashboard() {
           if (token !== resetTokenRef.current) return
           setProgress({ pct: evt.pct, msg: evt.msg, simTimeNow: evt.sim_time_now, simTimeTotal: evt.sim_time_total })
         } else if (evt.type === 'done' || evt.type === 'error') {
+          runningRunIdRef.current = null
           if (token !== resetTokenRef.current) { stopStream(); return }
           setProgress(null)
           stopStream()
@@ -3267,6 +3337,12 @@ export default function RunDashboard() {
         })
       }, 1500)
     },
+    onError: (err: Error) => showToast(err.message, 'error'),
+  })
+
+  const stopMutation = useMutation({
+    mutationFn: (runId: number) => simulationsApi.stopRun(runId),
+    onSuccess: () => showToast('Stop requested — finishing current step…'),
     onError: (err: Error) => showToast(err.message, 'error'),
   })
 
@@ -3409,10 +3485,10 @@ export default function RunDashboard() {
         </aside>
 
         {/* Main */}
-        <div className="print-main flex-1 p-6 overflow-auto bg-gradient-to-br from-white via-blue-50/30 to-indigo-50/40">
+        <div className="print-main flex-1 min-w-0 p-6 overflow-auto bg-gradient-to-br from-white via-blue-50/30 to-indigo-50/40">
           {/* Header */}
-          <div className="print:hidden flex items-center justify-between mb-5">
-            <div>
+          <div className="print:hidden flex items-center justify-between flex-wrap gap-3 mb-5 max-w-full">
+            <div className="min-w-0 shrink-0">
               <h1 className="text-xl font-bold text-gray-900">{activeScenario.name}</h1>
               <p className="text-sm text-gray-400 mt-0.5">
                 {/* Show the SELECTED RUN's actual simulated duration (not the
@@ -3423,7 +3499,7 @@ export default function RunDashboard() {
                 {displayRun?.num_replications && displayRun.num_replications > 1 ? ` · ${displayRun.num_replications} reps` : ''}
               </p>
             </div>
-            <div className="flex gap-2">
+            <div className="flex gap-2 flex-wrap justify-end">
               <Button variant="outline" size="sm" onClick={() => setConfigOpen(true)}>
                 <Settings className="h-4 w-4 mr-1.5" />
                 Config
@@ -3458,6 +3534,22 @@ export default function RunDashboard() {
                 <Button variant="outline" size="sm" onClick={() => window.print()}>
                   <Printer className="h-4 w-4 mr-1.5" />
                   Export PDF
+                </Button>
+              )}
+              {(isRunning || displayRun?.status === 'running') && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    const runId = runningRunIdRef.current ?? displayRun?.id
+                    if (runId != null) stopMutation.mutate(runId)
+                  }}
+                  disabled={stopMutation.isPending || (runningRunIdRef.current == null && displayRun?.id == null)}
+                  className="border-red-200 text-red-600 hover:bg-red-50 rounded-lg"
+                  title="Stop this run at its next checkpoint — partial results up to that point are kept"
+                >
+                  <Square className="h-4 w-4 mr-1.5" />
+                  {stopMutation.isPending ? 'Stopping…' : 'Stop'}
                 </Button>
               )}
               <Button size="sm" onClick={() => triggerMutation.mutate()} disabled={isRunning} className="bg-blue-600 hover:bg-blue-700 rounded-lg shadow-sm">
@@ -3553,6 +3645,7 @@ export default function RunDashboard() {
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6 auto-rows-fr">
                 <AvgSetupCard stats={stats} />
                 <AvgBufferBlockedCard stats={stats} />
+                <AvgCycleTimeCard stats={stats} />
               </div>
             </>
           )}
@@ -3578,16 +3671,21 @@ export default function RunDashboard() {
                             <p className="text-xs text-gray-400">How often a new job of each variant enters the simulation</p>
                           </CardHeader>
                           <CardContent>
-                            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
+                            <div className="flex flex-wrap gap-3">
                               {Object.entries(activeScenario.variant_quantities ?? {}).map(([variant, qty]) => {
                                 const interval = activeScenario.variant_intervals?.[variant]
                                 return (
-                                  <div key={variant} className="p-2.5 rounded-lg border border-gray-100 bg-gray-50/60">
-                                    <p className="text-xs font-medium text-gray-700 truncate">{variant}</p>
-                                    <p className="text-xs text-gray-500 mt-0.5">{qty} jobs</p>
-                                    <p className="text-xs font-semibold mt-0.5" style={{ color: interval ? '#7c3aed' : '#9ca3af' }}>
-                                      {interval ? `every ${interval} min` : 'all at once'}
-                                    </p>
+                                  <div key={variant} className="flex items-center gap-3 px-4 py-3 rounded-xl border border-gray-100 bg-gradient-to-br from-violet-50/60 to-purple-50/40 min-w-[180px]">
+                                    <div className="p-2 rounded-lg bg-violet-100 shrink-0">
+                                      <CalendarDays className="h-4 w-4 text-violet-500" />
+                                    </div>
+                                    <div className="min-w-0">
+                                      <p className="text-sm font-semibold text-gray-800 truncate">{variant}</p>
+                                      <p className="text-xs text-gray-400 mt-0.5">{qty} jobs</p>
+                                      <p className="text-xs font-bold mt-0.5" style={{ color: interval ? '#7c3aed' : '#9ca3af' }}>
+                                        {interval ? `every ${interval} min` : 'all at once'}
+                                      </p>
+                                    </div>
                                   </div>
                                 )
                               })}

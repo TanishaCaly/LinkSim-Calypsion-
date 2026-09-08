@@ -99,6 +99,7 @@ class StationStatResponse(BaseModel):
     capacity: int = 1
     top_bottleneck_type: Optional[str]
     top_bottleneck_metric: Optional[str]
+    avg_cycle_time: float = 0.0
 
     model_config = {"from_attributes": True}
 
