@@ -413,9 +413,18 @@ class SimulationUtils:
             first = steps[0].get("resource")
             if first == resource_name:
                 return True
-            # Routing step ("Exit controller type") — resource is a dict of
-            # possible destinations rather than a single name; treat it as a
-            # first station if resource_name is one of its options.
-            if isinstance(first, dict) and resource_name in first.get("options", []):
+            # Scenarios saved while the Exit Controller existed may hold a
+            # {"options": [...]} dict — only its first option is ever run
+            # (see sim_core._resolve_step_resource).
+            if isinstance(first, dict) and (first.get("options") or [None])[0] == resource_name:
                 return True
+            # A flow that starts with a split (steps sharing a "branch"
+            # value): each of its stations is a first station.
+            branch = steps[0].get("branch")
+            if branch is not None:
+                for step in steps[1:]:
+                    if step.get("branch") != branch:
+                        break
+                    if step.get("resource") == resource_name:
+                        return True
         return False

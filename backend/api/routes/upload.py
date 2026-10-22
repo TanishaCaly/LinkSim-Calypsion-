@@ -14,6 +14,32 @@ _SUPPORTED = {".yaml", ".yml", ".xlsx", ".xls", ".csv"}
 _csv = CsvParser()
 
 
+def _default_start(parsed: Dict[str, Any]) -> None:
+    """
+    An imported scenario's Start releases its products batch by batch in
+    Cyclic order (all of the 1st product, then all of the 2nd, ...) — the
+    Start's Exit Controller default, see sim_core._release_order. The file's
+    own Start (a "Source" station) gets it unless it already names one; a
+    file without a Start gets one.
+    """
+    stations = parsed.get("stations")
+    if not isinstance(stations, dict):
+        return
+    starts = [cfg for cfg in stations.values()
+              if isinstance(cfg, dict) and str(cfg.get("Station Type") or "").strip() == "Source"]
+    if starts:
+        for cfg in starts:
+            cfg.setdefault("MU Strategy", "cyclic")
+        return
+    name = "Start"
+    while name in stations:
+        name += " (MU)"
+    stations[name] = {
+        "Station Type": "Source", "capacity": 1, "shifts_per_day": 1, "operator_per_station": 0,
+        "MU Strategy": "cyclic",
+    }
+
+
 def _validate_parsed(parsed: Dict[str, Any]) -> None:
     """
     Only reject a file when NOTHING at all was recognized (every section came
@@ -46,6 +72,7 @@ async def upload_scenario(file: UploadFile = File(...)):
     try:
         parsed = ParserFactory.parse_all(content, filename=file.filename)
         _validate_parsed(parsed)
+        _default_start(parsed)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
 
@@ -68,6 +95,7 @@ async def upload_csv_bundle(
             quantities=await quantities.read(),
         )
         _validate_parsed(parsed)
+        _default_start(parsed)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
 
@@ -90,6 +118,7 @@ async def upload_flat_csv(file: UploadFile = File(...)):
     try:
         parsed = ParserFactory.parse_flat_csv(content)
         _validate_parsed(parsed)
+        _default_start(parsed)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
 

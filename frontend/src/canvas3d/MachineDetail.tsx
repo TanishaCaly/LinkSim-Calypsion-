@@ -75,6 +75,14 @@ export default function MachineDetail({ machine, stationConfig, operators, onClo
               <span className="text-gray-500">Repair Time</span>
               <span className="font-medium text-gray-900">{stationConfig?.['Repair Time'] != null ? `${stationConfig['Repair Time']} min` : '—'}</span>
             </div>
+            <div className="flex justify-between text-sm">
+              <span className="text-gray-500">Failure Policy</span>
+              <span className="font-medium text-gray-900">
+                {stationConfig?.['Failure Policy']
+                  ? String(stationConfig['Failure Policy']).charAt(0).toUpperCase() + String(stationConfig['Failure Policy']).slice(1)
+                  : 'Resume'}
+              </span>
+            </div>
           </CardContent>
         </Card>
 

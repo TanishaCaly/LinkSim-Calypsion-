@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from backend.storage import crud, get_db
+from backend.api.auth import require_auth
 from backend.engine.ai_insights import ai_insights_engine
 from backend.api.schemas import InsightsResponse
 
@@ -12,14 +13,15 @@ router = APIRouter(prefix="/api/insights", tags=["insights"])
 
 
 @router.get("/{run_id}", response_model=InsightsResponse)
-def get_insights(run_id: int, db: Session = Depends(get_db)):
+def get_insights(run_id: int, db: Session = Depends(get_db), user_id: int = Depends(require_auth)):
     run = crud.get_run(db, run_id)
     if not run:
         raise HTTPException(404, "Run not found")
+    scenario = crud.get_scenario(db, run.scenario_id, user_id=user_id)
+    if not scenario:
+        raise HTTPException(404, "Run not found")
     if run.status != "completed":
         raise HTTPException(400, f"Run is not completed yet (status: {run.status})")
-
-    scenario = crud.get_scenario(db, run.scenario_id)
     result = run.result or {}
 
     insights = ai_insights_engine.generate_insights(

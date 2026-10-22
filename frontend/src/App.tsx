@@ -3,6 +3,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import Layout from '@/components/layout/Layout'
 import RequireAuth from '@/components/RequireAuth'
 import Login from '@/pages/Login'
+import Signup from '@/pages/Signup'
+import SubscriptionExpired from '@/pages/SubscriptionExpired'
 import ScenarioManager from '@/pages/ScenarioManager'
 import RunDashboard from '@/pages/RunDashboard'
 import Canvas from '@/pages/Canvas'
@@ -20,6 +22,8 @@ export default function App() {
       <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
         <Routes>
           <Route path="login" element={<Login />} />
+          <Route path="signup" element={<Signup />} />
+          <Route path="subscription-expired" element={<SubscriptionExpired />} />
           <Route
             element={
               <RequireAuth>

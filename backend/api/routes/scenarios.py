@@ -8,6 +8,7 @@ from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from backend.storage import crud, get_db
+from backend.api.auth import require_auth
 from backend.api.schemas import (
     ScenarioCreate, ScenarioUpdate, ScenarioResponse, ScenarioListItem
 )
@@ -16,40 +17,45 @@ router = APIRouter(prefix="/api/scenarios", tags=["scenarios"])
 
 
 @router.post("/", response_model=ScenarioResponse, status_code=status.HTTP_201_CREATED)
-def create_scenario(payload: ScenarioCreate, db: Session = Depends(get_db)):
-    return crud.create_scenario(db, payload.model_dump())
+def create_scenario(payload: ScenarioCreate, db: Session = Depends(get_db), user_id: int = Depends(require_auth)):
+    return crud.create_scenario(db, payload.model_dump(), user_id=user_id)
 
 
 @router.get("/", response_model=List[ScenarioListItem])
-def list_scenarios(skip: int = 0, limit: int = 50, db: Session = Depends(get_db)):
-    return crud.list_scenarios(db, skip=skip, limit=limit)
+def list_scenarios(skip: int = 0, limit: int = 50, db: Session = Depends(get_db), user_id: int = Depends(require_auth)):
+    return crud.list_scenarios(db, skip=skip, limit=limit, user_id=user_id)
+
+
+@router.get("/count")
+def count_scenarios(db: Session = Depends(get_db), user_id: int = Depends(require_auth)):
+    return {"count": crud.count_scenarios(db, user_id=user_id)}
 
 
 @router.get("/{scenario_id}", response_model=ScenarioResponse)
-def get_scenario(scenario_id: int, db: Session = Depends(get_db)):
-    scenario = crud.get_scenario(db, scenario_id)
+def get_scenario(scenario_id: int, db: Session = Depends(get_db), user_id: int = Depends(require_auth)):
+    scenario = crud.get_scenario(db, scenario_id, user_id=user_id)
     if not scenario:
         raise HTTPException(status_code=404, detail="Scenario not found")
     return scenario
 
 
 @router.patch("/{scenario_id}", response_model=ScenarioResponse)
-def update_scenario(scenario_id: int, payload: ScenarioUpdate, db: Session = Depends(get_db)):
-    updated = crud.update_scenario(db, scenario_id, payload.model_dump(exclude_none=True))
+def update_scenario(scenario_id: int, payload: ScenarioUpdate, db: Session = Depends(get_db), user_id: int = Depends(require_auth)):
+    updated = crud.update_scenario(db, scenario_id, payload.model_dump(exclude_none=True), user_id=user_id)
     if not updated:
         raise HTTPException(status_code=404, detail="Scenario not found")
     return updated
 
 
 @router.delete("/{scenario_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_scenario(scenario_id: int, db: Session = Depends(get_db)):
-    if not crud.delete_scenario(db, scenario_id):
+def delete_scenario(scenario_id: int, db: Session = Depends(get_db), user_id: int = Depends(require_auth)):
+    if not crud.delete_scenario(db, scenario_id, user_id=user_id):
         raise HTTPException(status_code=404, detail="Scenario not found")
 
 
 @router.get("/{scenario_id}/file")
-def download_scenario_file(scenario_id: int, db: Session = Depends(get_db)):
-    scenario = crud.get_scenario(db, scenario_id)
+def download_scenario_file(scenario_id: int, db: Session = Depends(get_db), user_id: int = Depends(require_auth)):
+    scenario = crud.get_scenario(db, scenario_id, user_id=user_id)
     if not scenario:
         raise HTTPException(status_code=404, detail="Scenario not found")
     if not scenario.source_file or not scenario.source_filename:
@@ -65,9 +71,9 @@ def download_scenario_file(scenario_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/{scenario_id}/validate")
-def validate_scenario(scenario_id: int, db: Session = Depends(get_db)):
+def validate_scenario(scenario_id: int, db: Session = Depends(get_db), user_id: int = Depends(require_auth)):
     """Check for resource/station name mismatches in processflow data."""
-    scenario = crud.get_scenario(db, scenario_id)
+    scenario = crud.get_scenario(db, scenario_id, user_id=user_id)
     if not scenario:
         raise HTTPException(status_code=404, detail="Scenario not found")
     # Scenario inputs are stored as separate columns, not a single

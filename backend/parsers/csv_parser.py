@@ -49,6 +49,28 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _safe_bool(value: Any) -> Optional[bool]:
+    """Interpret a cell as True/False, or None if it's blank/unrecognised —
+    None lets a caller distinguish "column absent/blank" from "explicitly
+    set", unlike _safe_int/_safe_float's single default value."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if not text or text == "nan":
+        return None
+    if text in ("true", "yes", "y", "1"):
+        return True
+    if text in ("false", "no", "n", "0"):
+        return False
+    return None
+
+
 def _normalize_col(name: str) -> str:
     """Lowercase and collapse spaces/hyphens/underscores so 'Setup-time',
     'Setup_time', and 'Setup Time' all compare equal."""
@@ -125,6 +147,19 @@ def _station_row_from(row: Dict[str, Any]) -> Dict[str, Any]:
         "operator_per_station": _safe_int(_find_col(row, "operator_per_station", "operators"), 1),
         "Failure rate": _safe_float(_find_col(row, "Failure rate", "failure_rate"), 0),
         "Repair Time": _safe_float(_find_col(row, "Repair Time", "repair_time"), 10),
+        # MTBF (minutes, uncapped) — the primary reliability input when
+        # present (see backend/engine/sim_core.py's _init_resources and
+        # machine.py's SubMachine). Written by ScenarioManager.tsx's
+        # Availability%+MTTR fields as a plain float with no 0-1 ceiling,
+        # unlike the legacy "Failure rate" daily-probability field above
+        # (which can only express MTBF >= 1440 min). Left as None/absent
+        # when the column is missing, so sim_core.py falls back to the
+        # legacy Failure rate-derived calculation — unchanged behaviour
+        # for every file that doesn't have this column.
+        "MTBF": (
+            _safe_float(_find_col(row, "MTBF", "mtbf"))
+            if _find_col(row, "MTBF", "mtbf") is not None else None
+        ),
         "Setup time": _safe_float(_find_col(row, "Setup time", "setup_time"), 0),
         # Product-dependent setup — "variant1:15, variant2:25" — the time to
         # prepare this station for an incoming variant, regardless of what
@@ -143,11 +178,28 @@ def _station_row_from(row: Dict[str, Any]) -> Dict[str, Any]:
         "Batch Size": _safe_int(_find_col(row, "Batch Size", "batch_size"), 0),
         "Batch Setup Time": _safe_float(_find_col(row, "Batch Setup Time", "batch_setup_time"), 0),
         "Buffer Capacity": _safe_int(_find_col(row, "Buffer Capacity", "buffer_capacity"), 0),
+        # An explicit "Buffer Unlimited" column always wins when present
+        # (TRUE/FALSE, yes/no, 1/0 all accepted). Absent that column
+        # entirely, fall back to inference: a sheet that never mentions
+        # Buffer Capacity gets today's documented unlimited default; a sheet
+        # with an explicit Buffer Capacity value uses that value literally
+        # (0 now means real zero room, not unlimited — see the Buffer
+        # Capacity gate in sim_core.py).
+        "Buffer Unlimited": (
+            _safe_bool(_find_col(row, "Buffer Unlimited", "buffer_unlimited"))
+            if _safe_bool(_find_col(row, "Buffer Unlimited", "buffer_unlimited")) is not None
+            else _find_col(row, "Buffer Capacity", "buffer_capacity") is None
+        ),
         "Buffer Discipline": _clean_str(_find_col(row, "Buffer Discipline", "buffer_discipline"), "FIFO"),
-        "Buffer Width": _safe_int(_find_col(row, "Buffer Width", "buffer_width", "BufferWidth"), 0),
-        "Buffer Depth": _safe_int(_find_col(row, "Buffer Depth", "buffer_depth"), 0),
-        "Buffer Height": _safe_int(_find_col(row, "Buffer Height", "buffer_height"), 0),
         "PM Schedule": _clean_str(_find_col(row, "PM Schedule", "pm_schedule"), "Monthly"),
+        # What happens to a part already in progress when this station's
+        # machine fails mid-operation: "resume" (continue the remaining
+        # time after repair), "restart" (redo the full operation), or
+        # "scrap" (the part is discarded) — see backend/engine/machine.py's
+        # FailurePolicy enum. Blank/absent column defaults to "resume",
+        # matching the engine's own default (unchanged existing behaviour
+        # for every file that doesn't have this column).
+        "Failure Policy": _clean_str(_find_col(row, "Failure Policy", "failure_policy"), "resume"),
         "Material Shortage Probability (%)": _safe_float(
             _find_col(row, "Material Shortage Probability (%)", "material shortage"), 0),
         "Rework Probability (%)": _safe_float(_find_col(row, "Rework Probability (%)", "rework"), 10),
@@ -244,21 +296,10 @@ class CsvParser:
     def parse_processflow(self, source: Union[str, bytes]) -> Dict[str, List[Dict]]:
         """
         Expected columns: Variant, Operation, Resource, Duration
-        Optional columns: Rule, Condition/Weight — express a branching step
-        ("Exit controller type") without any JSON/code in a cell: add a
-        SECOND row for the same (Variant, Operation) naming an alternate
-        Resource, with Rule set to one of round_robin/percentage/
-        condition/shortest_queue and Condition/Weight holding the
-        mode-specific value (a weight number, or a literal value to match
-        for "condition"). A (Variant, Operation) that appears only once
-        keeps today's plain-string resource — nothing changes unless a
-        company's sheet intentionally adds a branching row.
+        A (Variant, Operation) repeated on several rows becomes one step using
+        the first row's Resource and Duration.
 
         Returns: {variant: [{operation, resource, duration}, ...]}
-        (resource is a plain string for a single-destination step, or a
-        routing dict {mode, options, weights?, rules?, default?} for a
-        branching step — see backend/engine/sim_core.py's
-        _resolve_step_resource for how the engine consumes this shape.)
         Variant names are normalised to lowercase for consistent matching.
         """
         records = self.parse(source)
@@ -273,8 +314,6 @@ class CsvParser:
             operation = _clean_str(row.get("Operation", row.get("operation")))
             resource = _clean_str(row.get("Resource", row.get("resource")))
             duration = _safe_float(_find_col(row, "Duration", "duration", "process time", "cycle time"), 0)
-            rule = _clean_str(_find_col(row, "Rule", "rule")).strip().lower()
-            weight_raw = _find_col(row, "Condition/Weight", "condition_weight", "weight", "condition")
 
             groups.setdefault(variant, {})
             order.setdefault(variant, [])
@@ -282,35 +321,14 @@ class CsvParser:
             if key not in groups[variant]:
                 groups[variant][key] = []
                 order[variant].append(key)
-            groups[variant][key].append({
-                "resource": resource, "duration": duration, "rule": rule, "weight_raw": weight_raw,
-            })
+            groups[variant][key].append({"resource": resource, "duration": duration})
 
         flow: Dict[str, List[Dict]] = {}
         for variant, op_order in order.items():
             steps: List[Dict[str, Any]] = []
             for operation in op_order:
-                rows = groups[variant][operation]
-                duration = rows[0]["duration"]
-                if len(rows) == 1 and not rows[0]["rule"]:
-                    # Single destination — unchanged, today's plain-string behaviour.
-                    steps.append({"operation": operation, "resource": rows[0]["resource"], "duration": duration})
-                    continue
-
-                # Branching step: merge the group's rows into one routing dict.
-                mode = next((r["rule"] for r in rows if r["rule"]), "round_robin")
-                options = [r["resource"] for r in rows if r["resource"]]
-                step: Dict[str, Any] = {"operation": operation, "duration": duration,
-                                        "resource": {"mode": mode, "options": options}}
-                if mode == "percentage":
-                    step["resource"]["weights"] = [_safe_float(r["weight_raw"], 1) for r in rows]
-                elif mode == "condition":
-                    step["resource"]["rules"] = [
-                        {"if": f"variant_type=='{_clean_str(r['weight_raw'])}'", "resource": r["resource"]}
-                        for r in rows if _clean_str(r["weight_raw"])
-                    ]
-                    step["resource"]["default"] = options[0] if options else None
-                steps.append(step)
+                first = groups[variant][operation][0]
+                steps.append({"operation": operation, "resource": first["resource"], "duration": first["duration"]})
             flow[variant] = steps
         return flow
 

@@ -89,17 +89,25 @@ class StationStatResponse(BaseModel):
     buffer_blocked_time: float = 0.0
     buffer_capacity: int = 0
     buffer_discipline: str = "FIFO"
+    rack_lane_count: Optional[int] = None
+    rack_occupied: Optional[int] = None
     completed_jobs: int
     throughput: float = 0.0
     busy_time: float
     avg_block_time: float
     failure_breakdowns: int
+    failure_counts_per_machine: Optional[List[int]] = None
     pm_breakdowns: int
     operator_per_station: int = 1
     capacity: int = 1
+    conveyor_length: Optional[float] = None
+    conveyor_speed: Optional[float] = None
+    transport_time: Optional[float] = None
+    sensor_passed: Optional[int] = None
     top_bottleneck_type: Optional[str]
     top_bottleneck_metric: Optional[str]
     avg_cycle_time: float = 0.0
+    max_cycle_time: float = 0.0
 
     model_config = {"from_attributes": True}
 

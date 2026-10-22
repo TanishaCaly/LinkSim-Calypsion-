@@ -17,6 +17,12 @@ export interface SimConfigOverride {
   SHIFT_1_NAME?: string
   SHIFT_2_NAME?: string
   SHIFT_3_NAME?: string
+  // PDF section 13's reliability panel: undefined/omitted = "Auto" (every
+  // run's failure/repair timing is genuinely random, today's existing
+  // behavior). An explicit integer makes a run's random draws (failure
+  // timing, repair timing, etc. — see backend/engine/sim_core.py's run())
+  // reproducible across repeated runs of the same scenario.
+  RANDOM_SEED?: number
   [key: string]: unknown
 }
 

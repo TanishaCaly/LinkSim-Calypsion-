@@ -8,20 +8,61 @@ export interface StationConfig {
   shifts_per_day: number | number[]
   operator_per_station: number
   'Station Type'?: string
-  // Conveyor only — minutes to traverse the belt. The engine uses this instead
-  // of the process-flow step's duration for Conveyor stations.
+  // A machine of a parallel group: the group's name (e.g. "Station 2" for
+  // Station 2 #1, #2, #3). The group's machines share one waiting line.
+  'Parallel Group'?: string
+  // Start (Source) only — its MU table (see MuRow). Product, Number and
+  // Interval are the scenario's own variants / quantities / intervals; only
+  // Name is kept here alone.
+  'MU Table'?: MuRow[]
+  // Start (Source) only — its Exit Controller (see StationNodeData.muStrategy).
+  'MU Strategy'?: 'cyclic' | 'random' | 'successor' | 'percentage'
+  'MU Priorities'?: Record<string, number>
+  'MU Percentages'?: Record<string, number>
+  // Conveyor only — minutes to traverse the belt. Older scenarios only; the
+  // engine uses it when there is no Conveyor Speed.
   'Transport Time'?: number
+  // Conveyor only — belt speed (m/min). Transport time = Length / Speed.
+  'Conveyor Speed'?: number
+  // Exit Controller (station with 2+ next stations) — UI only, not read by
+  // the engine yet.
+  'Exit Strategy'?: 'cyclic' | 'random' | 'successor' | 'percentage'
+  'Exit Percentages'?: Record<string, number>
+  'Exit Priorities'?: Record<string, number>
+  // Conveyor only. Length (with Speed) sets the transport time and Capacity
+  // the jobs on the belt at once; Width/Height are display only.
+  'Conveyor Length'?: number
+  'Conveyor Width'?: number
+  'Conveyor Height'?: number
+  'Conveyor Capacity'?: number
+  // Conveyor sensor (record only) — m from the belt's start ('Front') or
+  // end ('Rear'). Absent = no sensor.
+  'Conveyor Sensor Length'?: number
+  'Conveyor Sensor Position'?: 'Front' | 'Rear'
   'Assembly Count'?: number
   'Assembly Inputs'?: Record<string, number>
   'Failure rate': number
   'Repair Time': number
+  // What happens to a part already in progress when this station's machine
+  // fails mid-operation (backend/engine/machine.py's FailurePolicy enum):
+  // 'resume' | 'restart' | 'scrap'. Absent means 'resume', same as the
+  // engine's own default.
+  'Failure Policy'?: string
   'Setup time': number
   'Buffer Capacity': number
+  // When true, Buffer Capacity's number is ignored and the queue is
+  // unlimited — lets 'Buffer Capacity': 0 mean a literal zero-room cap
+  // (strict lockstep) instead of overloading 0 as "unlimited", matching how
+  // Failure rate/Repair Time already treat 0 as a plain literal value.
+  'Buffer Unlimited'?: boolean
   'Buffer Discipline': string
-  'Buffer Width': number
-  'Buffer Depth': number
-  'Buffer Height': number
-  'Buffer Count'?: number
+  // Canvas Build-mode only — never set by an Excel/CSV import. '3D' swaps
+  // the single Buffer Capacity number for X/Y/Z lane dimensions below,
+  // each defaulting to 1 until the user edits them on the canvas.
+  'Buffer Config Mode'?: '2D' | '3D'
+  'Buffer X'?: number
+  'Buffer Y'?: number
+  'Buffer Z'?: number
   'PM Schedule': string
   'Material Shortage Probability (%)': number
   'Rework Probability (%)': number
@@ -50,18 +91,17 @@ export interface StationConfig {
   [key: string]: unknown
 }
 
-export interface RoutingConfig {
-  mode: 'round_robin' | 'percentage' | 'condition' | 'shortest_queue'
-  options: string[]
-  weights?: number[]
-  rules?: { if: string; resource: string }[]
-  default?: string
-}
-
 export interface ProcessStep {
   operation: string
-  resource: string | RoutingConfig
+  // A plain station name. Scenarios saved while the Exit Controller existed
+  // may still hold a {mode, options, ...} dict here — only its first option
+  // is used (see sim_core.py's _resolve_step_resource).
+  resource: string | { options?: string[] }
   duration: number
+  // Consecutive steps with the same branch number are one split: a job
+  // visits only ONE of them, picked by the previous station's Exit
+  // Controller. Absent on a plain step.
+  branch?: number
 }
 
 export interface OperatorConfig {
@@ -152,17 +192,30 @@ export interface StationStat {
   buffer_blocked_time: number
   buffer_capacity: number
   buffer_discipline: string
+  // Only set for a Buffer node in 3D mode (see backend's _init_rack_buffers)
+  // — null/absent for every 2D/scalar station, meaning buffer_capacity
+  // above is the real, active number for that one instead.
+  rack_lane_count?: number | null
+  rack_occupied?: number | null
   completed_jobs: number
   throughput: number
   busy_time: number
   avg_block_time: number
   failure_breakdowns: number
+  failure_counts_per_machine?: number[]
   pm_breakdowns: number
   operator_per_station: number
   capacity: number
+  // Conveyor only (m, m/min, min) — null for every other station.
+  conveyor_length?: number | null
+  conveyor_speed?: number | null
+  transport_time?: number | null
+  // Jobs that passed the conveyor's sensor — null when it has no sensor.
+  sensor_passed?: number | null
   top_bottleneck_type: string | null
   top_bottleneck_metric: string | null
   avg_cycle_time: number
+  max_cycle_time: number
 }
 
 // Per Worker Controller, from worker_pool.py's WorkerPool.get_stats() —
@@ -242,8 +295,38 @@ export interface UploadResponse {
 
 // ─── Canvas node types ───────────────────────────────────────────────────────
 
+// One row of a Start's MU table: product (MU), how many (Number), display
+// name, minutes between its jobs (Interval; empty = all at once), colour.
+export interface MuRow {
+  mu: string
+  number: number
+  name: string
+  interval?: number | null
+  // The product's colour (its jobs on the Canvas); none = a default colour.
+  color?: string
+}
+
 export interface StationNodeData {
+  // The station name this box's settings were saved under — set when a
+  // saved scenario is loaded onto the Canvas, so Save still finds them
+  // after the box is renamed. Absent on a box added on the Canvas.
+  savedName?: string
   label: string
+  // Set on every machine of a parallel group (Station 2 #1, #2, ...): the
+  // group's name. Each machine is then a station of its own, saved under
+  // its box's name — so it can be renamed and still stay in the group.
+  parallelGroup?: string
+  // A box pasted on the Canvas: the station it was copied from, whose saved
+  // settings it starts with.
+  copiedFrom?: string
+  // Start (Source) only — the MU table: one row per product (variant) the
+  // Start creates (see MuTableDialog).
+  // Start (Source) only — its Exit Controller: the order the products are
+  // released in, each product as one whole batch. Percentage is UI only.
+  muStrategy?: 'cyclic' | 'random' | 'successor' | 'percentage'
+  muPriorities?: Record<string, number>
+  muPercentages?: Record<string, number>
+  muTable?: MuRow[]
   // Set once from the palette item used to create this node (Station/Assembly/
   // Inspection/Packaging). Kept separate from `label` so renaming a station
   // doesn't lose its type-specific fields (e.g. Assembly Count).
@@ -257,21 +340,42 @@ export interface StationNodeData {
   // scenario's existing 'Setup time' station field.
   setupTime?: number
   processTime?: number
+  // Minutes to fix this station after a breakdown (MTTR). Saves to the
+  // scenario's existing 'Repair Time' station field — previously only
+  // editable outside Canvas (Excel import or the ScenarioManager grid),
+  // which meant a Canvas-built scenario always saved a hardcoded 10
+  // regardless of what the user actually wanted.
+  repairTime?: number
+  // What happens to a part already in progress when this station's machine
+  // fails mid-operation: 'resume' (continue the remaining time after
+  // repair — the default), 'restart' (redo the full operation from
+  // scratch), or 'scrap' (the part is discarded). Saves to the scenario's
+  // 'Failure Policy' station field (backend/engine/machine.py's
+  // FailurePolicy enum); unset defaults to 'resume' there too.
+  failurePolicy?: string
   // Which of the day's shifts (1, 2, 3) this station runs on — any
   // combination, not just a contiguous count (e.g. [2, 3] to skip shift 1).
   shiftsPerDay?: number[]
   assemblyCount?: number
-  // Minutes for a unit to travel the length of a Conveyor. Used instead of
-  // cycleTime for Conveyor stations, since transport is wall-clock travel
-  // time rather than work that operators share.
-  transportTime?: number
+  // Conveyor belt speed (m/min). Its transport time is conveyorLength /
+  // conveyorSpeed, used instead of cycleTime for Conveyor stations.
+  conveyorSpeed?: number
+  // Conveyor dimensions (m) and capacity (units). Width/Height are display only.
+  conveyorLength?: number
+  conveyorWidth?: number
+  conveyorHeight?: number
+  conveyorCapacity?: number
+  // Conveyor sensor — m from the belt's start ('front') or end ('rear').
+  // Saved as 'Conveyor Sensor Length' / 'Conveyor Sensor Position'.
+  conveyorSensor?: { length: number; position: 'front' | 'rear' }
+  // Exit Controller — how finished jobs are split across 2+ next stations.
+  // UI/storage only for now; the simulation engine doesn't read it yet.
+  exitStrategy?: 'cyclic' | 'random' | 'successor' | 'percentage'
+  exitPercentages?: Record<string, number>  // keyed by next station's base name
+  exitPriorities?: Record<string, number>   // Successor mode: next box label -> priority (1 = first)
   // "Assembly type/table" — quantity of each upstream station's output needed
   // to produce one assembled unit here, keyed by the upstream station's base name.
   assemblyInputs?: Record<string, number>
-  routingMode?: 'round_robin' | 'percentage' | 'condition' | 'shortest_queue'
-  routingWeights?: Record<string, number>
-  routingRules?: { variantType: string; resource: string }[]
-  routingDefault?: string
   // Worker only — which named operator (a key in the scenario's
   // operators_data) this node represents. Contributes that operator's
   // Availability into the Worker Controller's pool it's wired to (Canvas.tsx's

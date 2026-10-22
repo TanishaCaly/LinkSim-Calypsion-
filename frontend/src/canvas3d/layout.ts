@@ -123,8 +123,16 @@ export function buildScene3D(
 
       seen.set(step.resource, { col: stepIdx, machines: colMachines })
 
-      const opCount = station.operator_per_station || 1
-      const shiftOp = station.shift1 || 'Op?'
+      // operator_per_station is an explicit count (0 is a real, meaningful
+      // value — a Buffer or machine-only station with no operator — not a
+      // missing value), so this must NOT fall back to 1 the way `|| 1`
+      // would. A Buffer in particular should draw no operator figure at all.
+      const opCount = station.operator_per_station ?? 1
+      // shift1 is a per-station SHIFT-TIME override, not an operator name —
+      // it happens to go unset for most stations, which previously showed
+      // the literal placeholder text "Op?" in the 3D view. Fall back to a
+      // generic label instead of a half-finished-looking placeholder.
+      const shiftOp = station.shift1 || 'Operator'
       const opConfig = operatorsData[shiftOp]
 
       for (let mi = 0; mi < colMachines.length; mi++) {

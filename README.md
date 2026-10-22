@@ -100,12 +100,13 @@ Parsing is robust to messy real-world spreadsheets: auto-detected header rows, f
 | `Capacity` | Parallel machine slots | 1 |
 | `shifts_per_day` | 0/3 = 24/7, 1/2 = Mon-Fri only | 1 |
 | `operator_per_station` | Operators per parallel slot | 1 |
-| `Failure rate` | Daily breakdown probability | 0 |
+| `Failure rate` | Daily breakdown probability (legacy — only used when `MTBF` is blank; can only express MTBF >= 1440 min) | 0 |
+| `MTBF` | Mean Time Between Failures, in minutes — primary reliability input, no ceiling. Edited via Availability%+MTTR in the Process Flow tab | blank (falls back to `Failure rate`) |
 | `Repair Time` | MTTR (minutes) | 10 |
 | `Setup time` | Changeover time — only charged when the station switches to a **different** product than it just ran | 0 |
-| `Buffer Capacity` | Max jobs waiting for this station (scalar) | Unlimited |
+| `Buffer Capacity` | Max jobs waiting for this station (scalar). `0` is a literal zero-room cap (strict lockstep with the upstream station), not "unlimited" — check `Buffer Unlimited` for that | 0 (zero room) |
+| `Buffer Unlimited` | When set, ignores `Buffer Capacity`'s number entirely and allows unlimited queue. Accepts TRUE/FALSE, yes/no, 1/0 | If this column is absent: unlimited (true) when no `Buffer Capacity` column is present either, otherwise false |
 | `Buffer Discipline` | `FIFO` or `LIFO` — which waiting job goes next | FIFO |
-| `Buffer Width` / `Buffer Depth` / `Buffer Height` | Physical rack model — lanes × depth × levels. A job stuck behind another in its own lane can't be picked even if other lanes have room. Takes precedence over the plain `Buffer Capacity` when all three are set | Not used |
 | `PM Schedule` | Monthly / Bi-Weekly / Weekly | Monthly |
 
 ### Variant Quantities sheet/CSV

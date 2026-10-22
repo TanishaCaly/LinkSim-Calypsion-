@@ -55,7 +55,7 @@ function utilTextColor(u: number) {
 
 // ─── Completed Jobs modal card ───────────────────────────────────────────────
 
-function CompletedJobsCard({ completed, inProgress, stats }: { completed: number; inProgress: number; stats: StationStat[] }) {
+function CompletedJobsCard({ completed, inProgress, scrapped, stats }: { completed: number; inProgress: number; scrapped: number; stats: StationStat[] }) {
   const [open, setOpen] = useState(false)
   const sorted = [...stats].sort((a, b) => b.completed_jobs - a.completed_jobs)
   const maxJobs = sorted[0]?.completed_jobs || 1
@@ -68,7 +68,18 @@ function CompletedJobsCard({ completed, inProgress, stats }: { completed: number
             <div>
               <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Completed Jobs</p>
               <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{completed}</p>
-              <p className="text-xs text-gray-400 mt-1">{inProgress > 0 ? `${inProgress} still in progress` : 'All jobs finished'}</p>
+              {/* "In progress" here means "not yet finished the whole route" —
+                  it includes jobs still mid-station AND jobs that haven't
+                  even started yet, not just jobs actively being worked on
+                  right now. "Still to finish" says that honestly; "still in
+                  progress" reads as "currently being worked on", which a
+                  per-station Completed count (further along than this
+                  run-wide figure at any one station) can look contradictory
+                  against. */}
+              <p className="text-xs text-gray-400 mt-1">
+                {inProgress > 0 ? `${inProgress} still to finish` : scrapped > 0 ? 'None still in progress' : 'All jobs finished'}
+                {scrapped > 0 && ` · ${scrapped} scrapped`}
+              </p>
             </div>
             <div className="p-2 rounded-lg bg-blue-50"><CheckCircle className="h-4 w-4 text-blue-500" /></div>
           </div>
@@ -90,7 +101,6 @@ function CompletedJobsCard({ completed, inProgress, stats }: { completed: number
             </div>
             <div className="flex items-center gap-6 px-6 py-3 bg-gray-50 border-b border-gray-100">
               <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Total Completed</p><p className="text-sm font-bold text-blue-600">{completed}</p></div>
-              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Jobs In Progress</p><p className="text-sm font-bold text-gray-800">{inProgress}</p></div>
               <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Top Station</p><p className="text-sm font-bold text-gray-800">{sorted[0]?.station_name ?? '—'}</p></div>
             </div>
             <div className="flex items-center gap-3 px-6 py-2 border-b border-gray-100">
@@ -256,10 +266,8 @@ function AvgUtilCard({ avgUtil, stats }: { avgUtil: number; stats: StationStat[]
 
 function AvgSetupCard({ stats }: { stats: StationStat[] }) {
   const [open, setOpen] = useState(false)
-  const avgSetup = stats.length
-    ? stats.reduce((sum, s) => sum + (s.setup_time_ratio ?? 0), 0) / stats.length
-    : 0
-  const sorted = [...stats].sort((a, b) => (b.setup_time_ratio ?? 0) - (a.setup_time_ratio ?? 0))
+  const totalSetup = stats.reduce((sum, s) => sum + (s.total_setup_time ?? 0), 0)
+  const sorted = [...stats].sort((a, b) => (b.total_setup_time ?? 0) - (a.total_setup_time ?? 0))
 
   return (
     <div className="relative h-full">
@@ -267,9 +275,9 @@ function AvgSetupCard({ stats }: { stats: StationStat[] }) {
         <CardContent className="pt-5 pb-4 h-full">
           <div className="flex items-start justify-between">
             <div>
-              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Avg Setup Time</p>
-              <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{avgSetup.toFixed(1)}%</p>
-              <p className="text-xs text-gray-400 mt-1">of occupied time, across stations</p>
+              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Setup Time</p>
+              <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{totalSetup.toFixed(1)} min</p>
+              <p className="text-xs text-gray-400 mt-1">total across stations</p>
             </div>
             <div className="p-2 rounded-lg bg-purple-50"><Settings className="h-4 w-4 text-purple-500" /></div>
           </div>
@@ -284,19 +292,18 @@ function AvgSetupCard({ stats }: { stats: StationStat[] }) {
                 <div className="w-9 h-9 rounded-xl bg-purple-100 flex items-center justify-center"><Settings className="h-5 w-5 text-purple-600" /></div>
                 <div>
                   <h2 className="text-base font-bold text-gray-900">Setup / Changeover Time</h2>
-                  <p className="text-xs text-gray-400 mt-0.5">Per-station breakdown · sorted by setup time %</p>
+                  <p className="text-xs text-gray-400 mt-0.5">Per-station breakdown · sorted by setup time</p>
                 </div>
               </div>
               <button onClick={() => setOpen(false)} className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors"><X className="h-4 w-4" /></button>
             </div>
             <div className="flex items-center gap-6 px-6 py-3 bg-gray-50 border-b border-gray-100">
-              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Avg Setup</p><p className="text-sm font-bold text-purple-600">{avgSetup.toFixed(1)}%</p></div>
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Total Setup</p><p className="text-sm font-bold text-purple-600">{totalSetup.toFixed(1)} min</p></div>
               <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Stations</p><p className="text-sm font-bold text-gray-800">{stats.length}</p></div>
             </div>
             <div className="flex items-center gap-3 px-6 py-2 border-b border-gray-100">
               <span className="text-[10px] font-bold text-gray-400 uppercase w-6">#</span>
               <span className="text-[10px] font-bold text-gray-400 uppercase flex-1">Station</span>
-              <span className="text-[10px] font-bold text-gray-400 uppercase w-24 text-right">Setup%</span>
               <span className="text-[10px] font-bold text-gray-400 uppercase w-28 text-right">Setup Time (min)</span>
             </div>
             <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-purple-200 [&::-webkit-scrollbar-thumb]:rounded-full">
@@ -304,8 +311,7 @@ function AvgSetupCard({ stats }: { stats: StationStat[] }) {
                 <div key={s.station_name} className={`flex items-center gap-3 px-6 py-3.5 border-b border-gray-50 last:border-0 ${i === 0 ? 'bg-purple-50/40' : 'hover:bg-gray-50'}`}>
                   <span className="text-xs font-bold text-gray-300 w-6 tabular-nums shrink-0">{i + 1}</span>
                   <span className="text-sm text-gray-800 font-medium flex-1">{s.station_name}</span>
-                  <span className="text-sm font-bold text-purple-600 tabular-nums w-24 text-right">{(s.setup_time_ratio ?? 0).toFixed(1)}%</span>
-                  <span className="text-sm text-gray-600 tabular-nums w-28 text-right">{(s.total_setup_time ?? 0).toFixed(1)}</span>
+                  <span className="text-sm font-bold text-purple-600 tabular-nums w-28 text-right">{(s.total_setup_time ?? 0).toFixed(1)}</span>
                 </div>
               ))}
             </div>
@@ -320,11 +326,11 @@ function AvgSetupCard({ stats }: { stats: StationStat[] }) {
 
 function AvgCycleTimeCard({ stats }: { stats: StationStat[] }) {
   const [open, setOpen] = useState(false)
-  const withCt = stats.filter(s => (s.avg_cycle_time ?? 0) > 0)
-  const avgCycleTime = withCt.length
-    ? withCt.reduce((sum, s) => sum + (s.avg_cycle_time ?? 0), 0) / withCt.length
+  const withCt = stats.filter(s => (s.max_cycle_time ?? 0) > 0)
+  const worstCycleTime = withCt.length
+    ? Math.max(...withCt.map(s => s.max_cycle_time ?? 0))
     : 0
-  const sorted = [...stats].sort((a, b) => (b.avg_cycle_time ?? 0) - (a.avg_cycle_time ?? 0))
+  const sorted = [...stats].sort((a, b) => (b.max_cycle_time ?? 0) - (a.max_cycle_time ?? 0))
 
   return (
     <div className="relative h-full">
@@ -332,9 +338,9 @@ function AvgCycleTimeCard({ stats }: { stats: StationStat[] }) {
         <CardContent className="pt-5 pb-4 h-full">
           <div className="flex items-start justify-between">
             <div>
-              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Avg Cycle Time</p>
-              <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{avgCycleTime.toFixed(1)} min</p>
-              <p className="text-xs text-gray-400 mt-1">arrival to completion, across stations</p>
+              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Max Cycle Time</p>
+              <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{worstCycleTime.toFixed(1)} min</p>
+              <p className="text-xs text-gray-400 mt-1">worst-case, arrival to completion, across stations</p>
             </div>
             <div className="p-2 rounded-lg bg-teal-50"><Timer className="h-4 w-4 text-teal-500" /></div>
           </div>
@@ -349,13 +355,13 @@ function AvgCycleTimeCard({ stats }: { stats: StationStat[] }) {
                 <div className="w-9 h-9 rounded-xl bg-teal-100 flex items-center justify-center"><Timer className="h-5 w-5 text-teal-600" /></div>
                 <div>
                   <h2 className="text-base font-bold text-gray-900">Cycle Time per Station</h2>
-                  <p className="text-xs text-gray-400 mt-0.5">Per-station breakdown · sorted by cycle time · avg time from a job's arrival at the station to its completion there</p>
+                  <p className="text-xs text-gray-400 mt-0.5">Per-station breakdown · sorted by cycle time · worst-case (max) time from a job's arrival at the station to its completion there</p>
                 </div>
               </div>
               <button onClick={() => setOpen(false)} className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors"><X className="h-4 w-4" /></button>
             </div>
             <div className="flex items-center gap-6 px-6 py-3 bg-gray-50 border-b border-gray-100">
-              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Avg Cycle Time</p><p className="text-sm font-bold text-teal-600">{avgCycleTime.toFixed(1)} min</p></div>
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Max Cycle Time</p><p className="text-sm font-bold text-teal-600">{worstCycleTime.toFixed(1)} min</p></div>
               <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Stations</p><p className="text-sm font-bold text-gray-800">{stats.length}</p></div>
             </div>
             <div className="flex items-center gap-3 px-6 py-2 border-b border-gray-100">
@@ -368,7 +374,7 @@ function AvgCycleTimeCard({ stats }: { stats: StationStat[] }) {
                 <div key={s.station_name} className={`flex items-center gap-3 px-6 py-3.5 border-b border-gray-50 last:border-0 ${i === 0 ? 'bg-teal-50/40' : 'hover:bg-gray-50'}`}>
                   <span className="text-xs font-bold text-gray-300 w-6 tabular-nums shrink-0">{i + 1}</span>
                   <span className="text-sm text-gray-800 font-medium flex-1">{s.station_name}</span>
-                  <span className="text-sm font-bold text-teal-600 tabular-nums w-32 text-right">{(s.avg_cycle_time ?? 0).toFixed(1)}</span>
+                  <span className="text-sm font-bold text-teal-600 tabular-nums w-32 text-right">{(s.max_cycle_time ?? 0).toFixed(1)}</span>
                 </div>
               ))}
             </div>
@@ -895,6 +901,273 @@ function TotalFailuresCard({ total, rework, stats }: { total: number; rework: nu
                   <span className="text-sm text-gray-600 tabular-nums w-16 text-right">{s.pm_breakdowns}</span>
                   <span className="text-sm text-gray-600 tabular-nums w-16 text-right">{s.station_utilization.toFixed(1)}%</span>
                   <span className="text-sm text-gray-600 tabular-nums w-20 text-right">{s.rework_percentage.toFixed(1)}%</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── MTBF / Availability shared helpers ───────────────────────────────────────
+// A station with capacity>1 has several independent parallel machines (see
+// MachineGroup in backend/engine/machine.py) — one failing only takes out
+// that one machine, not the whole station. failure_breakdowns is the POOLED
+// total across all of them, so simTime/failure_breakdowns (the old formula)
+// treats every failure as if it stopped the entire station, which is only
+// true at capacity=1 and understates MTBF/Availability as capacity grows.
+// failure_counts_per_machine (when present) gives each sub-machine's own
+// count, so MTBF/Availability can be computed per machine first, then
+// averaged — old runs without this field (or capacity=1, where the two
+// approaches are mathematically identical) fall back to the pooled formula.
+
+/** Per-sub-machine MTBF values (minutes), one per machine that had >=1 failure. */
+function perMachineMtbf(s: StationStat, simTime: number): number[] {
+  const perMachine = s.failure_counts_per_machine
+  if (perMachine && perMachine.length > 0) {
+    return perMachine.filter(c => c > 0).map(c => simTime / c)
+  }
+  // Fallback: old runs without per-sub-machine data, or capacity=1 (the two
+  // approaches are identical in that case since there's only one machine).
+  return s.failure_breakdowns > 0 ? [simTime / s.failure_breakdowns] : []
+}
+
+/** Station-level MTBF — average of that station's own per-machine MTBF values. */
+function stationMtbf(s: StationStat, simTime: number): number | null {
+  const values = perMachineMtbf(s, simTime)
+  return values.length > 0 ? values.reduce((sum, v) => sum + v, 0) / values.length : null
+}
+
+/** Station-level Availability (%) — average of each machine's own Availability
+ * fraction (not derived from the averaged MTBF — see MtbfCard/AvailabilityCard
+ * comments below for why that distinction matters). */
+function stationAvailability(s: StationStat, simTime: number, mttr: number): number | null {
+  const mtbfValues = perMachineMtbf(s, simTime)
+  if (mtbfValues.length === 0) return null
+  const availabilities = mtbfValues.map(mtbf => mtbf / (mtbf + mttr))
+  return (availabilities.reduce((sum, a) => sum + a, 0) / availabilities.length) * 100
+}
+
+/**
+ * Configured (theoretical, pre-run) MTBF — what the station's reliability
+ * settings predict on AVERAGE across many runs, as opposed to the Observed
+ * MTBF above (what actually happened in THIS one run's random failures).
+ *
+ * Prefers the station's stored `MTBF` (minutes, uncapped) — written by the
+ * Process Flow tab's Availability%+MTTR fields (ScenarioManager.tsx) and
+ * what backend/engine/machine.py now reads directly. Falls back to the
+ * legacy `1440 / Failure rate` estimate for scenarios saved before the
+ * MTBF field existed — failureRate there is the RAW DECIMAL stored on
+ * stations_data['Failure rate'] (e.g. 1 = 100%, 0.9 = 90%, matching
+ * backend/engine/machine.py's 0<=failure_rate<=1 validation), NOT a 0-100
+ * percentage.
+ *
+ * null when neither MTBF nor Failure Rate is set (station configured to
+ * never fail — "no configured MTBF" is the honest answer, not an
+ * infinite/fake one).
+ */
+function configuredMtbf(failureRate: number | undefined, mtbf: number | undefined): number | null {
+  if (mtbf != null && mtbf > 0) return mtbf
+  const rate = failureRate ?? 0
+  return rate > 0 ? 1440 / rate : null
+}
+
+/** Configured (theoretical, pre-run) Availability (%) from configuredMtbf
+ * (MTBF field if present, else legacy Failure Rate estimate) + MTTR. */
+function configuredAvailability(failureRate: number | undefined, mttr: number, mtbf: number | undefined): number | null {
+  const resolvedMtbf = configuredMtbf(failureRate, mtbf)
+  if (resolvedMtbf == null) return null
+  if (mttr <= 0) return 100
+  return (resolvedMtbf / (resolvedMtbf + mttr)) * 100
+}
+
+// ─── MTBF (Mean Time Between Failures) card ───────────────────────────────────
+// Shows BOTH numbers side by side, since they answer different questions and
+// were easy to confuse when only one was visible at a time:
+//   Observed   — minutes of run time / actual breakdown count THIS run had.
+//                A station with 0 failures has no observed MTBF (division
+//                by zero), shown as "—" rather than treated as "never fails".
+//   Configured — what the station's Failure Rate setting predicts on
+//                AVERAGE across many runs (configuredMtbf above). Any ONE
+//                run's Observed value can reasonably land far from this —
+//                failures are a random process, not a fixed countdown — so
+//                showing both together is the point, not a bug to reconcile.
+
+function MtbfCard({
+  simTime, stats, stationsData,
+}: { simTime: number; stats: StationStat[]; stationsData: Record<string, { 'Failure rate'?: number; MTBF?: number }> }) {
+  const [open, setOpen] = useState(false)
+  const withFailures = stats.filter(s => s.failure_breakdowns > 0)
+  const perStationMtbf = withFailures.map(s => ({
+    ...s,
+    mtbf: stationMtbf(s, simTime) ?? 0,
+    configured: configuredMtbf(stationsData[s.station_name]?.['Failure rate'], stationsData[s.station_name]?.['MTBF']),
+  })).sort((a, b) => a.mtbf - b.mtbf)
+  // Configured MTBF doesn't depend on whether this run happened to fail —
+  // averaged across every station that HAS a Failure Rate set, not just
+  // the ones that failed this particular run.
+  const configuredValues = stats
+    .map(s => configuredMtbf(stationsData[s.station_name]?.['Failure rate'], stationsData[s.station_name]?.['MTBF']))
+    .filter((v): v is number => v != null)
+  const avgConfiguredMtbf = configuredValues.length > 0
+    ? configuredValues.reduce((sum, v) => sum + v, 0) / configuredValues.length
+    : null
+
+  return (
+    <div className="relative h-full">
+      <Card
+        className={`border h-full transition-colors ${withFailures.length > 0 ? 'border-gray-200 cursor-pointer hover:border-amber-300' : 'border-gray-200'}`}
+        onClick={() => withFailures.length > 0 && setOpen(true)}
+      >
+        <CardContent className="pt-5 pb-4 h-full">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">MTBF</p>
+              <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">
+                {avgConfiguredMtbf != null ? `${avgConfiguredMtbf.toFixed(0)} min` : '—'}
+              </p>
+              <p className="text-xs text-gray-400 mt-1">configured</p>
+            </div>
+            <div className="p-2 rounded-lg bg-amber-50"><Timer className="h-4 w-4 text-amber-500" /></div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {open && perStationMtbf.length > 0 && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => setOpen(false)} />
+          <div className="relative bg-white rounded-2xl shadow-2xl w-[720px] max-h-[80vh] flex flex-col overflow-hidden">
+            <div className="flex items-center justify-between px-6 py-5 border-b border-gray-100 bg-gradient-to-r from-amber-50 to-yellow-50">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-amber-100 flex items-center justify-center"><Timer className="h-5 w-5 text-amber-600" /></div>
+                <div>
+                  <h2 className="text-base font-bold text-gray-900">Mean Time Between Failures</h2>
+                  <p className="text-xs text-gray-400 mt-0.5">Configured MTBF per station</p>
+                </div>
+              </div>
+              <button onClick={() => setOpen(false)} className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors"><X className="h-4 w-4" /></button>
+            </div>
+            <div className="flex items-center gap-6 px-6 py-3 bg-gray-50 border-b border-gray-100">
+              {avgConfiguredMtbf != null && (
+                <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Avg Configured MTBF</p><p className="text-sm font-bold text-gray-600">{avgConfiguredMtbf.toFixed(0)} min</p></div>
+              )}
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Stations w/ Failures</p><p className="text-sm font-bold text-gray-800">{withFailures.length} / {stats.length}</p></div>
+            </div>
+            <div className="flex items-center gap-3 px-6 py-2 border-b border-gray-100">
+              <span className="text-[10px] font-bold text-gray-400 uppercase flex-1">Station</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-24 text-right">Failures</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-28 text-right">Configured (min)</span>
+            </div>
+            <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-amber-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+              {perStationMtbf.map((s, i) => (
+                <div key={s.station_name} className={`flex items-center gap-3 px-6 py-3.5 border-b border-gray-50 last:border-0 ${i === 0 ? 'bg-amber-50/40' : 'hover:bg-gray-50'}`}>
+                  <div className="flex items-center gap-2 flex-1 min-w-0">
+                    <div className="w-2 h-2 rounded-full bg-amber-400 shrink-0" />
+                    <span className="text-sm text-gray-800 font-medium truncate">{s.station_name}</span>
+                  </div>
+                  <span className="text-sm text-gray-600 tabular-nums w-24 text-right">{s.failure_breakdowns}</span>
+                  <span className="text-sm text-gray-500 tabular-nums w-28 text-right">{s.configured != null ? s.configured.toFixed(0) : '—'}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Availability card ─────────────────────────────────────────────────────────
+// Shows BOTH numbers, same reasoning as MtbfCard above:
+//   Observed   — MTBF/(MTBF+MTTR) using THIS run's observed MTBF. A station
+//                with 0 failures this run has no observed MTBF, so no
+//                Observed Availability either — "—", not a false 100%.
+//   Configured — MTBF/(MTBF+MTTR) using the Failure-Rate-predicted MTBF
+//                (configuredAvailability above) — what ScenarioManager.tsx's
+//                own Availability field already shows before running.
+
+function AvailabilityCard({
+  simTime, stats, stationsData,
+}: { simTime: number; stats: StationStat[]; stationsData: Record<string, { 'Repair Time'?: number; 'Failure rate'?: number; MTBF?: number }> }) {
+  const [open, setOpen] = useState(false)
+  const withFailures = stats.filter(s => s.failure_breakdowns > 0)
+  const perStation = withFailures.map(s => {
+    const mttr = stationsData[s.station_name]?.['Repair Time'] ?? 10
+    const mtbf = stationMtbf(s, simTime) ?? 0
+    const availability = stationAvailability(s, simTime, mttr) ?? 0
+    const configured = configuredAvailability(stationsData[s.station_name]?.['Failure rate'], mttr, stationsData[s.station_name]?.['MTBF'])
+    return { ...s, mtbf, mttr, availability, configured }
+  }).sort((a, b) => a.availability - b.availability)
+  // Configured Availability doesn't depend on whether this run happened to
+  // fail — averaged across every station that HAS a Failure Rate set, not
+  // just the ones that failed this particular run.
+  const configuredValues = stats
+    .map(s => configuredAvailability(
+      stationsData[s.station_name]?.['Failure rate'],
+      stationsData[s.station_name]?.['Repair Time'] ?? 10,
+      stationsData[s.station_name]?.['MTBF'],
+    ))
+    .filter((v): v is number => v != null)
+  const avgConfiguredAvailability = configuredValues.length > 0
+    ? configuredValues.reduce((sum, v) => sum + v, 0) / configuredValues.length
+    : null
+
+  return (
+    <div className="relative h-full">
+      <Card
+        className={`border h-full transition-colors ${perStation.length > 0 ? 'border-gray-200 cursor-pointer hover:border-emerald-300' : 'border-gray-200'}`}
+        onClick={() => perStation.length > 0 && setOpen(true)}
+      >
+        <CardContent className="pt-5 pb-4 h-full">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Availability</p>
+              <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">
+                {avgConfiguredAvailability != null ? `${avgConfiguredAvailability.toFixed(2)}%` : '—'}
+              </p>
+              <p className="text-xs text-gray-400 mt-1">configured</p>
+            </div>
+            <div className="p-2 rounded-lg bg-emerald-50"><CheckCircle className="h-4 w-4 text-emerald-500" /></div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {open && perStation.length > 0 && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => setOpen(false)} />
+          <div className="relative bg-white rounded-2xl shadow-2xl w-[760px] max-h-[80vh] flex flex-col overflow-hidden">
+            <div className="flex items-center justify-between px-6 py-5 border-b border-gray-100 bg-gradient-to-r from-emerald-50 to-green-50">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-emerald-100 flex items-center justify-center"><CheckCircle className="h-5 w-5 text-emerald-600" /></div>
+                <div>
+                  <h2 className="text-base font-bold text-gray-900">Station Availability</h2>
+                  <p className="text-xs text-gray-400 mt-0.5">Configured Availability per station</p>
+                </div>
+              </div>
+              <button onClick={() => setOpen(false)} className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors"><X className="h-4 w-4" /></button>
+            </div>
+            <div className="flex items-center gap-6 px-6 py-3 bg-gray-50 border-b border-gray-100">
+              {avgConfiguredAvailability != null && (
+                <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Avg Configured</p><p className="text-sm font-bold text-gray-600">{avgConfiguredAvailability.toFixed(2)}%</p></div>
+              )}
+              <div><p className="text-[10px] text-gray-400 uppercase tracking-widest">Stations w/ Failures</p><p className="text-sm font-bold text-gray-800">{perStation.length} / {stats.length}</p></div>
+            </div>
+            <div className="flex items-center gap-3 px-6 py-2 border-b border-gray-100">
+              <span className="text-[10px] font-bold text-gray-400 uppercase flex-1">Station</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-20 text-right">MTTR (min)</span>
+              <span className="text-[10px] font-bold text-gray-400 uppercase w-24 text-right">Configured</span>
+            </div>
+            <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-emerald-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+              {perStation.map((s, i) => (
+                <div key={s.station_name} className={`flex items-center gap-3 px-6 py-3.5 border-b border-gray-50 last:border-0 ${i === 0 ? 'bg-emerald-50/40' : 'hover:bg-gray-50'}`}>
+                  <div className="flex items-center gap-2 flex-1 min-w-0">
+                    <div className="w-2 h-2 rounded-full bg-emerald-400 shrink-0" />
+                    <span className="text-sm text-gray-800 font-medium truncate">{s.station_name}</span>
+                  </div>
+                  <span className="text-sm text-gray-600 tabular-nums w-20 text-right">{s.mttr.toFixed(0)}</span>
+                  <span className="text-sm text-gray-500 tabular-nums w-24 text-right">{s.configured != null ? `${s.configured.toFixed(2)}%` : '—'}</span>
                 </div>
               ))}
             </div>
@@ -2039,6 +2312,8 @@ function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDialogProp
       ...value,
       SIM_TIME: Number(custom),
       num_replications: Math.max(1, Math.min(30, Number(reps) || 1)),
+      // No Random Seed box any more — every run is random ("Auto").
+      RANDOM_SEED: undefined,
       ...shiftEntriesToConfig(shifts),
     })
     onClose()
@@ -2171,6 +2446,7 @@ function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDialogProp
             </div>
             <p className="text-xs text-gray-400 mt-1.5">Multiple replications average results for statistical stability.</p>
           </div>
+
         </div>
 
         {/* Footer */}
@@ -2193,6 +2469,7 @@ interface JobTraceRow {
   windowMin: number | null
   waitingMin: number | null
   processingMin: number | null
+  otherTimeMin: number | null
   totalMin: number | null
   status: string
   delayReason: string
@@ -2225,14 +2502,47 @@ function parseJobTrace(completionLog: Record<string, unknown[]>): JobTraceRow[] 
       const round2 = (n: number) => Math.round(n * 100) / 100
       const waitingMin = e['Blocked Time'] != null ? round2(Number(e['Blocked Time'])) : null
       const processingMin = e['Processing Time'] != null ? round2(Number(e['Processing Time'])) : null
+      // What usually explains the gap between Processing (min) and Total
+      // (min) below — Total counts the full process-window (see windowMin's
+      // comment above), which silently folds in every OTHER delay signal
+      // the backend tracks (sim_core.py's _determine_delay_reason draws
+      // from these exact same fields to pick "Delay Reason"): machine
+      // breakdown, waiting for an operator, material shortage, setup/
+      // changeover, rework, and off-shift pause time (a job's station
+      // acquired the machine, then sat paused overnight/weekend waiting for
+      // the next shift). None of these had their own column before, so
+      // Delay Reason could say e.g. "Waiting for material" while "Waiting
+      // (min)" showed 0 in this same row — that column is queue-wait
+      // (Blocked Time) only, a DIFFERENT signal from all six of these.
+      // Summing them here means Waiting + Processing + this always accounts
+      // for the Total a user sees, and it's built from the identical signal
+      // set Delay Reason itself uses, so the two never disagree about what
+      // actually happened to a job.
+      const breakdownMin = e['station_downtime'] != null ? Number(e['station_downtime']) : 0
+      const operatorMin = e['operators_downtime'] != null ? Number(e['operators_downtime']) : 0
+      const materialMin = e['material_unavailability'] != null ? Number(e['material_unavailability']) : 0
+      const setupMin = e['total_setup_time'] != null ? Number(e['total_setup_time']) : 0
+      const reworkMin = e['total_rework_time'] != null ? Number(e['total_rework_time']) : 0
+      const pauseMin = e['pause_time'] != null ? Number(e['pause_time']) : 0
+      const otherTimeMin = round2(breakdownMin + operatorMin + materialMin + setupMin + reworkMin + pauseMin)
       let windowMin: number | null = null
       if (arrival && departure) {
         const start = new Date(arrival.replace(' ', 'T')).getTime()
         const end = new Date(departure.replace(' ', 'T')).getTime()
         windowMin = round2((end - start) / 60000)
       }
-      const totalMin = waitingMin != null && windowMin != null ? round2(waitingMin + windowMin) : null
-      rows.push({ jobId, station, arrival, departure, windowMin, waitingMin, processingMin, totalMin, status, delayReason })
+      // Total (min) used to be waitingMin + windowMin, where windowMin came
+      // from subtracting two whole-second timestamp strings — losing
+      // sub-second precision the backend's own numeric fields still have
+      // (e.g. Processing Time 822.86 + pause_time 540 truly sums to
+      // 1362.86, but the timestamp-derived window rounded to 1362.85).
+      // Summing the precise numeric fields directly instead means Total
+      // always exactly equals Waiting + Processing + Other Delay, with no
+      // rounding drift between the two paths.
+      const totalMin = waitingMin != null && processingMin != null
+        ? round2(waitingMin + processingMin + otherTimeMin)
+        : null
+      rows.push({ jobId, station, arrival, departure, windowMin, waitingMin, processingMin, otherTimeMin, totalMin, status, delayReason })
     }
   }
   // Sort by arrival time (jobs with no arrival timestamp sink to the bottom)
@@ -2325,7 +2635,7 @@ function JobTraceTable({
         <table className="w-full text-sm">
           <thead className="sticky top-0 bg-gray-50 z-10">
             <tr className="border-b border-gray-100">
-              {['Job ID', 'Station', 'Processing Start', 'Processing End', 'Waiting (min)', 'Processing (min)', 'Total (min)', 'Status', 'Delay Reason'].map(h => (
+              {['Job ID', 'Station', 'Processing Start', 'Processing End', 'Waiting (min)', 'Processing (min)', 'Other Delay (min)', 'Total (min)', 'Status', 'Delay Reason'].map(h => (
                 <th key={h} className="text-left text-[10px] font-bold text-gray-400 uppercase tracking-widest py-3 px-4 whitespace-nowrap">{h}</th>
               ))}
             </tr>
@@ -2339,6 +2649,7 @@ function JobTraceTable({
                 <td className="py-2.5 px-4 text-gray-600 whitespace-nowrap">{r.departure ?? '—'}</td>
                 <td className={`py-2.5 px-4 tabular-nums whitespace-nowrap ${r.waitingMin ? 'text-amber-600 font-medium' : 'text-gray-400'}`}>{r.waitingMin ?? '—'}</td>
                 <td className="py-2.5 px-4 text-blue-600 font-medium tabular-nums whitespace-nowrap">{r.processingMin ?? '—'}</td>
+                <td className={`py-2.5 px-4 tabular-nums whitespace-nowrap ${r.otherTimeMin ? 'text-purple-600 font-medium' : 'text-gray-400'}`}>{r.otherTimeMin || '—'}</td>
                 <td className="py-2.5 px-4 text-gray-800 font-semibold tabular-nums whitespace-nowrap">{r.totalMin ?? '—'}</td>
                 <td className="py-2.5 px-4 whitespace-nowrap">
                   <span className={`text-xs font-semibold px-2 py-0.5 rounded-full border ${
@@ -2421,7 +2732,7 @@ function parseGantt(completionLog: Record<string, unknown[]>): GanttJob[] {
   return jobs
 }
 
-function GanttTimeline({ result, onExpandToggle, isExpanded }: { result: Record<string, unknown>; onExpandToggle?: () => void; isExpanded?: boolean }) {
+function GanttTimeline({ result, simTime, onExpandToggle, isExpanded }: { result: Record<string, unknown>; simTime?: number; onExpandToggle?: () => void; isExpanded?: boolean }) {
   const isDark = useAppStore(s => s.theme) === 'dark'
   const svgC = isDark
     ? { rowEven: '#1e293b', rowOdd: '#0f172a', grid: '#334155', legendBg: '#1e293b', label: '#e2e8f0', muted: '#94a3b8', barBorder: 'rgba(255,255,255,0.12)' }
@@ -2446,7 +2757,14 @@ function GanttTimeline({ result, onExpandToggle, isExpanded }: { result: Record<
   // once a simulation produces enough completion-log entries. reduce()
   // avoids the call-stack limit entirely.
   const tMin = jobs.reduce((min, j) => Math.min(min, j.start), Infinity)
-  const tMax = jobs.reduce((max, j) => Math.max(max, j.end), -Infinity)
+  // The configured run length (simTime, in simulated minutes) always wins
+  // over the last job's own end time — a run that finishes all its jobs
+  // early (e.g. a 200-minute run where the last job ends at 125m) should
+  // still show the FULL window the user asked it to run for, empty tail
+  // included, not silently crop to whenever activity happened to stop.
+  const lastJobEnd = jobs.reduce((max, j) => Math.max(max, j.end), -Infinity)
+  const configuredEnd = hasJobs && simTime != null ? tMin + simTime * 60000 : -Infinity
+  const tMax = hasJobs ? Math.max(lastJobEnd, configuredEnd) : -Infinity
   const totalMs = hasJobs ? (tMax - tMin || 1) : 1
 
   const [scrubPct, setScrubPct] = useState(100)
@@ -2919,6 +3237,11 @@ function StationHealthGrid({ stats }: { stats: StationStat[] }) {
           { label: 'Setup Time', value: `${(s.setup_time_ratio ?? 0).toFixed(1)}%`, badge: (s.setup_time_ratio ?? 0) > 10 ? 'text-purple-600' : 'text-gray-400' },
           { label: 'Buffer Blocked', value: `${(s.buffer_blocked_ratio ?? 0).toFixed(1)}%`, badge: (s.buffer_blocked_ratio ?? 0) > 10 ? 'text-rose-600' : 'text-gray-400' },
           { label: 'Throughput', value: `${s.throughput.toFixed(2)} /hr`, badge: 'text-indigo-600' },
+          // Conveyor only — the belt's own settings for this run.
+          ...(s.conveyor_length != null ? [{ label: 'Length', value: `${+s.conveyor_length.toFixed(2)} m`, badge: 'text-gray-700' }] : []),
+          ...(s.conveyor_speed != null ? [{ label: 'Speed', value: `${+s.conveyor_speed.toFixed(2)} m/min`, badge: 'text-gray-700' }] : []),
+          ...(s.transport_time != null ? [{ label: 'Transport Time', value: `${+s.transport_time.toFixed(2)} min`, badge: 'text-gray-700' }] : []),
+          ...(s.sensor_passed != null ? [{ label: 'Jobs passed sensor', value: `${s.sensor_passed}`, badge: 'text-gray-700' }] : []),
         ]
         const arrowOffset = popup.anchorX - popup.x
         return (
@@ -3083,6 +3406,7 @@ function RunHistory({
     completed: 'bg-green-400',
     running:   'bg-blue-400 animate-pulse',
     failed:    'bg-red-400',
+    stopped:   'bg-red-400',
     pending:   'bg-gray-300',
   }
 
@@ -3115,7 +3439,8 @@ function RunHistory({
                 <p className={`text-[10px] capitalize ${
                   r.status === 'completed' ? 'text-green-500' :
                   r.status === 'running'   ? 'text-blue-400' :
-                  r.status === 'failed'    ? 'text-red-400'  : 'text-gray-400'
+                  r.status === 'failed'    ? 'text-red-400'  :
+                  r.status === 'stopped'   ? 'text-red-400'  : 'text-gray-400'
                 }`}>{r.status}</p>
               </div>
             </div>
@@ -3370,13 +3695,24 @@ export default function RunDashboard() {
     )
   }
 
-  const stats = displayRun?.station_stats ?? []
+  // Start (Source) and End (Drain) are entry/exit markers the engine tracks
+  // as zero-time passthroughs, not real work — the backend still reports a
+  // station_stats row for them (their machine/resource technically exists),
+  // so every KPI card built from `stats` needs this filter, not just one
+  // card, or they'd keep showing up as if they were real stations wherever
+  // a card wasn't individually fixed.
+  const allStats = displayRun?.station_stats ?? []
+  const stats = allStats.filter((s) => {
+    const t = activeScenario.stations_data[s.station_name]?.['Station Type']
+    return t !== 'Source' && t !== 'Drain'
+  })
   const isRunning = !!progress || triggerMutation.isPending
 
   // KPIs — all pre-calculated by backend
   const simTime = displayRun?.simulation_time ?? 0
   const completedJobs = displayRun?.completed_jobs ?? 0
   const inProgressJobs = displayRun?.in_progress_jobs ?? 0
+  const scrappedJobs = Number((displayRun?.result?.simulation_state as { scrapped_jobs?: number } | undefined)?.scrapped_jobs ?? 0)
   const throughput = displayRun?.kpi_throughput != null ? displayRun.kpi_throughput.toFixed(4) : '0.0000'
   const avgUtil = displayRun?.kpi_avg_utilization ?? 0
   const peakUtil = displayRun?.kpi_peak_utilization ?? 0
@@ -3446,7 +3782,7 @@ export default function RunDashboard() {
           {!historyCollapsed && (<>
             {/* Header */}
             <div className="px-4 pt-5 pb-3 border-b border-gray-100">
-              <p className="text-xs font-bold text-gray-500 uppercase tracking-widest">Run History</p>
+              <p className="text-xs font-bold text-gray-500 uppercase tracking-widest">What If</p>
             </div>
 
             {/* Runs list */}
@@ -3494,7 +3830,7 @@ export default function RunDashboard() {
                 {/* Show the SELECTED RUN's actual simulated duration (not the
                     config dialog's pending SIM_TIME), so this updates per-run
                     when switching between runs in history. */}
-                {displayRun?.simulation_time != null ? Math.round(displayRun.simulation_time) : (simCfg.SIM_TIME ?? '?')} min sim · {Object.keys(activeScenario.stations_data).length} stations ·{' '}
+                {displayRun?.simulation_time != null ? Math.round(displayRun.simulation_time) : (simCfg.SIM_TIME ?? '?')} min sim · {Object.values(activeScenario.stations_data).filter((c) => c['Station Type'] !== 'Source' && c['Station Type'] !== 'Drain').length} stations ·{' '}
                 {Object.keys(activeScenario.variant_quantities).length} variants
                 {displayRun?.num_replications && displayRun.num_replications > 1 ? ` · ${displayRun.num_replications} reps` : ''}
               </p>
@@ -3631,7 +3967,7 @@ export default function RunDashboard() {
           {(!displayRun || tab === 'kpis') && (
             <>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3 auto-rows-fr">
-                <CompletedJobsCard completed={completedJobs} inProgress={inProgressJobs} stats={stats} />
+                <CompletedJobsCard completed={completedJobs} inProgress={inProgressJobs} scrapped={scrappedJobs} stats={stats} />
                 <ThroughputCard value={`${throughput} /hr`} sub="jobs per hour" stats={stats} />
                 <SimDurationCard simDays={simDays} simTime={simTime} simCfg={simCfg} />
                 <PeakUtilCard peakUtil={peakUtil} bottleneck={bottleneck} stats={stats} />
@@ -3646,6 +3982,10 @@ export default function RunDashboard() {
                 <AvgSetupCard stats={stats} />
                 <AvgBufferBlockedCard stats={stats} />
                 <AvgCycleTimeCard stats={stats} />
+                <MtbfCard simTime={simTime} stats={stats} stationsData={activeScenario.stations_data} />
+              </div>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6 auto-rows-fr">
+                <AvailabilityCard simTime={simTime} stats={stats} stationsData={activeScenario.stations_data} />
               </div>
             </>
           )}
@@ -3769,7 +4109,7 @@ export default function RunDashboard() {
                         </div>
                       </CardHeader>
                       <CardContent>
-                        <GanttTimeline result={displayRun.result ?? {}} isExpanded={ganttExpanded} onExpandToggle={() => setGanttExpanded(e => !e)} />
+                        <GanttTimeline result={displayRun.result ?? {}} simTime={displayRun.simulation_time} isExpanded={ganttExpanded} onExpandToggle={() => setGanttExpanded(e => !e)} />
                       </CardContent>
                     </Card>
                   )}

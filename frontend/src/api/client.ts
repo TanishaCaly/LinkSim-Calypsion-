@@ -63,6 +63,11 @@ api.interceptors.response.use(
         window.location.href = '/login'
       }
     }
+    if (err.response?.status === 403 && err.response?.data?.detail === 'Subscription expired') {
+      if (!window.location.pathname.startsWith('/subscription-expired')) {
+        window.location.href = '/subscription-expired'
+      }
+    }
     const msg = err.response?.data?.detail
       ? formatDetail(err.response.data.detail)
       : (err.message ?? 'Unknown error')

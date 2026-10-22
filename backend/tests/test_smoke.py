@@ -241,7 +241,7 @@ def test_runaway_sim_time_is_clamped():
 
 # ---------------------------------------------------------------------------
 # Station Type behaviours: Connector (instant pass-through) and
-# Conveyor (transport delay, no operator, unbounded concurrency)
+# Conveyor (transport delay, no operator, Conveyor Capacity jobs at once)
 # ---------------------------------------------------------------------------
 
 def _station(**overrides):
@@ -320,14 +320,85 @@ def test_conveyor_uses_transport_time_and_needs_no_operator():
     assert _last_job_end(result) == pytest.approx(7.0)
 
 
+def test_conveyor_speed_is_length_over_transport_time():
+    # 30 m in 15 min = 2 m/min. The job rides for the given Transport Time
+    # (not the step duration, 99), and the result reports all three.
+    stations = {"BELT": _station(operator_per_station=0, **{
+        "Station Type": "Conveyor", "Transport Time": 15.0, "Conveyor Length": 30.0})}
+    flow = {"v": [{"operation": "BELT", "resource": "BELT", "duration": 99.0}]}
+    result, _ = _run_sim(stations, flow, {"v": 1})
+
+    assert _last_job_end(result) == pytest.approx(15.0)
+    stat = result["station_stats"]["BELT"]
+    assert (stat["conveyor_length"], stat["conveyor_speed"], stat["transport_time"]) == (30.0, 2.0, 15.0)
+
+
+@pytest.mark.parametrize("position, passed", [
+    ("Front", 2),   # sensor at 12 m: reached after 12 / 5 = 2.4 min of riding
+    ("Rear", 1),    # sensor at 30 - 12 = 18 m: needs 3.6 min of riding
+])
+def test_conveyor_sensor_counts_jobs_that_passed(position, passed):
+    # 30 m belt, 6 min ride = 5 m/min, one job at a time. Job 1 rides 0-6;
+    # job 2 rides from 6 and has moved 3 min when the sim ends at 9. The
+    # sensor only counts — the ride is unchanged (1 job completes either way).
+    stations = {"BELT": _station(operator_per_station=0, **{
+        "Station Type": "Conveyor", "Transport Time": 6.0, "Conveyor Length": 30.0,
+        "Conveyor Sensor Length": 12.0, "Conveyor Sensor Position": position})}
+    flow = {"v": [{"operation": "BELT", "resource": "BELT", "duration": 99.0}]}
+    result, _ = _run_sim(stations, flow, {"v": 100}, sim_time=9.0)
+
+    assert result["station_stats"]["BELT"]["sensor_passed"] == passed
+    assert result["simulation_state"]["completed_jobs"] == 1
+
+
+def test_conveyor_sensor_count_resets_each_replication():
+    # Same line as above; every replication passes 2 jobs, so the average is
+    # 2 — not a running total across replications.
+    stations = {"BELT": _station(operator_per_station=0, **{
+        "Station Type": "Conveyor", "Transport Time": 6.0, "Conveyor Length": 30.0,
+        "Conveyor Sensor Length": 12.0, "Conveyor Sensor Position": "Front"})}
+    flow = {"v": [{"operation": "BELT", "resource": "BELT", "duration": 99.0}]}
+    cfg = dict(SIM_CONFIG)
+    cfg["SIM_TIME"] = 9.0
+    sim = ManufacturingSimulation(stations, flow, {"v": 100}, {}, cfg)
+    result = sim.run_with_replications(3)
+
+    assert result["station_stats"]["BELT"]["sensor_passed"] == 2
+
+
+def test_conveyor_without_sensor_reports_none():
+    stations = {"BELT": _station(operator_per_station=0, **{
+        "Station Type": "Conveyor", "Transport Time": 6.0, "Conveyor Length": 30.0})}
+    flow = {"v": [{"operation": "BELT", "resource": "BELT", "duration": 99.0}]}
+    result, _ = _run_sim(stations, flow, {"v": 1})
+
+    assert result["station_stats"]["BELT"]["sensor_passed"] is None
+    assert _last_job_end(result) == pytest.approx(6.0)
+
+
+def test_conveyor_transport_time_is_length_over_speed():
+    # 30 m at 7 m/min = 30/7 min. Length + Speed win over a stale Transport
+    # Time (99) and the step duration (50).
+    stations = {"BELT": _station(operator_per_station=0, **{
+        "Station Type": "Conveyor", "Conveyor Length": 30.0, "Conveyor Speed": 7.0,
+        "Transport Time": 99.0})}
+    flow = {"v": [{"operation": "BELT", "resource": "BELT", "duration": 50.0}]}
+    result, _ = _run_sim(stations, flow, {"v": 1})
+
+    assert _last_job_end(result) == pytest.approx(30.0 / 7.0)
+    stat = result["station_stats"]["BELT"]
+    assert stat["conveyor_speed"] == pytest.approx(7.0)
+    assert stat["transport_time"] == pytest.approx(30.0 / 7.0)
+
+
 def test_conveyor_carries_jobs_concurrently():
-    # Ten jobs on a belt configured with capacity 1. A machine would serialise
+    # Ten jobs on a belt with Conveyor Capacity 10. A machine would serialise
     # them (last one done at t=50); a belt carries them all at once, so every
     # job is off the belt after a single transport time.
     stations = {
         "BELT": _station(
             capacity=1, operator_per_station=0,
-            **{"Station Type": "Conveyor", "Transport Time": 5.0},
+            **{"Station Type": "Conveyor", "Transport Time": 5.0, "Conveyor Capacity": 10},
         ),
     }
     flow = {"v": [{"operation": "BELT", "resource": "BELT", "duration": 5.0}]}
@@ -337,6 +408,64 @@ def test_conveyor_carries_jobs_concurrently():
     assert _last_job_end(result) == pytest.approx(5.0), (
         "jobs queued one-at-a-time instead of riding the belt together"
     )
+
+
+def test_conveyor_capacity_defaults_to_one():
+    # No Conveyor Capacity saved -> 1 job on the belt at a time.
+    stations = {"BELT": _station(operator_per_station=0, **{"Station Type": "Conveyor", "Transport Time": 5.0})}
+    flow = {"v": [{"operation": "BELT", "resource": "BELT", "duration": 5.0}]}
+    result, _ = _run_sim(stations, flow, {"v": 3})
+
+    assert result["simulation_state"]["completed_jobs"] == 3
+    assert _last_job_end(result) == pytest.approx(15.0)
+
+
+def test_conveyor_capacity_zero_takes_no_job():
+    stations = {"BELT": _station(operator_per_station=0, **{
+        "Station Type": "Conveyor", "Transport Time": 5.0, "Conveyor Capacity": 0})}
+    flow = {"v": [{"operation": "BELT", "resource": "BELT", "duration": 5.0}]}
+    result, _ = _run_sim(stations, flow, {"v": 3})
+
+    assert result["simulation_state"]["completed_jobs"] == 0
+
+
+def test_conveyor_first_on_first_off():
+    # No Transport Time, so each job rides for its own step duration: the fast
+    # job finishes at 5 but must wait behind the slow one until 20.
+    stations = {"BELT": _station(operator_per_station=0, **{"Station Type": "Conveyor", "Conveyor Capacity": 2})}
+    flow = {
+        "slow": [{"operation": "BELT", "resource": "BELT", "duration": 20.0}],
+        "fast": [{"operation": "BELT", "resource": "BELT", "duration": 5.0}],
+    }
+    result, _ = _run_sim(stations, flow, {"slow": 1, "fast": 1})
+
+    ends = [e["process_end_time_real"] for e in result["completion_log"]["BELT"]]
+    assert ends == ["2025-01-01 06:20:00", "2025-01-01 06:20:00"]
+
+
+def test_conveyor_stops_while_front_job_is_stuck():
+    # A(2) -> BELT(capacity 3, 10 min) -> M(30). Job 2 reaches the end at 14
+    # but M is busy until 42, so the whole belt stops: job 3 (on since 6) has
+    # 2 min left and job 4 (on since 12) 8 min left. They finish those after
+    # the belt restarts — job 3 at 44, job 4 (stopped again 44-72) at 78.
+    stations = {
+        "A": _station(operator_per_station=0),
+        "BELT": _station(operator_per_station=0, **{
+            "Station Type": "Conveyor", "Transport Time": 10.0, "Conveyor Capacity": 3}),
+        "M": _station(operator_per_station=0),
+    }
+    flow = {"v": [
+        {"operation": "A", "resource": "A", "duration": 2.0},
+        {"operation": "BELT", "resource": "BELT", "duration": 10.0},
+        {"operation": "M", "resource": "M", "duration": 30.0},
+    ]}
+    result, _ = _run_sim(stations, flow, {"v": 4})
+
+    belt = {e["job_id"]: e for e in result["completion_log"]["BELT"]}
+    assert belt["v-004"]["process_start_time_real"] == "2025-01-01 06:12:00", "belt was full until job 1 left"
+    assert belt["v-003"]["process_end_time_real"] == "2025-01-01 06:44:00"
+    assert belt["v-004"]["process_end_time_real"] == "2025-01-01 07:18:00"
+    assert all(e["Processing Time"] == pytest.approx(10.0) for e in belt.values())
 
 
 # ---------------------------------------------------------------------------
@@ -790,3 +919,275 @@ def test_list_shifts_per_day_does_not_crash_bottleneck_analysis():
 
     affected = calculate_affected_jobs("M", station_info, sim_config, cycle_times)
     assert affected["station"] == "M"
+
+
+def _exit_controller_machines(strategy, priorities=None):
+    # Station 1 (2 min) feeds Station 2 with 3 parallel machines (3 min each),
+    # failures OFF on both — they must still be 3 separate machines, so the
+    # Exit Controller decides which one each job goes to.
+    s1 = {"Exit Strategy": strategy, "Enable Failures": False}
+    if priorities:
+        s1["Exit Priorities"] = priorities
+    stations = {
+        "Station 1": _station(operator_per_station=0, **s1),
+        "Station 2": _station(operator_per_station=0, capacity=3, **{"Enable Failures": False}),
+    }
+    flow = {"v": [{"operation": "S1", "resource": "Station 1", "duration": 2.0},
+                  {"operation": "S2", "resource": "Station 2", "duration": 3.0}]}
+    result, _ = _run_sim(stations, flow, {"v": 6})
+    assert result["simulation_state"]["completed_jobs"] == 6
+    assert _last_job_end(result) == pytest.approx(15.0)
+    return [e["machine"] for e in result["completion_log"]["Station 2"]]
+
+
+def test_exit_controller_cyclic_with_failures_off():
+    # Job 3 goes to #3 even though #1 is free by then — it's #3's turn.
+    assert _exit_controller_machines("cyclic") == [1, 2, 3, 1, 2, 3]
+
+
+def test_exit_controller_successor_with_failures_off():
+    # #2 is best, then #1: #2 whenever free, else #1; #3 is never needed.
+    prios = {"Station 2 #1": 2, "Station 2 #2": 1, "Station 2 #3": 3}
+    assert _exit_controller_machines("successor", prios) == [2, 1, 2, 1, 2, 1]
+
+
+def test_exit_controller_random_with_failures_off():
+    # Random picks among free machines, so every job still gets a real one.
+    machines = _exit_controller_machines("random")
+    assert len(machines) == 6 and set(machines) <= {1, 2, 3}
+
+
+def _split_line(strategy, times, priorities=None, capacities=None, qty=6, branch_first=False):
+    # Station 1 (2 min) -> one of Station 2 / 3 / ... (a split: each job goes
+    # to only ONE of them, picked by Station 1's Exit Controller). Returns
+    # (where each job went in job order, sim). times: {station: minutes}.
+    s1 = {"Exit Strategy": strategy, "Enable Failures": False}
+    if priorities:
+        s1["Exit Priorities"] = priorities
+    stations = {"Station 1": _station(operator_per_station=0, **s1)}
+    flow = [] if branch_first else [{"operation": "S1", "resource": "Station 1", "duration": 2.0}]
+    for name, minutes in times.items():
+        cap = (capacities or {}).get(name, 1)
+        stations[name] = _station(operator_per_station=0, capacity=cap, **{"Enable Failures": False})
+        flow.append({"operation": name, "resource": name, "duration": minutes, "branch": 1})
+    result, sim = _run_sim(stations, {"v": flow}, {"v": qty})
+    assert result["simulation_state"]["completed_jobs"] == qty
+    went = {}
+    for name in times:
+        for e in result["completion_log"].get(name, []):
+            label = f"{name} #{e['machine']}" if "machine" in e else name
+            went[int(e["job_id"][-3:])] = label
+    assert sorted(went) == list(range(1, qty + 1)), "every job visits exactly one branch"
+    return [went[j] for j in sorted(went)], sim
+
+
+SPLIT_TIMES = {"Station 2": 5.0, "Station 3": 13.0, "Station 4": 10.0}
+
+
+def test_split_cyclic_skips_busy_and_blocks_station_1():
+    # Jobs leave Station 1 at 2, 4, 6, 8, ... Turns 2 -> 3 -> 4; job 4 finds
+    # only Station 2 free (its turn), job 5 waits on Station 1 (10 -> 13)
+    # until Station 2 frees, job 6 waits (15 -> 16) for Station 4.
+    went, sim = _split_line("cyclic", SPLIT_TIMES)
+    assert went == ["Station 2", "Station 3", "Station 4", "Station 2", "Station 2", "Station 4"]
+    assert sim.stations_data["Station 1"]["total_block_time"] == pytest.approx(4.0)
+
+
+def test_split_successor_uses_priorities():
+    # Station 3 first, then 2, then 4 — always the best free one.
+    prios = {"Station 2": 2, "Station 3": 1, "Station 4": 3}
+    went, _ = _split_line("successor", SPLIT_TIMES, prios)
+    assert went == ["Station 3", "Station 2", "Station 4", "Station 2", "Station 2", "Station 3"]
+
+
+def test_split_random_sends_each_job_to_one_station():
+    went, _ = _split_line("random", SPLIT_TIMES)
+    assert set(went) <= set(SPLIT_TIMES)
+
+
+def test_split_parallel_copies_are_separate_choices():
+    # Station 2 has 2 machines: choices are #1, #2, Station 3 in turn.
+    went, _ = _split_line("cyclic", {"Station 2": 10.0, "Station 3": 11.0},
+                          capacities={"Station 2": 2}, qty=4)
+    assert went == ["Station 2 #1", "Station 2 #2", "Station 3", "Station 2 #1"]
+
+
+def test_split_as_first_step():
+    # The line starts with the split: both jobs arrive at 0 and spread out.
+    went, _ = _split_line("cyclic", {"Station 2": 5.0, "Station 3": 5.0}, qty=2, branch_first=True)
+    assert went == ["Station 2", "Station 3"]
+
+
+def _buffer_line(buffer_cfg, station2_cfg=None, qty=6):
+    # Station 1 (1 min) -> [Buffer 1] -> Station 2 (5 min): jobs pile up
+    # between them. buffer_cfg None = no Buffer box (Station 2's own buffer).
+    stations = {"Station 1": _station(operator_per_station=0, **{"Enable Failures": False})}
+    flow = [{"operation": "a", "resource": "Station 1", "duration": 1.0}]
+    if buffer_cfg is not None:
+        stations["Buffer 1"] = _station(operator_per_station=0, **{"Station Type": "Buffer", **buffer_cfg})
+        flow.append({"operation": "b", "resource": "Buffer 1", "duration": 0.0})
+    stations["Station 2"] = _station(operator_per_station=0, **{"Enable Failures": False, **(station2_cfg or {})})
+    flow.append({"operation": "c", "resource": "Station 2", "duration": 5.0})
+    result, _ = _run_sim(stations, {"v": flow}, {"v": qty})
+    assert result["simulation_state"]["completed_jobs"] == qty
+    minute = lambda e: int(str(e["process_start_time_real"])[14:16])
+    s1_starts = [minute(e) for e in result["completion_log"]["Station 1"]]
+    s2_order = [int(e["job_id"][-3:]) for e in sorted(result["completion_log"]["Station 2"], key=minute)]
+    return s1_starts, s2_order, result
+
+
+def test_buffer_2d_holds_its_quantity_and_blocks_station_1():
+    # Buffer of 2: jobs 2 and 3 wait in it, job 4 stays on Station 1, so
+    # Station 1 can only start job 5 when job 2 leaves at 06:06 — not later.
+    s1, s2, result = _buffer_line({"Buffer Capacity": 2})
+    assert s1 == [0, 1, 2, 3, 6, 11]
+    assert s2 == [1, 2, 3, 4, 5, 6]
+    assert result["station_stats"]["Station 1"]["buffer_blocked_time"] == pytest.approx(10.0)
+
+
+def test_buffer_2d_lifo_sends_newest_job_first():
+    _, s2, _ = _buffer_line({"Buffer Capacity": 2, "Buffer Discipline": "LIFO"})
+    assert s2 == [1, 3, 4, 5, 6, 2]
+    _, s2, _ = _buffer_line({"Buffer Unlimited": True, "Buffer Discipline": "LIFO"})
+    assert s2 == [1, 6, 5, 4, 3, 2]
+
+
+def test_buffer_capacity_zero_passes_jobs_straight_through():
+    # No room in the box: as if it weren't there — Station 1 holds each job
+    # until Station 2 is free, and every job still completes.
+    s1, s2, result = _buffer_line({"Buffer Capacity": 0})
+    assert s1 == [0, 1, 6, 11, 16, 21]
+    assert s2 == [1, 2, 3, 4, 5, 6]
+    assert result["station_stats"]["Station 1"]["buffer_blocked_time"] == pytest.approx(20.0)
+
+
+def test_buffer_3d_rack_size_limits_the_line():
+    # A 2x1x1 rack holds 2 jobs, exactly like a 2D buffer of 2.
+    s1, _, _ = _buffer_line({"Buffer Config Mode": "3D", "Buffer X": 2, "Buffer Y": 1, "Buffer Z": 1})
+    assert s1 == [0, 1, 2, 3, 6, 11]
+
+
+def test_buffer_3d_lifo_only_takes_lane_fronts():
+    # 2 lanes, 2 deep: lane A = 2,4  lane B = 3,5 (then 6 behind 5). LIFO picks
+    # the newest FRONT job each time — job 4 is stuck behind 2 until 2 leaves.
+    _, s2, _ = _buffer_line({"Buffer Config Mode": "3D", "Buffer X": 2, "Buffer Y": 2, "Buffer Z": 1,
+                             "Buffer Discipline": "LIFO"})
+    assert s2 == [1, 3, 5, 6, 2, 4]
+
+
+def test_station_own_buffer_quantity_blocks_and_orders():
+    s1, s2, _ = _buffer_line(None, {"Buffer Capacity": 2})
+    assert s1 == [0, 1, 2, 3, 6, 11]
+    assert s2 == [1, 2, 3, 4, 5, 6]
+    _, s2, _ = _buffer_line(None, {"Buffer Unlimited": True, "Buffer Discipline": "LIFO"})
+    assert s2 == [1, 6, 5, 4, 3, 2]
+
+
+def _parallel_group_line(times, buffers, strategy="cyclic", priorities=None, qty=6):
+    # Station 1 (2 min) -> a parallel group "Station 2": each machine is a
+    # station of its own (own name, own time), sharing one waiting line whose
+    # room is the machines' buffers added together. Returns (machine each job
+    # went to, in job order, sim).
+    s1 = {"Exit Strategy": strategy, "Enable Failures": False}
+    if priorities:
+        s1["Exit Priorities"] = priorities
+    stations = {"Station 1": _station(operator_per_station=0, **s1)}
+    flow = [{"operation": "S1", "resource": "Station 1", "duration": 2.0}]
+    for name, minutes in times.items():
+        buf = buffers.get(name, 0)
+        extra = {"Buffer Unlimited": True} if buf is None else {"Buffer Capacity": buf}
+        stations[name] = _station(operator_per_station=0, **{
+            "Enable Failures": False, "Parallel Group": "Station 2", **extra})
+        flow.append({"operation": name, "resource": name, "duration": minutes, "branch": 1})
+    result, sim = _run_sim(stations, {"v": flow}, {"v": qty})
+    assert result["simulation_state"]["completed_jobs"] == qty
+    went = {}
+    for name in times:
+        for e in result["completion_log"].get(name, []):
+            went[int(e["job_id"][-3:])] = name
+    assert sorted(went) == list(range(1, qty + 1)), "every job visits exactly one machine"
+    return [went[j] for j in sorted(went)], sim, result
+
+
+def test_parallel_group_shared_line():
+    # A and B take 10 min, room in the line = 1 + 1. Jobs 3 and 4 wait in the
+    # line (Station 1 is free to carry on); job 5 finds it full and blocks
+    # Station 1 from 10 to 12, when job 3 leaves the line for A.
+    went, sim, result = _parallel_group_line({"Stitching A": 10.0, "Stitching B": 10.0},
+                                             {"Stitching A": 1, "Stitching B": 1})
+    assert went == ["Stitching A", "Stitching B"] * 3
+    assert sim.stations_data["Station 1"]["total_block_time"] == pytest.approx(2.0)
+    assert _last_job_end(result) == pytest.approx(34.0)
+    # Job 3 joined the line at 6 and finished on A at 22.
+    job3 = next(e for e in result["completion_log"]["Stitching A"] if e["job_id"].endswith("003"))
+    assert job3["Cycle Time"] == pytest.approx(16.0)
+
+
+def test_parallel_group_no_buffer_waits_on_station_1():
+    # Room 0: like a split, the job waits on Station 1 until a machine frees.
+    went, sim, _ = _parallel_group_line({"Stitching A": 10.0, "Stitching B": 10.0}, {})
+    assert went == ["Stitching A", "Stitching B"] * 3
+    assert sim.stations_data["Station 1"]["total_block_time"] > 2.0
+
+
+def test_parallel_group_own_times_and_unlimited_line():
+    # B is faster (4 min); an unlimited line never blocks Station 1.
+    went, sim, _ = _parallel_group_line({"Stitching A": 10.0, "Stitching B": 4.0},
+                                        {"Stitching A": None})
+    assert went.count("Stitching B") > went.count("Stitching A")
+    assert sim.stations_data["Station 1"].get("total_block_time", 0) == pytest.approx(0.0)
+
+
+def test_parallel_group_successor_by_machine_name():
+    # Priorities are keyed by each machine's own name: B first, A only when B is busy.
+    went, _, _ = _parallel_group_line({"Stitching A": 1.5, "Stitching B": 1.5}, {},
+                                      strategy="successor",
+                                      priorities={"Stitching A": 2, "Stitching B": 1})
+    assert went == ["Stitching B"] * 6
+
+
+def _start_line(strategy, priorities=None, quantities=None):
+    # Start (with its MU table + Exit Controller) -> M (1 min). Products are
+    # released batch by batch; each job comes its product's interval after
+    # the job before it.
+    start = {"Station Type": "Source", "MU Strategy": strategy, "MU Table": [
+        {"mu": "tshirt", "number": 2, "name": "Tshirt"},
+        {"mu": "pant", "number": 2, "name": "Pant"},
+        {"mu": "shirt", "number": 1, "name": "Shirt"},
+    ]}
+    if priorities:
+        start["MU Priorities"] = priorities
+    stations = {"Start": start, "M": _station(operator_per_station=0, **{"Buffer Unlimited": True})}
+    flow = {v: [{"operation": "M", "resource": "M", "duration": 1.0}] for v in ("tshirt", "pant", "shirt")}
+    cfg = dict(SIM_CONFIG)
+    cfg["SIM_TIME"] = 480.0
+    random.seed(0)
+    sim = ManufacturingSimulation(stations, flow, quantities or {"tshirt": 2, "pant": 2, "shirt": 1}, {}, cfg,
+                                  variant_intervals={"tshirt": 5, "pant": 8})
+    return sim
+
+
+def test_start_cyclic_releases_batch_by_batch():
+    sim = _start_line("cyclic")
+    assert sim._release_schedule() == [
+        ("tshirt", 1, 0.0), ("tshirt", 2, 5.0), ("pant", 1, 13.0), ("pant", 2, 21.0), ("shirt", 1, 21.0)]
+    result = sim.run()
+    assert result["simulation_state"]["completed_jobs"] == 5
+    order = [e["job_id"] for e in result["completion_log"]["M"]]
+    assert order == ["tshirt-001", "tshirt-002", "pant-001", "pant-002", "shirt-001"]
+
+
+def test_start_successor_uses_priorities():
+    sim = _start_line("successor", {"tshirt": 3, "pant": 2, "shirt": 1})
+    assert [v for v, i, _ in sim._release_schedule() if i == 1] == ["shirt", "pant", "tshirt"]
+
+
+def test_start_random_keeps_batches_together():
+    order = [v for v, _, _ in _start_line("random")._release_schedule()]
+    batches = [v for k, v in enumerate(order) if k == 0 or order[k - 1] != v]
+    assert sorted(batches) == ["pant", "shirt", "tshirt"]
+
+
+def test_start_percentage_or_unset_keeps_old_arrivals():
+    assert _start_line("percentage")._release_schedule() is None
+    assert _start_line("")._release_schedule() is None

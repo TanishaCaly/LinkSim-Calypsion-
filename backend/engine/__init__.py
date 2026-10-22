@@ -1,5 +1,5 @@
 from .sim_core import ManufacturingSimulation
-from .machine import Machine
+from .machine import MachineGroup, SubMachine
 from .sim_utils import SimulationUtils
 from .bottleneck import identify_bottlenecks, calculate_affected_jobs, event_analyse
 from .components import SimulationStats, Entity, Generator, Queue, Activity, Exit

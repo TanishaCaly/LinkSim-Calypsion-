@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react'
-import { useNavigate, useLocation } from 'react-router-dom'
+import { useNavigate, useLocation, Link } from 'react-router-dom'
 import { Cpu, AlertCircle } from 'lucide-react'
 import { authApi } from '@/api/auth'
 import { Button } from '@/components/ui/button'
@@ -75,6 +75,13 @@ export default function Login() {
           <Button type="submit" disabled={loading || !username || !password} className="w-full bg-blue-600 hover:bg-blue-700">
             {loading ? 'Signing in…' : 'Sign in'}
           </Button>
+
+          <p className="text-sm text-center text-gray-500">
+            Don't have an account?{' '}
+            <Link to="/signup" className="text-blue-600 hover:underline font-medium">
+              Sign up
+            </Link>
+          </p>
         </form>
       </div>
     </div>

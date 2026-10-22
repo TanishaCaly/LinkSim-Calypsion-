@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { LayoutDashboard, FolderOpen, GitBranch, Lightbulb, Cpu, ChevronLeft, ChevronRight, Sun, Moon, LogOut } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -14,6 +14,7 @@ const nav = [
 
 const DEFAULT_SIDEBAR_WIDTH = 256
 const MIN_SIDEBAR_WIDTH = 200
+const TOAST_MS = 3000
 
 export default function Layout() {
   const { toast, clearToast, theme, toggleTheme } = useAppStore()
@@ -22,6 +23,14 @@ export default function Layout() {
   const [resizing, setResizing] = useState(false)
   const asideRef = useRef<HTMLElement>(null)
   const navigate = useNavigate()
+
+  // Notifications close by themselves after 3 s. Each new one (a fresh
+  // object, even with the same text) restarts the 3 s.
+  useEffect(() => {
+    if (!toast) return
+    const timer = setTimeout(clearToast, TOAST_MS)
+    return () => clearTimeout(timer)
+  }, [toast, clearToast])
 
   async function handleLogout() {
     await authApi.logout().catch(() => {})
@@ -161,7 +170,7 @@ export default function Layout() {
           <div className="p-4 border-t border-gray-100">
             <div className="flex items-center gap-2">
               <div className="w-1.5 h-1.5 rounded-full bg-green-400" />
-              <p className="text-xs text-gray-400">v0.1.0 · Phase 2</p>
+              <p className="text-xs text-gray-400">v0.1.0 · Phase 1</p>
             </div>
           </div>
         )}

@@ -24,61 +24,76 @@ function stemName(file: File | null): string {
   return file.name.replace(/\.[^.]+$/, '')
 }
 
-function formatStepResource(resource: unknown): string {
-  if (typeof resource === 'string') return resource
-  if (resource && typeof resource === 'object') {
-    const r = resource as { mode?: string; options?: string[] }
-    const options = r.options?.join(' / ') ?? ''
-    return `${options} (${r.mode ?? 'routing'})`
-  }
-  return ''
-}
-
 /**
- * Estimated steady-state availability (%) for a station, derived from its
- * Failure Rate (daily failure probability, 0-1) and Repair Time (minutes),
- * via availability = MTBF / (MTBF + MTTR). Display-only — doesn't change
- * which shifts the station actually runs on (that's the separate
- * shifts_per_day field, edited in the Canvas station panel), just estimates
- * how much of its scheduled time it's likely to be up given random
- * breakdowns, matching how the engine's Machine class already models
- * failures (see backend/engine/formulas.py daily_failure_rate_to_per_minute).
+ * Estimated steady-state availability (%) for a station, via
+ * availability = MTBF / (MTBF + MTTR) — the PDF's own core formula.
+ * Display-only — doesn't change which shifts the station actually runs on
+ * (that's the separate shifts_per_day field, edited in the Canvas station
+ * panel), just estimates how much of its scheduled time it's likely to be
+ * up given random breakdowns.
+ *
+ * Prefers the station's stored `MTBF` (minutes, uncapped) when present —
+ * this is what onCommit below writes, and what backend/engine/machine.py
+ * now reads directly (see sim_core.py's _init_resources). Falls back to
+ * the legacy `1440/Failure rate` estimate for scenarios saved before the
+ * MTBF field existed, so old data still displays something sensible.
+ * `Failure rate` is a 0-1 DAILY probability (machine.py enforces
+ * 0<=rate<=1), so that fallback can only express MTBF >= 1440 minutes —
+ * it undershoots reliability for faster-failing machines, which is exactly
+ * why new edits are written as MTBF instead (see availabilityPctToMtbf).
  */
-function estimateAvailabilityPct(failureRate: number | undefined, repairTime: number | undefined): number {
-  const rate = failureRate ?? 0
+function estimateAvailabilityPct(
+  failureRate: number | undefined,
+  repairTime: number | undefined,
+  mtbf: number | undefined,
+): number {
   const mttr = repairTime ?? 0
-  if (rate <= 0) return 100
-  const mtbf = 1440 / rate // minutes between failures, from a daily failure probability
+  let mtbfValue: number
+  if (mtbf != null && mtbf > 0) {
+    mtbfValue = mtbf
+  } else {
+    const rate = failureRate ?? 0
+    if (rate <= 0) return 100
+    mtbfValue = 1440 / rate
+  }
   if (mttr <= 0) return 100
-  return (mtbf / (mtbf + mttr)) * 100
+  return (mtbfValue / (mtbfValue + mttr)) * 100
 }
 
 /**
  * Inverse of estimateAvailabilityPct: given a target availability % and the
- * station's current Repair Time, solves for the daily Failure Rate (0-1)
- * that would produce it, so editing % here writes back a consistent value.
+ * station's current MTTR, solves for MTBF (minutes) directly —
+ *   MTBF = (A / (1 - A)) * MTTR
+ * the PDF's section 1/4 formula, exactly, with no artificial ceiling.
+ *
+ * This REPLACES the old availabilityPctToFailureRate, which instead solved
+ * for a 0-1 "Failure rate" and had to clamp at rate=1 (MTBF=1440 min floor)
+ * for almost any realistic input — e.g. the PDF's own 90%/MTTR=2 example
+ * needs MTBF=18 min, 80x below that floor, so it silently produced a
+ * station 80x more reliable than requested. Writing MTBF as a plain float
+ * instead has no such ceiling.
  */
-function availabilityPctToFailureRate(pct: number, repairTime: number | undefined): number {
+function availabilityPctToMtbf(pct: number, repairTime: number | undefined): number {
   const mttr = repairTime ?? 0
-  const clamped = Math.max(0.01, Math.min(100, pct))
-  if (clamped >= 100 || mttr <= 0) return 0
-  const mtbf = mttr * (clamped / (100 - clamped))
-  return 1440 / mtbf
+  const clamped = Math.max(0.0001, Math.min(99.9999, pct))
+  if (mttr <= 0) return 0
+  const availability = clamped / 100
+  return (availability / (1 - availability)) * mttr
 }
 
 /**
  * The Station Availability (%) cell binds straight to
- * estimateAvailabilityPct(Failure rate, Repair Time) recomputed on every
- * render — so typing a new value round-trips through
- * availabilityPctToFailureRate and back through estimateAvailabilityPct,
- * which doesn't perfectly invert (floating point + the 0.01 floor on
- * Failure rate) and drifts the displayed number away from what was typed.
- * Worse, clearing the field to type a fresh value saw "" and had nowhere to
- * go but snap back to the recomputed number, making it look like the digit
- * couldn't be deleted. This keeps its own local text draft while typing —
- * committing (and inverting to Failure Rate) only once the value looks like
- * a real number — and only re-syncs from the computed % when the station
- * actually changes underneath it, not on every recompute of this same value.
+ * estimateAvailabilityPct(Failure rate, Repair Time, MTBF) recomputed on
+ * every render — so typing a new value round-trips through
+ * availabilityPctToMtbf and back through estimateAvailabilityPct, which
+ * doesn't perfectly invert (floating point) and drifts the displayed
+ * number away from what was typed. Worse, clearing the field to type a
+ * fresh value saw "" and had nowhere to go but snap back to the recomputed
+ * number, making it look like the digit couldn't be deleted. This keeps
+ * its own local text draft while typing — committing (and inverting to
+ * MTBF) only once the value looks like a real number — and only re-syncs
+ * from the computed % when the station actually changes underneath it,
+ * not on every recompute of this same value.
  */
 function AvailabilityPctField({
   value, onCommit, stationKey,
@@ -98,6 +113,7 @@ function AvailabilityPctField({
       max={100}
       step={0.01}
       value={draft}
+      onFocus={(e) => e.target.select()}
       onChange={(e) => {
         const raw = e.target.value
         setDraft(raw)
@@ -109,7 +125,7 @@ function AvailabilityPctField({
       onBlur={() => {
         if (draft === '' || Number.isNaN(Number(draft))) setDraft(String(value))
       }}
-      title="Editable — writes back to this station's Failure Rate (holding Repair Time fixed)"
+      title="Editable — writes back to this station's MTBF (holding MTTR fixed)"
       className="h-8 text-sm w-24 pr-5"
     />
   )
@@ -137,6 +153,7 @@ function UploadDialog({ open, onClose }: { open: boolean; onClose: () => void })
 
   const onImported = (name: string) => {
     queryClient.invalidateQueries({ queryKey: ['scenarios'] })
+    queryClient.invalidateQueries({ queryKey: ['scenarios-count'] })
     showToast(`Scenario "${name}" imported`)
     onClose()
   }
@@ -362,54 +379,93 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
     { key: 'quantities',  label: 'Quantities' },
   ]
 
+  /** Station rows flattened to an array (not a Record) so the NAME itself is
+   * editable text like any other cell, including while typing a brand-new
+   * station name that doesn't match any key yet. */
+  interface StationRow { name: string; cfg: Record<string, any> }
+  const [stationRows, setStationRows] = useState<StationRow[]>(() =>
+    Object.entries(scenario.stations_data ?? {}).map(([name, cfg]) => ({ name, cfg: { ...cfg } }))
+  )
+
   // ── Process Flow editing ──────────────────────────────────────────────────
-  // Flattened one row per (variant, step). `routing` holds a structured
-  // config (mirrors the engine's {mode, options, weights?/rules?/default?}
-  // shape from _resolve_step_resource) for a branching step; it's null for a
-  // plain single-destination step, where `resource` is just the station name.
-  interface RoutingCond { variantType: string; resource: string }
-  interface FlowRouting {
-    mode: 'round_robin' | 'percentage' | 'condition' | 'shortest_queue'
-    options: string[]
-    weights: Record<string, number>
-    rules: RoutingCond[]
-    default: string
-  }
+  // Flattened one row per (variant, step).
   interface FlowStepRow {
     variant: string
     operation: string
     resource: string
-    routing: FlowRouting | null
     duration: number
+    // Consecutive rows of one variant with the same branch number are a
+    // split: each job visits only one of them (set on the Canvas).
+    branch?: number
   }
   const flattenProcessFlow = (pf: Record<string, any>): FlowStepRow[] => {
     const rows: FlowStepRow[] = []
     for (const [variant, steps] of Object.entries(pf ?? {})) {
       for (const step of steps as any[]) {
-        const isRouting = step.resource && typeof step.resource === 'object'
-        let routing: FlowRouting | null = null
-        if (isRouting) {
-          const r = step.resource
-          const weights: Record<string, number> = {}
-          ;(r.options ?? []).forEach((opt: string, oi: number) => { weights[opt] = r.weights?.[oi] ?? 1 })
-          const rules: RoutingCond[] = (r.rules ?? []).map((rule: any) => {
-            const match = /variant_type==['"]([^'"]*)['"]/.exec(rule.if ?? '')
-            return { variantType: match?.[1] ?? '', resource: rule.resource }
-          })
-          routing = { mode: r.mode ?? 'round_robin', options: r.options ?? [], weights, rules, default: r.default ?? (r.options?.[0] ?? '') }
-        }
+        // Scenarios saved while the Exit Controller existed may still hold a
+        // {mode, options, ...} resource — show its first station, matching
+        // what the engine now runs for it (sim_core._resolve_step_resource).
+        const resource = step.resource && typeof step.resource === 'object'
+          ? (step.resource.options?.[0] ?? '')
+          : (step.resource ?? '')
         rows.push({
           variant,
           operation: step.operation,
-          resource: isRouting ? '' : (step.resource ?? ''),
-          routing,
+          resource,
           duration: step.duration,
+          ...(step.branch !== undefined ? { branch: step.branch } : {}),
         })
       }
     }
     return rows
   }
   const [flowRows, setFlowRows] = useState<FlowStepRow[]>(() => flattenProcessFlow(scenario.processflow_data))
+  // Process time a station starts with when it is added to the route — the
+  // same as a new box on the Canvas: 30 min for a station, its transport
+  // time for a conveyor, nothing for a junction/buffer.
+  const newStepTime = (name: string): number => {
+    const cfg = stationRows.find((s) => s.name === name)?.cfg ?? {}
+    const type = cfg['Station Type']
+    if (type === 'Conveyor') {
+      const length = cfg['Conveyor Length'] ?? 0
+      const speed = cfg['Conveyor Speed'] ?? 0
+      return length > 0 && speed > 0 ? length / speed : 0
+    }
+    if (['Connector', 'Buffer', 'Worker', 'Worker Controller', 'Workplace', 'Source', 'Drain'].includes(type)) return 0
+    return 30
+  }
+  // Stations that don't take part in a job's route (pool wiring, Start/End).
+  const isRouteStationCfg = (cfg: Record<string, any>) =>
+    !['Worker', 'Worker Controller', 'Workplace', 'Source', 'Drain'].includes(cfg['Station Type'])
+  // Put a station at the end of every product's route (before End), with
+  // newStepTime — so it shows in Process Flow and on the Canvas.
+  const appendStationToEveryRoute = (name: string) => {
+    const station = name.trim()
+    if (!station) return
+    setFlowRows((rows) => {
+      const variants = Array.from(new Set(rows.map((r) => r.variant).filter((v) => v.trim())))
+      let out = [...rows]
+      for (const variant of variants) {
+        if (out.some((r) => r.variant === variant && r.resource === station)) continue
+        const lastIdx = out.map((r) => r.variant).lastIndexOf(variant)
+        // An older flow may end with its End (Drain) step: go before it.
+        const last = out[lastIdx]
+        const beforeEnd = stationRows.find((s) => s.name === last.resource)?.cfg['Station Type'] === 'Drain'
+        const at = beforeEnd ? lastIdx : lastIdx + 1
+        out = [...out.slice(0, at), { variant, operation: station, resource: station, duration: newStepTime(station) }, ...out.slice(at)]
+      }
+      return out
+    })
+    setSharedRoute((route) => (route.includes(station) ? route : [...route.filter((s) => s.trim()), station]))
+    setFlowDirty(true)
+  }
+  // The parallel group a stop's stations all belong to, if they do (a
+  // machine's group is in its Stations tab settings).
+  const stopParallelGroup = (names: string[]): string | undefined => {
+    const groups = new Set(names.map((n) => stationRows.find((s) => s.name === n)?.cfg['Parallel Group'] || ''))
+    const [only] = groups
+    return groups.size === 1 && only ? only : undefined
+  }
   const [flowDirty, setFlowDirty] = useState(false)
   const [flowSaved, setFlowSaved] = useState(false)
 
@@ -419,20 +475,10 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
       for (const r of rows) {
         if (!r.variant.trim() || !r.operation.trim()) continue
         if (!data[r.variant.trim()]) data[r.variant.trim()] = []
-        let resource: any = r.resource
-        if (r.routing) {
-          const options = r.routing.options.filter((o) => o.trim())
-          resource = { mode: r.routing.mode, options }
-          if (r.routing.mode === 'percentage') {
-            resource.weights = options.map((o) => r.routing!.weights[o] ?? 1)
-          } else if (r.routing.mode === 'condition') {
-            resource.rules = r.routing.rules
-              .filter((rule) => rule.variantType.trim())
-              .map((rule) => ({ if: `variant_type=='${rule.variantType.trim()}'`, resource: rule.resource }))
-            resource.default = r.routing.default || options[0]
-          }
-        }
-        data[r.variant.trim()].push({ operation: r.operation.trim(), resource, duration: r.duration })
+        data[r.variant.trim()].push({
+          operation: r.operation.trim(), resource: r.resource, duration: r.duration,
+          ...(r.branch !== undefined ? { branch: r.branch } : {}),
+        })
       }
       return scenariosApi.update(scenario.id, { processflow_data: data })
     },
@@ -444,48 +490,251 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
     },
   })
 
+  // Splits: consecutive rows of one variant sharing a branch number. For
+  // each row in a split, its place in it ("path 2 of 3"); and each variant's
+  // route with splits in brackets — Station 1 → [ Station 2 | Station 3 ] → End.
+  // When every station of one such stop is a machine of the same parallel
+  // group, the stop is that group (one waiting line, each machine with its
+  // own settings) — shown as Station 2 ( Station 2 #1 | Station 2 #2 ).
+  const flowSplitPlace: Record<number, { pos: number; count: number; group?: string }> = {}
+  const flowRouteByVariant = new Map<string, string[]>()
+  for (let i = 0; i < flowRows.length; ) {
+    const r = flowRows[i]
+    let j = i + 1
+    if (r.branch !== undefined) {
+      while (j < flowRows.length && flowRows[j].variant === r.variant && flowRows[j].branch === r.branch) j++
+    }
+    const group = flowRows.slice(i, j)
+    const parallelGroup = group.length > 1 ? stopParallelGroup(group.map((g) => g.resource)) : undefined
+    if (group.length > 1) group.forEach((_, k) => { flowSplitPlace[i + k] = { pos: k + 1, count: group.length, group: parallelGroup } })
+    if (!flowRouteByVariant.has(r.variant)) flowRouteByVariant.set(r.variant, [])
+    flowRouteByVariant.get(r.variant)!.push(
+      group.length <= 1 ? r.resource
+        : parallelGroup ? `${parallelGroup} ( ${group.map((g) => g.resource).join(' | ')} )`
+          : `[ ${group.map((g) => g.resource).join(' | ')} ]`,
+    )
+    i = j
+  }
+  const flowHasSplit = Object.keys(flowSplitPlace).length > 0
+  const flowHasRealSplit = Object.values(flowSplitPlace).some((p) => !p.group)
+  const flowHasGroup = Object.values(flowSplitPlace).some((p) => p.group)
+
   const updateFlowRow = (i: number, patch: Partial<FlowStepRow>) => {
     setFlowRows((rows) => rows.map((r, ri) => (ri === i ? { ...r, ...patch } : r)))
     setFlowDirty(true)
   }
-  const updateFlowRouting = (i: number, patch: Partial<FlowRouting>) => {
-    setFlowRows((rows) => rows.map((r, ri) => (ri === i && r.routing ? { ...r, routing: { ...r.routing, ...patch } } : r)))
-    setFlowDirty(true)
-  }
   const addFlowRow = () => {
-    setFlowRows((rows) => [...rows, { variant: '', operation: '', resource: '', routing: null, duration: 0 }])
+    setFlowRows((rows) => [...rows, { variant: '', operation: '', resource: '', duration: 0 }])
     setFlowDirty(true)
   }
   const deleteFlowRow = (i: number) => {
     setFlowRows((rows) => rows.filter((_, ri) => ri !== i))
     setFlowDirty(true)
   }
-  const toggleFlowRoutingMode = (i: number, enable: boolean) => {
-    setFlowRows((rows) => rows.map((r, ri) => {
-      if (ri !== i) return r
-      return { ...r, routing: enable ? (r.routing ?? { mode: 'percentage', options: ['', ''], weights: {}, rules: [], default: '' }) : null }
-    }))
+
+  // ── Process Flow: Grid mode ───────────────────────────────────────────────
+  // Alternate view for the common case where many variants share the exact
+  // same station route and only differ in Process Time — lets the user fill
+  // in a Variant x Station grid instead of re-typing the route per variant.
+  // Reads/writes the same flowRows state as the detailed table (see
+  // saveFlowMutation above); a variant only appears here if its station
+  // sequence exactly matches sharedRoute, in order — anything else stays
+  // detailed-table-only.
+  const [flowViewMode, setFlowViewMode] = useState<'grid' | 'detailed'>('detailed')
+  // The longest variant's route — its stations, plus which of them are a
+  // split (station -> branch number; a station appears once per route).
+  const initialRoute = (() => {
+    const byVariant = new Map<string, FlowStepRow[]>()
+    for (const r of flowRows) {
+      if (!byVariant.has(r.variant)) byVariant.set(r.variant, [])
+      byVariant.get(r.variant)!.push(r)
+    }
+    let best: FlowStepRow[] = []
+    for (const seq of byVariant.values()) {
+      if (seq.length > best.length) best = seq
+    }
+    return best
+  })()
+  const [sharedRoute, setSharedRoute] = useState<string[]>(() => initialRoute.map((r) => r.resource))
+  // Stations of the shared route that belong to a split (set on the Canvas):
+  // each job goes to only one station of the same branch number.
+  const [routeBranch, setRouteBranch] = useState<Record<string, number>>(() =>
+    Object.fromEntries(initialRoute.filter((r) => r.branch !== undefined).map((r) => [r.resource, r.branch!])))
+  // Which route slots are showing the free-text "new station" input instead
+  // of the existing-stations dropdown — set when the user picks "+ New
+  // station..." for that slot.
+  const [routeStationFreeText, setRouteStationFreeText] = useState<Set<number>>(new Set())
+
+  interface GridRow { variant: string; times: Record<string, number> }
+
+  function variantMatchesRoute(rows: FlowStepRow[], route: string[]): boolean {
+    if (rows.length !== route.length) return false
+    // Same stations in the same order, and the same splits.
+    return rows.every((r, idx) => r.resource === route[idx] && r.branch === routeBranch[route[idx]])
+  }
+
+  const { gridRows, excludedVariants } = (() => {
+    const byVariant = new Map<string, FlowStepRow[]>()
+    for (const r of flowRows) {
+      if (!r.variant.trim()) continue
+      if (!byVariant.has(r.variant)) byVariant.set(r.variant, [])
+      byVariant.get(r.variant)!.push(r)
+    }
+    const grid: GridRow[] = []
+    const excluded: string[] = []
+    for (const [variant, rows] of byVariant) {
+      if (sharedRoute.length > 0 && variantMatchesRoute(rows, sharedRoute)) {
+        const times: Record<string, number> = {}
+        rows.forEach((r) => { times[r.resource] = r.duration })
+        grid.push({ variant, times })
+      } else {
+        excluded.push(variant)
+      }
+    }
+    return { gridRows: grid, excludedVariants: excluded }
+  })()
+
+  /** Replace a variant's rows (if any) with a fresh set built from the shared
+   * route + grid times, leaving every other variant's rows — and this
+   * variant's original position in the list — untouched, so editing a cell
+   * doesn't reshuffle the grid's row order. */
+  // `route` defaults to the shared route — a caller that has just changed it
+  // passes the new one, since sharedRoute here is still the old value until
+  // React re-renders (using it dropped a station added to the route).
+  const applyGridRow = (variant: string, times: Record<string, number>, route: string[] = sharedRoute) => {
+    setFlowRows((rows) => {
+      const newRows: FlowStepRow[] = route.map((station) => ({
+        variant,
+        operation: station,
+        resource: station,
+        duration: times[station] ?? 0,
+        ...(routeBranch[station] !== undefined ? { branch: routeBranch[station] } : {}),
+      }))
+      const firstIdx = rows.findIndex((r) => r.variant === variant)
+      if (firstIdx === -1) return [...rows, ...newRows]
+      const others = rows.filter((r) => r.variant !== variant)
+      const insertAt = rows.slice(0, firstIdx).filter((r) => r.variant !== variant).length
+      return [...others.slice(0, insertAt), ...newRows, ...others.slice(insertAt)]
+    })
     setFlowDirty(true)
   }
-  const addFlowRoutingOption = (i: number) => {
-    setFlowRows((rows) => rows.map((r, ri) => (ri === i && r.routing ? { ...r, routing: { ...r.routing, options: [...r.routing.options, ''] } } : r)))
+
+  const updateGridCell = (variant: string, station: string, value: number) => {
+    const existing = gridRows.find((g) => g.variant === variant)
+    const times = { ...(existing?.times ?? {}), [station]: value }
+    applyGridRow(variant, times)
+  }
+
+  const addGridVariant = () => {
+    let n = 1
+    let name = `variant${n}`
+    const existingNames = new Set(flowRows.map((r) => r.variant))
+    while (existingNames.has(name)) { n += 1; name = `variant${n}` }
+    const times: Record<string, number> = {}
+    sharedRoute.forEach((s) => { times[s] = 0 })
+    applyGridRow(name, times)
+  }
+
+  const renameGridVariant = (oldName: string, newName: string) => {
+    if (oldName === newName) return
+    setFlowRows((rows) => rows.map((r) => (r.variant === oldName ? { ...r, variant: newName } : r)))
+    setFlowDirty(true)
+    // Quantities tab keeps its own variant list (variant_quantities is a
+    // separate scenario field from processflow_data) — without this, renaming
+    // a variant here would silently orphan its quantity/interval row under
+    // the old name instead of following the rename.
+    setQuantityRows((rows) => rows.map((r) => (r.variant === oldName ? { ...r, variant: newName } : r)))
+    setQuantitiesDirty(true)
+  }
+
+  const deleteGridVariant = (variant: string) => {
+    setFlowRows((rows) => rows.filter((r) => r.variant !== variant))
     setFlowDirty(true)
   }
-  const updateFlowRoutingOption = (i: number, oi: number, value: string) => {
-    setFlowRows((rows) => rows.map((r, ri) => {
-      if (ri !== i || !r.routing) return r
-      const options = r.routing.options.map((o, idx) => (idx === oi ? value : o))
-      return { ...r, routing: { ...r.routing, options } }
-    }))
+
+  const addRouteStation = () => {
+    setSharedRoute((route) => [...route, ''])
     setFlowDirty(true)
   }
-  const deleteFlowRoutingOption = (i: number, oi: number) => {
-    setFlowRows((rows) => rows.map((r, ri) => {
-      if (ri !== i || !r.routing) return r
-      const options = r.routing.options.filter((_, idx) => idx !== oi)
-      return { ...r, routing: { ...r.routing, options } }
-    }))
+  // Grid mode lets you type a brand-new station name directly into the route.
+  // Without this, that name would only ever live in processflow_data — the
+  // Stations tab (and thus the engine, which reads stations_data for
+  // capacity/failure/repair config) would never know the station exists.
+  const ensureStationExists = (name: string) => {
+    const trimmed = name.trim()
+    if (!trimmed) return
+    setStationRows((rows) => {
+      if (rows.some((r) => r.name === trimmed)) return rows
+      return [...rows, {
+        name: trimmed, cfg: {
+          capacity: 1, shifts_per_day: 1, operator_per_station: 1,
+          'Failure rate': 0, 'Repair Time': 10, 'Setup time': 0,
+          'Buffer Capacity': 0, 'Buffer Unlimited': true,
+          'Buffer Discipline': 'FIFO', 'PM Schedule': 'Monthly',
+          'Rework Probability (%)': 0, 'Material Shortage Probability (%)': 0,
+        },
+      }]
+    })
+    setStationsDirty(true)
+  }
+  // Appending a station to the shared route makes every variant that used to
+  // match the (shorter) route fall out of Grid mode, since variantMatchesRoute
+  // requires an exact length/order match — those variants would silently
+  // vanish from the grid instead of gaining the new station. Extend each of
+  // them to include the new station (0 min, same as a brand-new grid variant)
+  // so they stay visible, matching the "extend, don't shrink" precedent used
+  // for variant1/variant2 earlier.
+  // Takes the route explicitly (rather than reading the sharedRoute closure)
+  // because callers invoke this right after setSharedRoute — React batches
+  // that update, so sharedRoute in the closure is still the OLD value at the
+  // point this runs. Reading it directly here silently used stale data and
+  // skipped variants that should have been extended.
+  const extendExistingVariantsToStation = (updatedRoute: string[], newStation: string) => {
+    const priorRoute = updatedRoute.filter((s) => s.trim() && s !== newStation)
+    const byVariant = new Map<string, FlowStepRow[]>()
+    for (const r of flowRows) {
+      if (!r.variant.trim()) continue
+      if (!byVariant.has(r.variant)) byVariant.set(r.variant, [])
+      byVariant.get(r.variant)!.push(r)
+    }
+    for (const [variant, rows] of byVariant) {
+      if (!variantMatchesRoute(rows, priorRoute)) continue
+      const times: Record<string, number> = {}
+      rows.forEach((r) => { times[r.resource] = r.duration })
+      times[newStation] = newStepTime(newStation)
+      applyGridRow(variant, times, updatedRoute.filter((s) => s.trim()))
+    }
+  }
+  const updateRouteStation = (idx: number, value: string) => {
+    // A station replaced inside a split keeps that place in the split.
+    const old = sharedRoute[idx]
+    if (old !== value && routeBranch[old] !== undefined) {
+      setRouteBranch((b) => {
+        const { [old]: branch, ...rest } = b
+        return value ? { ...rest, [value]: branch } : rest
+      })
+    }
+    setSharedRoute((route) => route.map((s, i) => (i === idx ? value : s)))
     setFlowDirty(true)
+  }
+  const removeRouteStation = (idx: number) => {
+    const removed = sharedRoute[idx]?.trim()
+    setSharedRoute((route) => route.filter((_, i) => i !== idx))
+    setFlowDirty(true)
+    if (!removed) return
+    setRouteBranch((b) => {
+      const { [removed]: _gone, ...rest } = b
+      return rest
+    })
+    // Removing a station from the shared route means "this station is gone
+    // from the process" — cascade the deletion everywhere it's referenced
+    // (every variant's flow rows, Grid or Detailed, plus the Stations tab
+    // entry itself), not just the route display. Otherwise Detailed mode and
+    // the Stations tab would silently keep stale references to a station the
+    // user just removed here.
+    setFlowRows((rows) => rows.filter((r) => r.resource !== removed))
+    setStationRows((rows) => rows.filter((r) => r.name !== removed))
+    setStationsDirty(true)
   }
 
   // ── Operators editing ─────────────────────────────────────────────────────
@@ -558,8 +807,17 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
     },
   })
   const updateQuantityRow = (i: number, patch: Partial<QuantityRow>) => {
+    const oldName = quantityRows[i]?.variant
     setQuantityRows((rows) => rows.map((r, ri) => (ri === i ? { ...r, ...patch } : r)))
     setQuantitiesDirty(true)
+    // Mirrors renameGridVariant's Process Flow -> Quantities sync (see there):
+    // Quantities and Process Flow each keep their own independent variant
+    // list, so a rename on either side has to be pushed into the other or
+    // they silently drift apart under the same variant's two different names.
+    if (patch.variant !== undefined && oldName && patch.variant !== oldName) {
+      setFlowRows((rows) => rows.map((r) => (r.variant === oldName ? { ...r, variant: patch.variant! } : r)))
+      setFlowDirty(true)
+    }
   }
   const addQuantityRow = () => {
     setQuantityRows((rows) => [...rows, { variant: '', quantity: 0, interval: null }])
@@ -570,19 +828,31 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
     setQuantitiesDirty(true)
   }
 
-  /** Station rows flattened to an array (not a Record) so the NAME itself is
-   * editable text like any other cell, including while typing a brand-new
-   * station name that doesn't match any key yet. */
-  interface StationRow { name: string; cfg: Record<string, any> }
-  const [stationRows, setStationRows] = useState<StationRow[]>(() =>
-    Object.entries(scenario.stations_data ?? {}).map(([name, cfg]) => ({ name, cfg: { ...cfg } }))
-  )
   const [stationsDirty, setStationsDirty] = useState(false)
   const [stationsSaved, setStationsSaved] = useState(false)
 
   // Live lookup used by the Setup Matrix datalist + other display code below —
   // reflects in-progress edits, not just the last-saved scenario.stations_data.
   const stations = Object.fromEntries(stationRows.map((r) => [r.name, r.cfg]))
+  // A Conveyor is not a station: its row in Stations/Process Flow stays in
+  // route order but is blank and locked; its own properties are edited in
+  // the Conveyors table instead.
+  const isConveyorCfg = (cfg: Record<string, any> | null | undefined) => cfg?.['Station Type'] === 'Conveyor'
+  // Speed (m/min); an older conveyor saved with Length + Transport Time
+  // instead gets it as Length / Transport Time.
+  const conveyorSpeedOf = (cfg: Record<string, any>): number | undefined =>
+    cfg['Conveyor Speed'] ?? ((cfg['Conveyor Length'] ?? 0) > 0 && (cfg['Transport Time'] ?? 0) > 0
+      ? cfg['Conveyor Length'] / cfg['Transport Time']
+      : undefined)
+  // Transport Time (min) = Length / Speed; undefined until both are > 0.
+  const conveyorTransportOf = (cfg: Record<string, any>): number | undefined => {
+    const length = cfg['Conveyor Length'] ?? 0
+    const speed = conveyorSpeedOf(cfg) ?? 0
+    return length > 0 && speed > 0 ? length / speed : undefined
+  }
+  const conveyorCapacityInvalid = stationRows.some((r) => isConveyorCfg(r.cfg)
+    && ((r.cfg['Conveyor Capacity'] ?? 1) < 1 || conveyorTransportOf(r.cfg) === undefined))
+  const lockedBlank = <Input disabled value="" className="h-8 text-sm w-20 disabled:bg-gray-50" />
 
   const saveStationsMutation = useMutation({
     mutationFn: (rows: StationRow[]) => {
@@ -609,23 +879,161 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
     setStationRows((rows) => rows.map((r, ri) => (ri === i ? { ...r, name } : r)))
     setStationsDirty(true)
   }
+  // Mirrors ensureStationExists' Process Flow -> Stations direction (see
+  // there): a station added on the Stations tab should show up as a route
+  // option in Process Flow's Grid mode too, not just live in stations_data
+  // with no way to route jobs through it without manually retyping the name.
+  // Fires on blur (final, committed name), not per keystroke, for the same
+  // reason ensureStationExists does.
+  // A brand-new station goes at the end of every product's route (before
+  // End) — Process Flow and the Canvas both draw the line from the route.
+  const addStationToRoute = (name: string, cfg: Record<string, any>) => {
+    if (!isRouteStationCfg(cfg)) return
+    appendStationToEveryRoute(name)
+  }
   const addStationRow = () => {
     setStationRows((rows) => [...rows, {
       name: '', cfg: {
         capacity: 1, shifts_per_day: 1, operator_per_station: 1,
         'Failure rate': 0, 'Repair Time': 10, 'Setup time': 0,
-        'Buffer Capacity': 0, 'Buffer Width': 0, 'Buffer Depth': 0, 'Buffer Height': 0,
-        'Buffer Count': 1,
+        'Buffer Capacity': 0, 'Buffer Unlimited': true,
         'Buffer Discipline': 'FIFO', 'PM Schedule': 'Monthly',
         'Rework Probability (%)': 0, 'Material Shortage Probability (%)': 0,
       },
     }])
     setStationsDirty(true)
   }
+  // Deleting a station removes it everywhere: the route of every product
+  // (so Process Flow and the Canvas), the Grid route, and the Setup Matrix.
   const deleteStationRow = (i: number) => {
+    const name = stationRows[i]?.name.trim()
     setStationRows((rows) => rows.filter((_, ri) => ri !== i))
     setStationsDirty(true)
+    if (!name) return
+    if (flowRows.some((r) => r.resource === name)) {
+      setFlowRows((rows) => rows.filter((r) => r.resource !== name))
+      setFlowDirty(true)
+    }
+    if (sharedRoute.includes(name)) {
+      setSharedRoute((route) => route.filter((s) => s !== name))
+      setFlowDirty(true)
+    }
+    setRouteBranch((b) => {
+      if (b[name] === undefined) return b
+      const { [name]: _gone, ...rest } = b
+      return rest
+    })
+    if (matrixRows.some((r) => r.station === name)) {
+      setMatrixRows((rows) => rows.filter((r) => r.station !== name))
+      setMatrixDirty(true)
+    }
   }
+
+  // Renaming a station renames it everywhere it is used, so the route still
+  // finds it: Process Flow rows, the Grid route, other stations' Exit
+  // Controller entries and Worker Controller link, and the Setup Matrix.
+  const nameAtFocus = useRef<string | null>(null)
+  const renameStationEverywhere = (oldName: string, newName: string) => {
+    setFlowRows((rows) => rows.map((r) => (r.resource !== oldName ? r : {
+      ...r,
+      resource: newName,
+      operation: r.operation === oldName ? newName : r.operation === `${oldName}_op` ? `${newName}_op` : r.operation,
+    })))
+    setSharedRoute((route) => route.map((s) => (s === oldName ? newName : s)))
+    setRouteBranch((b) => {
+      if (b[oldName] === undefined) return b
+      const { [oldName]: branch, ...rest } = b
+      return { ...rest, [newName]: branch }
+    })
+    const renameKey = (obj: unknown) => (obj && typeof obj === 'object' && oldName in obj
+      ? Object.fromEntries(Object.entries(obj).map(([k, v]) => [k === oldName ? newName : k, v]))
+      : obj)
+    setStationRows((rows) => rows.map((r) => ({
+      ...r,
+      cfg: {
+        ...r.cfg,
+        ...(r.cfg['Exit Priorities'] ? { 'Exit Priorities': renameKey(r.cfg['Exit Priorities']) } : {}),
+        ...(r.cfg['Exit Percentages'] ? { 'Exit Percentages': renameKey(r.cfg['Exit Percentages']) } : {}),
+        ...(r.cfg['Worker Controller'] === oldName ? { 'Worker Controller': newName } : {}),
+      },
+    })))
+    if (matrixRows.some((r) => r.station === oldName)) {
+      setMatrixRows((rows) => rows.map((r) => (r.station === oldName ? { ...r, station: newName } : r)))
+      setMatrixDirty(true)
+    }
+    setFlowDirty(true)
+  }
+
+  // Add a machine to a station's parallel group (the station starts one if
+  // it isn't in a group yet). The new machine is a copy of this one — same
+  // settings, and in Process Flow the same time for every variant — saved
+  // as a station of its own, so any of it can then be changed.
+  const isMachineCfg = (cfg: Record<string, any>) =>
+    !['Conveyor', 'Connector', 'Buffer', 'Worker', 'Worker Controller', 'Workplace', 'Source', 'Drain'].includes(cfg['Station Type'])
+  const addMachineToGroup = (i: number) => {
+    const src = stationRows[i]
+    const srcName = src.name.trim()
+    if (!srcName) return
+    const group: string = src.cfg['Parallel Group'] || srcName
+    const members = new Set(stationRows.filter((r) => r.cfg['Parallel Group'] === group).map((r) => r.name))
+    members.add(srcName)
+    const taken = new Set(stationRows.map((r) => r.name))
+    let k = members.size + 1
+    while (taken.has(`${group} #${k}`)) k += 1
+    const newName = `${group} #${k}`
+    setStationRows((rows) => [
+      ...rows.map((r, ri) => (ri === i ? { ...r, cfg: { ...r.cfg, 'Parallel Group': group } } : r)),
+      { name: newName, cfg: { ...src.cfg, 'Parallel Group': group } },
+    ])
+    setStationsDirty(true)
+
+    // A group's machines are one stop: consecutive rows sharing a branch
+    // number, like a split. The new machine's row goes right after the
+    // group's last machine, in every variant that visits the group.
+    const newBranch = Math.max(0, ...flowRows.map((r) => r.branch ?? 0)) + 1
+    setFlowRows((rows) => {
+      const out: FlowStepRow[] = []
+      rows.forEach((r, idx) => {
+        out.push(r.resource === srcName && r.branch === undefined ? { ...r, branch: newBranch } : r)
+        const next = rows[idx + 1]
+        const lastOfStop = members.has(r.resource)
+          && !(next && next.variant === r.variant && members.has(next.resource) && next.branch === r.branch)
+        if (!lastOfStop) return
+        const from = rows.find((x) => x.variant === r.variant && x.resource === srcName) ?? r
+        out.push({
+          variant: r.variant,
+          operation: from.operation === srcName ? newName : from.operation === `${srcName}_op` ? `${newName}_op` : newName,
+          resource: newName,
+          duration: from.duration,
+          branch: from.branch ?? newBranch,
+        })
+      })
+      return out
+    })
+    if (sharedRoute.some((s) => members.has(s))) {
+      const branch = routeBranch[srcName] ?? newBranch
+      setSharedRoute((route) => {
+        const last = Math.max(...route.map((s, ri) => (members.has(s) ? ri : -1)))
+        return [...route.slice(0, last + 1), newName, ...route.slice(last + 1)]
+      })
+      setRouteBranch((b) => ({ ...b, [srcName]: branch, [newName]: branch }))
+    }
+    setFlowDirty(true)
+  }
+
+  // Stations tab order: a group's machines are listed together, where its
+  // first machine is.
+  const stationOrder = (() => {
+    const out: number[] = []
+    const done = new Set<number>()
+    stationRows.forEach((r, i) => {
+      if (done.has(i)) return
+      const g = r.cfg['Parallel Group']
+      const ids = g ? stationRows.flatMap((x, xi) => (x.cfg['Parallel Group'] === g ? [xi] : [])) : [i]
+      for (const x of ids) { done.add(x); out.push(x) }
+    })
+    return out
+  })()
 
   const [matrixRows, setMatrixRows] = useState<SetupMatrixRow[]>(() => flattenSetupMatrix(scenario.setup_matrix ?? {}))
   const [matrixDirty, setMatrixDirty] = useState(false)
@@ -682,7 +1090,7 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
             <div>
               <h2 className="text-base font-bold text-gray-900">{scenario.name}</h2>
               <p className="text-xs text-gray-400 mt-0.5">
-                {Object.keys(stations).length} stations · {Object.keys(scenario.processflow_data ?? {}).length} variants · {Object.keys(operators).length} operators
+                {Object.values(stations).filter((c: any) => c['Station Type'] !== 'Source' && c['Station Type'] !== 'Drain').length} stations · {Object.keys(scenario.processflow_data ?? {}).length} variants · {Object.keys(operators).length} operators
               </p>
             </div>
           </div>
@@ -718,64 +1126,101 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-gray-100">
-                  {['Station', 'Capacity', 'Shifts/Day', 'Operators', 'Failure Rate (%)', 'Buffer Quantity', 'Buffer X', 'Buffer Y', 'Buffer Z', 'No. of Buffers', 'Buffer Order', 'PM Schedule', 'Rework %', 'Material Shortage %', ''].map(h => (
+                  {['Station', 'Capacity', 'Shifts/Day', 'Operators', 'Buffer Quantity', 'Unlimited Buffer', 'Buffer Order', 'PM Schedule', 'Rework %', 'Material Shortage %', ''].map(h => (
                     <th key={h} className="text-left text-[10px] font-bold text-gray-400 uppercase tracking-widest pb-3 pr-4 whitespace-nowrap">{h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {stationRows.map((row, i) => {
+                {stationOrder.map((i, pos) => {
+                  const row = stationRows[i]
                   const cfg = row.cfg
+                  // Start (Source) and End (Drain) are pure routing markers
+                  // Canvas writes into stations_data so the process flow has
+                  // somewhere to begin/end — they take no capacity, no
+                  // process time, and aren't a real station a user would
+                  // configure, so they're hidden here. Index i is kept as
+                  // the row's real position in stationRows (not
+                  // re-numbered), since updateStationField/updateStationName
+                  // /delete below all address rows by that index.
+                  if (cfg['Station Type'] === 'Source' || cfg['Station Type'] === 'Drain') return null
                   const num = (field: string) => (
                     <Input
                       type="number"
                       value={cfg[field] ?? 0}
+                      onFocus={(e) => e.target.select()}
                       onChange={(e) => updateStationField(i, field, Number(e.target.value))}
                       className="h-8 text-sm w-20"
                     />
                   )
                   return (
-                    <tr key={i} className={`border-b border-gray-50 ${i % 2 === 0 ? '' : 'bg-gray-50/50'}`}>
+                    <tr key={i} className={`border-b border-gray-50 ${pos % 2 === 0 ? '' : 'bg-gray-50/50'}`}>
                       <td className="py-1.5 pr-4">
                         <Input
                           value={row.name}
                           onChange={(e) => updateStationName(i, e.target.value)}
+                          onFocus={() => { nameAtFocus.current = row.name }}
+                          onBlur={(e) => {
+                            const oldName = nameAtFocus.current?.trim()
+                            const newName = e.target.value.trim()
+                            nameAtFocus.current = null
+                            // A rename (not a brand-new station): follow it everywhere.
+                            if (oldName && newName && oldName !== newName
+                              && !stationRows.some((r, ri) => ri !== i && r.name.trim() === newName)) {
+                              renameStationEverywhere(oldName, newName)
+                              return
+                            }
+                            // A brand-new station (its name typed for the first time).
+                            if (!oldName && newName) addStationToRoute(newName, cfg)
+                          }}
                           placeholder="Station name"
                           className="h-8 text-sm w-36 font-medium"
                         />
+                        {cfg['Parallel Group'] && (
+                          <p className="text-[10px] text-cyan-700 mt-1 whitespace-nowrap">
+                            Machine of group {cfg['Parallel Group']}
+                          </p>
+                        )}
+                        {isMachineCfg(cfg) && row.name.trim() && (
+                          <button
+                            onClick={() => addMachineToGroup(i)}
+                            className="flex items-center gap-1 text-[10px] font-medium text-blue-600 hover:text-blue-700 mt-1 whitespace-nowrap"
+                          >
+                            <PlusCircle className="h-3 w-3" />
+                            Add machine
+                          </button>
+                        )}
                       </td>
+                      {isConveyorCfg(cfg) ? (
+                        // 9 locked blank cells: Capacity … Material Shortage %.
+                        Array.from({ length: 9 }, (_, c) => (
+                          <td key={c} className="py-1.5 pr-4">{lockedBlank}</td>
+                        ))
+                      ) : (<>
                       <td className="py-1.5 pr-4">{num('capacity')}</td>
                       <td className="py-1.5 pr-4">{num('shifts_per_day')}</td>
                       <td className="py-1.5 pr-4">{num('operator_per_station')}</td>
                       <td className="py-1.5 pr-4">
-                        {/* Stored/sent to the engine as a 0-1 daily failure
-                            probability (backend/engine/machine.py requires
-                            0 <= failure_rate <= 1), but shown/typed here as a
-                            0-100 percentage since that's what "5% failure
-                            rate" actually means to a user. */}
-                        <div className="relative w-24">
-                          <Input
-                            type="number"
-                            min={0}
-                            max={100}
-                            value={Math.round(((cfg['Failure rate'] ?? 0) as number) * 1000) / 10}
-                            onChange={(e) => updateStationField(i, 'Failure rate', Math.max(0, Math.min(100, Number(e.target.value))) / 100)}
-                            className="h-8 text-sm w-24 pr-5"
-                          />
-                          <span className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-gray-400 pointer-events-none">%</span>
-                        </div>
-                      </td>
-                      <td className="py-1.5 pr-4">{num('Buffer Capacity')}</td>
-                      <td className="py-1.5 pr-4">{num('Buffer Width')}</td>
-                      <td className="py-1.5 pr-4">{num('Buffer Depth')}</td>
-                      <td className="py-1.5 pr-4">{num('Buffer Height')}</td>
-                      <td className="py-1.5 pr-4">
                         <Input
                           type="number"
-                          min={1}
-                          value={cfg['Buffer Count'] ?? 1}
-                          onChange={(e) => updateStationField(i, 'Buffer Count', Number(e.target.value))}
-                          className="h-8 text-sm w-20"
+                          disabled={!!cfg['Buffer Unlimited']}
+                          value={cfg['Buffer Capacity'] ?? 0}
+                          onFocus={(e) => e.target.select()}
+                          onChange={(e) => updateStationField(i, 'Buffer Capacity', Number(e.target.value))}
+                          className="h-8 text-sm w-20 disabled:bg-gray-50 disabled:text-gray-400"
+                        />
+                      </td>
+                      <td className="py-1.5 pr-4 text-center">
+                        {/* Buffer Capacity=0 now means literally zero room
+                            (strict lockstep) to match Failure Rate/Repair
+                            Time's plain-number convention. "Unlimited" needs
+                            its own explicit flag instead of overloading 0 —
+                            see backend Buffer Capacity gate in sim_core.py. */}
+                        <input
+                          type="checkbox"
+                          checked={!!cfg['Buffer Unlimited']}
+                          onChange={(e) => updateStationField(i, 'Buffer Unlimited', e.target.checked)}
+                          className="h-4 w-4"
                         />
                       </td>
                       <td className="py-1.5 pr-4">
@@ -801,6 +1246,7 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                       </td>
                       <td className="py-1.5 pr-4">{num('Rework Probability (%)')}</td>
                       <td className="py-1.5 pr-4">{num('Material Shortage Probability (%)')}</td>
+                      </>)}
                       <td className="py-1.5 pr-4">
                         <button
                           onClick={() => deleteStationRow(i)}
@@ -813,9 +1259,9 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                     </tr>
                   )
                 })}
-                {stationRows.length === 0 && (
+                {stationRows.every((r) => r.cfg['Station Type'] === 'Source' || r.cfg['Station Type'] === 'Drain') && (
                   <tr>
-                    <td colSpan={15} className="py-6 text-center text-gray-400 text-sm">
+                    <td colSpan={11} className="py-6 text-center text-gray-400 text-sm">
                       No stations yet — add one below.
                     </td>
                   </tr>
@@ -836,7 +1282,7 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                 {(stationsSaved || matrixSaved || flowSaved || operatorsSaved || quantitiesSaved) && <span className="text-xs text-green-600 font-medium">Saved</span>}
                 <Button
                   size="sm"
-                  disabled={!anyDirty || anySaving}
+                  disabled={!anyDirty || anySaving || conveyorCapacityInvalid}
                   onClick={saveAllDirty}
                   className="bg-blue-600 hover:bg-blue-700"
                 >
@@ -845,6 +1291,81 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                 </Button>
               </div>
             </div>
+
+              {/* Conveyors — a conveyor is not a station, so its own properties
+                  live here (its Stations row above is blank and locked).
+                  Saved with the Stations tab, on the same stations_data entry
+                  the Canvas writes. */}
+              <div className="mt-8 pt-6 border-t border-gray-100">
+                <h3 className="text-sm font-bold text-gray-700 mb-1">Conveyors</h3>
+                <p className="text-xs text-gray-400 mb-4">
+                  Belts that move jobs between stations. Capacity is how many jobs the belt holds at once.
+                </p>
+                <div className="overflow-x-auto [color-scheme:light]">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-gray-100">
+                        {['Conveyor', 'Length (m)', 'Speed (m/min)', 'Transport Time (min)', 'Breadth (m)', 'Height (m)', 'Capacity', 'Shifts/Day'].map(h => (
+                          <th key={h} className="text-left text-[10px] font-bold text-gray-400 uppercase tracking-widest pb-3 pr-4 whitespace-nowrap">{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {stationRows.map((row, i) => {
+                        if (!isConveyorCfg(row.cfg)) return null
+                        const speed = conveyorSpeedOf(row.cfg)
+                        const transport = conveyorTransportOf(row.cfg)
+                        const num = (field: string, fallback = 0, value?: number) => (
+                          <Input
+                            type="number"
+                            value={value ?? row.cfg[field] ?? fallback}
+                            onFocus={(e) => e.target.select()}
+                            onChange={(e) => {
+                              // An older conveyor saved with Length + Transport
+                              // Time: fix its Speed first (Length / Transport
+                              // Time), so the time is then Length / Speed.
+                              if (row.cfg['Conveyor Speed'] === undefined && speed !== undefined && field !== 'Conveyor Speed') {
+                                updateStationField(i, 'Conveyor Speed', speed)
+                              }
+                              if (row.cfg['Transport Time'] !== undefined) {
+                                updateStationField(i, 'Transport Time', undefined)
+                              }
+                              updateStationField(i, field, Number(e.target.value))
+                            }}
+                            className="h-8 text-sm w-20"
+                          />
+                        )
+                        return (
+                          <tr key={i} className="border-b border-gray-50">
+                            <td className="py-1.5 pr-4 font-medium text-gray-800 whitespace-nowrap">{row.name}</td>
+                            <td className="py-1.5 pr-4">{num('Conveyor Length')}</td>
+                            <td className="py-1.5 pr-4">{num('Conveyor Speed', 0, speed)}</td>
+                            <td className="py-1.5 pr-4">
+                              <Input disabled value={transport !== undefined ? String(Math.round(transport * 10000) / 10000) : '—'} className="h-8 text-sm w-20 disabled:bg-gray-50" />
+                            </td>
+                            <td className="py-1.5 pr-4">{num('Conveyor Width')}</td>
+                            <td className="py-1.5 pr-4">{num('Conveyor Height')}</td>
+                            <td className="py-1.5 pr-4">{num('Conveyor Capacity', 1)}</td>
+                            <td className="py-1.5 pr-4">{num('shifts_per_day')}</td>
+                          </tr>
+                        )
+                      })}
+                      {!stationRows.some((r) => isConveyorCfg(r.cfg)) && (
+                        <tr>
+                          <td colSpan={8} className="py-6 text-center text-gray-400 text-sm">
+                            No conveyors in this scenario — add one on the Canvas.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+                {conveyorCapacityInvalid && (
+                  <p className="text-xs text-amber-600 mt-2">
+                    Conveyor length and speed must be more than 0 and capacity 1 or more — the scenario can't be saved until they are.
+                  </p>
+                )}
+              </div>
 
               {/* Setup Matrix editor — lives directly below Stations, since it's
                   per-station changeover data, not a separate top-level concept. */}
@@ -894,6 +1415,7 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                           <Input
                             type="number"
                             value={row.setupTime}
+                            onFocus={(e) => e.target.select()}
                             onChange={(e) => updateRow(i, { setupTime: Number(e.target.value) })}
                             className="h-8 text-sm w-28"
                           />
@@ -934,7 +1456,7 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                     {(stationsSaved || matrixSaved || flowSaved || operatorsSaved || quantitiesSaved) && <span className="text-xs text-green-600 font-medium">Saved</span>}
                     <Button
                       size="sm"
-                      disabled={!anyDirty || anySaving}
+                      disabled={!anyDirty || anySaving || conveyorCapacityInvalid}
                       onClick={saveAllDirty}
                       className="bg-blue-600 hover:bg-blue-700"
                     >
@@ -950,11 +1472,234 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
           {/* Process Flow tab */}
           {tab === 'processflow' && (
             <div>
+              {/* Stations in the list that no product's route uses — the
+                  engine and the Canvas only ever see the route. */}
+              {stationRows
+                .filter((r) => r.name.trim() && isRouteStationCfg(r.cfg) && !flowRows.some((f) => f.resource === r.name.trim()))
+                .map((r) => (
+                  <div key={r.name} className="flex items-center justify-between gap-3 mb-2 text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2">
+                    <span><span className="font-semibold">{r.name}</span> is in the station list but not on the route.</span>
+                    <button
+                      onClick={() => appendStationToEveryRoute(r.name)}
+                      className="flex items-center gap-1 font-semibold text-blue-600 hover:text-blue-700 whitespace-nowrap"
+                    >
+                      <PlusCircle className="h-3.5 w-3.5" />
+                      Add to end of route
+                    </button>
+                  </div>
+                ))}
+              <div className="flex items-center gap-1 mb-4 bg-gray-100 rounded-lg p-1 w-fit">
+                <button
+                  onClick={() => setFlowViewMode('grid')}
+                  className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors ${flowViewMode === 'grid' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                >
+                  Grid mode
+                </button>
+                <button
+                  onClick={() => setFlowViewMode('detailed')}
+                  className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors ${flowViewMode === 'detailed' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                >
+                  Detailed mode
+                </button>
+              </div>
+
+              {flowViewMode === 'grid' && (
+                <div className="mb-6">
+                  <p className="text-xs text-gray-400 mb-2">
+                    Define the shared route once, then just fill in Process Time per variant. Only variants that follow this exact route (same stations, same order, same splits) show up here.
+                    {Object.keys(routeBranch).length > 0 && ' [ A | B ] = a split: each job goes to only one of them, picked by the Exit Controller of the station before. Group ( A | B ) = machines of one parallel group, each with its own time.'}
+                  </p>
+                  <div className="flex items-center gap-2 flex-wrap mb-4">
+                    {sharedRoute.map((station, idx) => {
+                      const isKnownStation = stationRows.some((r) => r.name === station)
+                      const showFreeText = routeStationFreeText.has(idx) || (station.trim() !== '' && !isKnownStation)
+                      // A split's stations are drawn as [ A | B | C ].
+                      const branch = routeBranch[station]
+                      const sameSplitAsPrev = branch !== undefined && idx > 0 && routeBranch[sharedRoute[idx - 1]] === branch
+                      const sameSplitAsNext = branch !== undefined && idx + 1 < sharedRoute.length && routeBranch[sharedRoute[idx + 1]] === branch
+                      // A stop whose stations are all machines of one parallel group.
+                      const routeGroup = branch !== undefined
+                        ? stopParallelGroup(sharedRoute.filter((s) => routeBranch[s] === branch))
+                        : undefined
+                      return (
+                        <div key={idx} className="flex items-center gap-1">
+                          {idx > 0 && (
+                            <span className="text-gray-300 text-sm">{sameSplitAsPrev ? '|' : '→'}</span>
+                          )}
+                          {routeGroup && !sameSplitAsPrev && <span className="text-xs font-semibold text-cyan-700">{routeGroup}</span>}
+                          {branch !== undefined && !sameSplitAsPrev && <span className="text-blue-500 text-lg leading-none">{routeGroup ? '(' : '['}</span>}
+                          {showFreeText ? (
+                            <Input
+                              value={station}
+                              onChange={(e) => updateRouteStation(idx, e.target.value)}
+                              onBlur={(e) => {
+                                ensureStationExists(e.target.value)
+                                const trimmed = e.target.value.trim()
+                                if (trimmed) {
+                                  const updatedRoute = sharedRoute.map((s, i) => (i === idx ? trimmed : s))
+                                  extendExistingVariantsToStation(updatedRoute, trimmed)
+                                }
+                              }}
+                              placeholder="Station name"
+                              className="h-8 text-sm w-32"
+                              autoFocus
+                            />
+                          ) : (
+                            <select
+                              value={station}
+                              onChange={(e) => {
+                                if (e.target.value === '__new__') {
+                                  setRouteStationFreeText((set) => new Set(set).add(idx))
+                                  updateRouteStation(idx, '')
+                                  return
+                                }
+                                updateRouteStation(idx, e.target.value)
+                                if (e.target.value) {
+                                  const updatedRoute = sharedRoute.map((s, i) => (i === idx ? e.target.value : s))
+                                  extendExistingVariantsToStation(updatedRoute, e.target.value)
+                                }
+                              }}
+                              className="h-8 text-sm text-gray-800 bg-white border border-gray-200 rounded-md px-1.5 w-32"
+                            >
+                              <option value="">Select station</option>
+                              {stationRows
+                                .filter((r) => r.cfg['Station Type'] !== 'Source' && r.cfg['Station Type'] !== 'Drain')
+                                .map((r) => (
+                                  <option key={r.name} value={r.name}>{r.name}</option>
+                                ))}
+                              <option value="__new__">+ New station...</option>
+                            </select>
+                          )}
+                          <button
+                            onClick={() => removeRouteStation(idx)}
+                            className="text-gray-300 hover:text-red-500"
+                            aria-label="Remove station from route"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                          {branch !== undefined && !sameSplitAsNext && <span className="text-blue-500 text-lg leading-none">{routeGroup ? ')' : ']'}</span>}
+                        </div>
+                      )
+                    })}
+                    <button
+                      onClick={addRouteStation}
+                      className="flex items-center gap-1 text-xs font-medium text-blue-600 hover:text-blue-700"
+                    >
+                      <PlusCircle className="h-3.5 w-3.5" />
+                      Add station to route
+                    </button>
+                  </div>
+
+                  {sharedRoute.length > 0 && sharedRoute.every((s) => s.trim()) && (
+                    <div className="overflow-x-auto [color-scheme:light]">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="border-b border-gray-100">
+                            <th className="text-left text-[10px] font-bold text-gray-400 uppercase tracking-widest pb-3 pr-4">Variant</th>
+                            {sharedRoute.map((station) => (
+                              <th key={station} className="text-left text-[10px] font-bold text-gray-400 uppercase tracking-widest pb-3 pr-4 whitespace-nowrap align-bottom">
+                                {routeBranch[station] !== undefined && (() => {
+                                  const g = stopParallelGroup(sharedRoute.filter((s) => routeBranch[s] === routeBranch[station]))
+                                  return g
+                                    ? <span className="block text-cyan-700 normal-case tracking-normal font-semibold">{g} · machine</span>
+                                    : <span className="block text-blue-500 normal-case tracking-normal font-semibold">Split path</span>
+                                })()}
+                                {station} (min)
+                              </th>
+                            ))}
+                            <th></th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {gridRows.map((g, gIdx) => (
+                            <tr key={gIdx} className="border-b border-gray-50">
+                              <td className="py-1.5 pr-4">
+                                <Input
+                                  value={g.variant}
+                                  onChange={(e) => renameGridVariant(g.variant, e.target.value)}
+                                  className="h-8 text-sm w-28 font-medium"
+                                />
+                              </td>
+                              {sharedRoute.map((station) => isConveyorCfg(stations[station]) ? (
+                                <td key={station} className="py-1.5 pr-4">{lockedBlank}</td>
+                              ) : (
+                                <td key={station} className="py-1.5 pr-4">
+                                  <Input
+                                    type="number"
+                                    value={g.times[station] ?? 0}
+                                    onFocus={(e) => e.target.select()}
+                                    onChange={(e) => updateGridCell(g.variant, station, Number(e.target.value))}
+                                    className="h-8 text-sm w-24"
+                                  />
+                                </td>
+                              ))}
+                              <td className="py-1.5 pr-4">
+                                <button
+                                  onClick={() => deleteGridVariant(g.variant)}
+                                  className="text-gray-300 hover:text-red-500"
+                                  aria-label="Delete variant"
+                                >
+                                  <Trash2 className="h-4 w-4" />
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                          {gridRows.length === 0 && (
+                            <tr>
+                              <td colSpan={sharedRoute.length + 2} className="py-6 text-center text-gray-400 text-sm">
+                                No variants use this route yet — add one below.
+                              </td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                      <button
+                        onClick={addGridVariant}
+                        className="flex items-center gap-1.5 text-sm font-medium text-blue-600 hover:text-blue-700 mt-3"
+                      >
+                        <PlusCircle className="h-4 w-4" />
+                        Add variant
+                      </button>
+                    </div>
+                  )}
+
+                  {excludedVariants.length > 0 && (
+                    <p className="text-xs text-amber-600 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2 mt-4">
+                      {excludedVariants.length} variant{excludedVariants.length > 1 ? 's' : ''} use{excludedVariants.length > 1 ? '' : 's'} a custom route ({excludedVariants.join(', ')}) — edit {excludedVariants.length > 1 ? 'them' : 'it'} in Detailed mode.
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {flowViewMode === 'detailed' && flowHasSplit && (
+                // Route with its splits: [ A | B ] means each job goes to
+                // only one of them, picked by the Exit Controller.
+                <div className="mb-4 space-y-1">
+                  {[...flowRouteByVariant].map(([variant, route]) => (
+                    <p key={variant} className="text-xs text-gray-600">
+                      <span className="font-semibold text-gray-800">{variant || 'Variant'}:</span>{' '}
+                      {route.join(' → ')}
+                    </p>
+                  ))}
+                  {flowHasRealSplit && (
+                    <p className="text-[10px] text-gray-400">
+                      [ A | B ] = each job goes to only one of them, picked by the Exit Controller of the station before.
+                    </p>
+                  )}
+                  {flowHasGroup && (
+                    <p className="text-[10px] text-gray-400">
+                      Group ( A | B ) = machines of one parallel group: one shared waiting line, each job goes to one machine. Each machine has its own row below, with its own time and settings.
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {flowViewMode === 'detailed' && (
               <div className="overflow-x-auto [color-scheme:light] [&::-webkit-scrollbar]:h-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-blue-200 [&::-webkit-scrollbar-thumb]:rounded-full">
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-gray-100">
-                      {['Variant', 'Operation', 'Station / Resource', 'Exit Controller (branching)', 'Process Time (min)', 'Station Availability (%)', 'Repair Time', 'Setup Time', ''].map(h => (
+                      {['Variant', 'Operation', 'Station / Resource', 'Process Time (min)', 'Enable Failures', 'Station Availability (%)', 'Setup Time', 'MTTR', 'Failure Policy', ''].map(h => (
                         <th key={h} className="text-left text-[10px] font-bold text-gray-400 uppercase tracking-widest pb-3 pr-4 whitespace-nowrap">{h}</th>
                       ))}
                     </tr>
@@ -1001,104 +1746,26 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                         <td className="py-1.5 pr-4">
                           <Input
                             value={row.resource}
-                            disabled={row.routing != null}
                             onChange={(e) => updateFlowRow(i, { resource: e.target.value })}
                             placeholder="Station"
-                            className="h-8 text-sm w-32 disabled:bg-gray-50 disabled:text-gray-400"
+                            className="h-8 text-sm w-32"
                           />
-                          <label className="flex items-center gap-1.5 mt-1 text-[11px] text-gray-400">
-                            <input
-                              type="checkbox"
-                              checked={row.routing != null}
-                              onChange={(e) => toggleFlowRoutingMode(i, e.target.checked)}
-                            />
-                            Branching
-                          </label>
-                        </td>
-                        <td className="py-1.5 pr-4">
-                          {row.routing ? (
-                            <div className="w-72 bg-gray-50 border border-gray-200 rounded-lg p-2.5 space-y-2">
-                              <select
-                                value={row.routing.mode}
-                                onChange={(e) => updateFlowRouting(i, { mode: e.target.value as FlowRouting['mode'] })}
-                                className="w-full h-7 text-xs text-gray-800 bg-white border border-gray-200 rounded-md px-1.5"
-                              >
-                                <option value="round_robin">Round-robin</option>
-                                <option value="percentage">Percentage split</option>
-                                <option value="condition">Condition (by variant)</option>
-                                <option value="shortest_queue">Shortest queue</option>
-                              </select>
-
-                              <div className="space-y-1">
-                                {row.routing.options.map((opt, oi) => (
-                                  <div key={oi} className="flex items-center gap-1.5">
-                                    <Input
-                                      value={opt}
-                                      onChange={(e) => updateFlowRoutingOption(i, oi, e.target.value)}
-                                      placeholder="Station name"
-                                      className="h-7 text-xs flex-1"
-                                    />
-                                    {row.routing!.mode === 'percentage' && (
-                                      <Input
-                                        type="number"
-                                        value={row.routing!.weights[opt] ?? ''}
-                                        onChange={(e) => updateFlowRouting(i, { weights: { ...row.routing!.weights, [opt]: Number(e.target.value) } })}
-                                        placeholder="%"
-                                        className="h-7 w-16 text-xs"
-                                      />
-                                    )}
-                                    {row.routing!.mode === 'condition' && (
-                                      <Input
-                                        value={row.routing!.rules.find((r) => r.resource === opt)?.variantType ?? ''}
-                                        onChange={(e) => {
-                                          const others = row.routing!.rules.filter((r) => r.resource !== opt)
-                                          const value = e.target.value.trim()
-                                          updateFlowRouting(i, { rules: value ? [...others, { variantType: value, resource: opt }] : others })
-                                        }}
-                                        placeholder="Variant"
-                                        className="h-7 w-20 text-xs"
-                                      />
-                                    )}
-                                    <button
-                                      onClick={() => deleteFlowRoutingOption(i, oi)}
-                                      className="text-gray-300 hover:text-red-500 shrink-0"
-                                      aria-label="Remove option"
-                                    >
-                                      <Trash2 className="h-3.5 w-3.5" />
-                                    </button>
-                                  </div>
-                                ))}
-                              </div>
-                              <button
-                                onClick={() => addFlowRoutingOption(i)}
-                                className="text-[11px] font-medium text-blue-600 hover:text-blue-700"
-                              >
-                                + Add option
-                              </button>
-
-                              {row.routing.mode === 'condition' && (
-                                <div>
-                                  <label className="text-[10px] text-gray-400 uppercase tracking-wide">Default (no match)</label>
-                                  <select
-                                    value={row.routing.default}
-                                    onChange={(e) => updateFlowRouting(i, { default: e.target.value })}
-                                    className="w-full h-7 text-xs text-gray-800 bg-white border border-gray-200 rounded-md px-1.5 mt-1"
-                                  >
-                                    {row.routing.options.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
-                                  </select>
-                                </div>
-                              )}
-                              {row.routing.mode === 'shortest_queue' && (
-                                <p className="text-[10px] text-gray-400">Sends each job to whichever option currently has the least work waiting.</p>
-                              )}
-                              {row.routing.mode === 'round_robin' && (
-                                <p className="text-[10px] text-gray-400">Cycles through the options in order.</p>
-                              )}
-                            </div>
+                          {flowSplitPlace[i] && (flowSplitPlace[i].group ? (
+                            <p className="text-[10px] text-cyan-700 mt-1 whitespace-nowrap">
+                              {flowSplitPlace[i].group} · machine {flowSplitPlace[i].pos} of {flowSplitPlace[i].count}
+                            </p>
                           ) : (
-                            <span className="text-gray-300 text-xs">—</span>
-                          )}
+                            <p className="text-[10px] text-blue-600 mt-1 whitespace-nowrap">
+                              Split · path {flowSplitPlace[i].pos} of {flowSplitPlace[i].count}
+                            </p>
+                          ))}
                         </td>
+                        {isConveyorCfg(stationCfg) ? (
+                          // Process Time … Failure Policy: 6 locked blank cells.
+                          Array.from({ length: 6 }, (_, c) => (
+                            <td key={c} className="py-1.5 pr-4">{lockedBlank}</td>
+                          ))
+                        ) : (<>
                         <td className="py-1.5 pr-4">
                           <Input
                             type="number"
@@ -1107,16 +1774,32 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                             className="h-8 text-sm w-24"
                           />
                         </td>
+                        <td className="py-1.5 pr-4 text-center">
+                          {/* PDF section 13's panel: an explicit on/off switch
+                              for this station's whole failure/PM simulation —
+                              passed straight to the engine as "Enable
+                              Failures" (sim_core.py's _init_resources).
+                              Absent/unset defaults to true (failures on),
+                              unchanged behavior for every existing scenario —
+                              only an explicit uncheck here disables it. */}
+                          <input
+                            type="checkbox"
+                            disabled={stationIdx < 0}
+                            checked={stationCfg ? stationCfg['Enable Failures'] !== false : true}
+                            onChange={(e) => updateStationField(stationIdx, 'Enable Failures', e.target.checked)}
+                            className="h-4 w-4"
+                          />
+                        </td>
                         <td className="py-1.5 pr-4">
-                          {stationCfg ? (
+                          {stationCfg && stationCfg['Enable Failures'] !== false ? (
                             <div className="relative w-24">
                               <AvailabilityPctField
                                 stationKey={row.resource}
-                                value={Math.round(estimateAvailabilityPct(stationCfg['Failure rate'], stationCfg['Repair Time']) * 100) / 100}
+                                value={Math.round(estimateAvailabilityPct(stationCfg['Failure rate'], stationCfg['Repair Time'], stationCfg['MTBF']) * 100) / 100}
                                 onCommit={(pct) => updateStationField(
                                   stationIdx,
-                                  'Failure rate',
-                                  availabilityPctToFailureRate(pct, stationCfg['Repair Time']),
+                                  'MTBF',
+                                  availabilityPctToMtbf(pct, stationCfg['Repair Time']),
                                 )}
                               />
                               <span className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-gray-400 pointer-events-none">%</span>
@@ -1125,8 +1808,62 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                             <span className="text-gray-300 text-xs">—</span>
                           )}
                         </td>
-                        <td className="py-1.5 pr-4">{stationNum('Repair Time')}</td>
                         <td className="py-1.5 pr-4">{stationNum('Setup time')}</td>
+                        <td className="py-1.5 pr-4">
+                          {/* Changing MTTR alone must NOT silently distort the
+                              Availability % already set — MTBF is a frozen
+                              value computed at the moment Availability % was
+                              last typed (see availabilityPctToMtbf below), so
+                              naively only updating Repair Time here would
+                              leave that stale MTBF paired with a new MTTR,
+                              silently changing the displayed Availability %
+                              with no indication anything shifted (e.g. typing
+                              85%+MTTR=2 saves MTBF=11.33; later changing MTTR
+                              to 1 alone would silently show ~91.9%, not 85%).
+                              Re-deriving MTBF from the CURRENTLY DISPLAYED
+                              Availability % whenever MTTR changes keeps that
+                              % fixed — the PDF's own "Availability+MTTR is
+                              the stable pair" model — treating MTTR edits as
+                              "same reliability, different repair time"
+                              instead of "same breakdown timing, new %". */}
+                          <Input
+                            type="number"
+                            disabled={stationIdx < 0 || (stationCfg ? stationCfg['Enable Failures'] === false : false)}
+                            value={stationCfg ? (stationCfg['Repair Time'] ?? 0) : ''}
+                            placeholder={stationIdx < 0 ? '—' : undefined}
+                            onFocus={(e) => e.target.select()}
+                            onChange={(e) => {
+                              const newMttr = Number(e.target.value)
+                              if (stationCfg && stationCfg['MTBF'] != null && (stationCfg['MTBF'] as number) > 0) {
+                                const currentPct = estimateAvailabilityPct(
+                                  stationCfg['Failure rate'], stationCfg['Repair Time'], stationCfg['MTBF'],
+                                )
+                                updateStationField(stationIdx, 'MTBF', availabilityPctToMtbf(currentPct, newMttr))
+                              }
+                              updateStationField(stationIdx, 'Repair Time', newMttr)
+                            }}
+                            className="h-8 text-sm w-20 disabled:bg-gray-50 disabled:text-gray-400"
+                          />
+                        </td>
+                        <td className="py-1.5 pr-4">
+                          {/* What happens to a part still in progress when this
+                              station's machine fails mid-operation — passed
+                              straight to the engine as "Failure Policy"
+                              (backend/engine/machine.py's FailurePolicy enum).
+                              Unset/omitted defaults to Resume, same as today. */}
+                          <select
+                            disabled={stationIdx < 0 || (stationCfg ? stationCfg['Enable Failures'] === false : false)}
+                            value={stationCfg ? (stationCfg['Failure Policy'] || 'resume') : 'resume'}
+                            onChange={(e) => updateStationField(stationIdx, 'Failure Policy', e.target.value)}
+                            className="h-8 text-sm text-gray-800 bg-white border border-gray-200 rounded-md px-1.5 disabled:bg-gray-50 disabled:text-gray-400"
+                            title="What happens to a part already in progress when this machine fails"
+                          >
+                            <option value="resume">Resume</option>
+                            <option value="restart">Restart</option>
+                            <option value="scrap">Scrap</option>
+                          </select>
+                        </td>
+                        </>)}
                         <td className="py-1.5 pr-4">
                           <button
                             onClick={() => deleteFlowRow(i)}
@@ -1141,7 +1878,7 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                     })}
                     {flowRows.length === 0 && (
                       <tr>
-                        <td colSpan={9} className="py-6 text-center text-gray-400 text-sm">
+                        <td colSpan={10} className="py-6 text-center text-gray-400 text-sm">
                           No process flow steps yet — add one below.
                         </td>
                       </tr>
@@ -1149,20 +1886,23 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                   </tbody>
                 </table>
               </div>
+              )}
 
               <div className="flex items-center justify-between mt-4">
-                <button
-                  onClick={addFlowRow}
-                  className="flex items-center gap-1.5 text-sm font-medium text-blue-600 hover:text-blue-700"
-                >
-                  <PlusCircle className="h-4 w-4" />
-                  Add step
-                </button>
+                {flowViewMode === 'detailed' ? (
+                  <button
+                    onClick={addFlowRow}
+                    className="flex items-center gap-1.5 text-sm font-medium text-blue-600 hover:text-blue-700"
+                  >
+                    <PlusCircle className="h-4 w-4" />
+                    Add step
+                  </button>
+                ) : <span />}
                 <div className="flex items-center gap-3">
                   {(stationsSaved || matrixSaved || flowSaved || operatorsSaved || quantitiesSaved) && <span className="text-xs text-green-600 font-medium">Saved</span>}
                   <Button
                     size="sm"
-                    disabled={!anyDirty || anySaving}
+                    disabled={!anyDirty || anySaving || conveyorCapacityInvalid}
                     onClick={saveAllDirty}
                     className="bg-blue-600 hover:bg-blue-700"
                   >
@@ -1200,6 +1940,7 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                         <Input
                           type="number"
                           value={row.skillRating}
+                          onFocus={(e) => e.target.select()}
                           onChange={(e) => updateOperatorRow(i, { skillRating: Number(e.target.value) })}
                           className="h-8 text-sm w-24"
                         />
@@ -1208,6 +1949,7 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                         <Input
                           type="number"
                           value={row.availability}
+                          onFocus={(e) => e.target.select()}
                           onChange={(e) => updateOperatorRow(i, { availability: Number(e.target.value) })}
                           className="h-8 text-sm w-24"
                         />
@@ -1245,7 +1987,7 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                   {(stationsSaved || matrixSaved || flowSaved || operatorsSaved || quantitiesSaved) && <span className="text-xs text-green-600 font-medium">Saved</span>}
                   <Button
                     size="sm"
-                    disabled={!anyDirty || anySaving}
+                    disabled={!anyDirty || anySaving || conveyorCapacityInvalid}
                     onClick={saveAllDirty}
                     className="bg-blue-600 hover:bg-blue-700"
                   >
@@ -1283,6 +2025,7 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                         <Input
                           type="number"
                           value={row.quantity}
+                          onFocus={(e) => e.target.select()}
                           onChange={(e) => updateQuantityRow(i, { quantity: Number(e.target.value) })}
                           className="h-8 text-sm w-24"
                         />
@@ -1292,6 +2035,7 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                           type="number"
                           value={row.interval ?? ''}
                           placeholder="—"
+                          onFocus={(e) => e.target.select()}
                           onChange={(e) => updateQuantityRow(i, { interval: e.target.value === '' ? null : Number(e.target.value) })}
                           className="h-8 text-sm w-24"
                         />
@@ -1329,7 +2073,7 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
                   {(stationsSaved || matrixSaved || flowSaved || operatorsSaved || quantitiesSaved) && <span className="text-xs text-green-600 font-medium">Saved</span>}
                   <Button
                     size="sm"
-                    disabled={!anyDirty || anySaving}
+                    disabled={!anyDirty || anySaving || conveyorCapacityInvalid}
                     onClick={saveAllDirty}
                     className="bg-blue-600 hover:bg-blue-700"
                   >
@@ -1441,15 +2185,26 @@ export default function ScenarioManager() {
     }
   }
 
+  const PAGE_SIZE = 50
+  const [page, setPage] = useState(1)
+
   const { data: scenarios = [], isLoading } = useQuery({
-    queryKey: ['scenarios'],
-    queryFn: scenariosApi.list,
+    queryKey: ['scenarios', page],
+    queryFn: () => scenariosApi.list(0, page * PAGE_SIZE),
   })
+
+  const { data: totalCount = 0 } = useQuery({
+    queryKey: ['scenarios-count'],
+    queryFn: scenariosApi.count,
+  })
+
+  const hasMore = scenarios.length < totalCount
 
   const deleteMutation = useMutation({
     mutationFn: (id: number) => scenariosApi.delete(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['scenarios'] })
+      queryClient.invalidateQueries({ queryKey: ['scenarios-count'] })
       showToast('Scenario deleted')
     },
     onError: (err: Error) => showToast(err.message, 'error'),
@@ -1471,7 +2226,7 @@ export default function ScenarioManager() {
           <div>
             <h1 className="text-2xl font-semibold text-gray-900">Scenarios</h1>
             <p className="text-sm text-gray-400 mt-0.5">
-              {scenarios.length} scenario{scenarios.length !== 1 ? 's' : ''} saved
+              {totalCount} scenario{totalCount !== 1 ? 's' : ''} saved
             </p>
           </div>
           <div className="flex gap-2">
@@ -1514,17 +2269,30 @@ export default function ScenarioManager() {
             </Button>
           </div>
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-            {scenarios.map((s) => (
-              <ScenarioCard
-                key={s.id}
-                scenario={s}
-                onSelect={() => handleSelect(s.id)}
-                onDelete={() => deleteMutation.mutate(s.id)}
-                onViewFile={() => handleViewFile(s.id)}
-              />
-            ))}
-          </div>
+          <>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+              {scenarios.map((s) => (
+                <ScenarioCard
+                  key={s.id}
+                  scenario={s}
+                  onSelect={() => handleSelect(s.id)}
+                  onDelete={() => deleteMutation.mutate(s.id)}
+                  onViewFile={() => handleViewFile(s.id)}
+                />
+              ))}
+            </div>
+            {hasMore && (
+              <div className="flex justify-center mt-8">
+                <Button
+                  variant="outline"
+                  onClick={() => setPage(p => p + 1)}
+                  className="border-gray-300 text-gray-600 hover:border-blue-400 hover:text-blue-600 hover:bg-blue-50 rounded-full px-6"
+                >
+                  Load more ({totalCount - scenarios.length} remaining)
+                </Button>
+              </div>
+            )}
+          </>
         )}
 
       </div>

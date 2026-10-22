@@ -2,7 +2,10 @@ import api from './client'
 import type { Scenario, ScenarioCreate, ScenarioListItem, UploadResponse } from '../types'
 
 export const scenariosApi = {
-  list: () => api.get<ScenarioListItem[]>('/scenarios/').then(r => r.data),
+  list: (skip = 0, limit = 50) =>
+    api.get<ScenarioListItem[]>('/scenarios/', { params: { skip, limit } }).then(r => r.data),
+
+  count: () => api.get<{ count: number }>('/scenarios/count').then(r => r.data.count),
 
   get: (id: number) => api.get<Scenario>(`/scenarios/${id}`).then(r => r.data),
 

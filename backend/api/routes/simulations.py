@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from backend.storage import crud, get_db
 from backend.storage.crud import get_station_stats
+from backend.api.auth import require_auth
 from backend.api.schemas import RunRequest, RunResponse, RunDetailResponse, StationStatResponse
 from backend.engine import ManufacturingSimulation
 from backend.engine import progress_store
@@ -33,8 +34,9 @@ def trigger_run(
     req: RunRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
+    user_id: int = Depends(require_auth),
 ):
-    scenario = crud.get_scenario(db, scenario_id)
+    scenario = crud.get_scenario(db, scenario_id, user_id=user_id)
     if not scenario:
         raise HTTPException(status_code=404, detail="Scenario not found")
 
@@ -47,7 +49,7 @@ def trigger_run(
 
 
 @router.post("/{run_id}/stop", status_code=status.HTTP_202_ACCEPTED)
-def stop_run(run_id: int, db: Session = Depends(get_db)):
+def stop_run(run_id: int, db: Session = Depends(get_db), user_id: int = Depends(require_auth)):
     """
     Request cancellation of an in-progress run. Sets a flag the running
     simulation thread polls at its existing progress checkpoints (see
@@ -57,6 +59,8 @@ def stop_run(run_id: int, db: Session = Depends(get_db)):
     """
     run = crud.get_run(db, run_id)
     if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if not crud.get_scenario(db, run.scenario_id, user_id=user_id):
         raise HTTPException(status_code=404, detail="Run not found")
     if run.status != "running":
         raise HTTPException(status_code=400, detail=f"Run is '{run.status}', not running — nothing to stop")
@@ -128,17 +132,22 @@ async def stream_progress(run_id: int, request: Request, db: Session = Depends(g
 # ---------------------------------------------------------------------------
 
 @router.get("/{scenario_id}/runs", response_model=List[RunResponse])
-def list_runs(scenario_id: int, db: Session = Depends(get_db)):
-    scenario = crud.get_scenario(db, scenario_id)
+def list_runs(scenario_id: int, db: Session = Depends(get_db), user_id: int = Depends(require_auth)):
+    scenario = crud.get_scenario(db, scenario_id, user_id=user_id)
     if not scenario:
         raise HTTPException(status_code=404, detail="Scenario not found")
     return crud.list_runs(db, scenario_id)
 
 
 @router.get("/runs/{run_id}", response_model=RunDetailResponse)
-def get_run(run_id: int, db: Session = Depends(get_db)):
+def get_run(run_id: int, db: Session = Depends(get_db), user_id: int = Depends(require_auth)):
     run = crud.get_run(db, run_id)
     if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    # A run belongs to a scenario, which belongs to a user — verify via that
+    # chain (StationStat has no user_id of its own, same for SimulationRun).
+    owning_scenario = crud.get_scenario(db, run.scenario_id, user_id=user_id)
+    if not owning_scenario:
         raise HTTPException(status_code=404, detail="Run not found")
 
     station_stats = get_station_stats(db, run_id)

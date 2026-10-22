@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import ReactFlow, {
   addEdge, Background, Controls, MiniMap,
   useNodesState, useEdgesState, useEdges,
   type Connection, type Edge, type Node, type NodeTypes, type ReactFlowInstance,
-  Handle, Position, MarkerType, ConnectionMode,
+  Handle, Position, MarkerType, ConnectionMode, SelectionMode,
 } from 'reactflow'
 import 'reactflow/dist/style.css'
+import JobReplay, { type ReplayTarget } from '../canvas2d/JobReplay'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import {
@@ -13,6 +15,7 @@ import {
   ChevronDown, Check,
 } from 'lucide-react'
 import { scenariosApi } from '@/api/scenarios'
+import { simulationsApi } from '@/api/simulations'
 import { useAppStore } from '@/store/useAppStore'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -21,7 +24,8 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import Scene from '@/canvas3d/Scene'
 import { buildScene3D } from '@/canvas3d/layout'
-import type { StationNodeData, ScenarioCreate, StationConfig } from '@/types'
+import type { StationNodeData, ScenarioCreate, StationConfig, MuRow } from '@/types'
+import { defaultVariantColor, unusedVariantColor } from '@/lib/variantColors'
 
 // ─── Detailed Object Palette icons ───────────────────────────────────────────
 //
@@ -348,6 +352,40 @@ interface FlowNodeData {
   // Worker Controller X" instead of leaving a pooled station looking
   // identical to one using the plain static shift1/2/3 assignment.
   workerController?: string
+  // Buffer-only stats (from StationStat) — a Buffer has no cycle time/parallel
+  // machines/shifts of its own, it just holds jobs, so the View-mode panel
+  // shows these instead for a Buffer node.
+  bufferCapacity?: number
+  bufferDiscipline?: string
+  bufferBlockedRatio?: number
+  bufferBlockedTime?: number
+  // Only set for a Buffer that ran in 3D mode (see backend's
+  // rack_lane_count/rack_occupied) — null/undefined for a 2D Buffer, which
+  // keeps showing the plain bufferCapacity number instead.
+  rackLaneCount?: number | null
+  rackOccupied?: number | null
+  // Buffer-only CONFIG (Build mode) — how many jobs this Buffer can hold at
+  // once. Deliberately a separate field from bufferCapacity above, which is
+  // a run-result readback (StationStat.buffer_capacity) written fresh after
+  // every run; reusing that field for the editable config would have the
+  // next run's stats silently overwrite whatever the user configured here.
+  // Saves to the scenario's 'Buffer Capacity' station field, same as a real
+  // station's own Buffer Quantity column.
+  bufferQuantity?: number
+  bufferUnlimited?: boolean
+  // '2D' (default, plain Buffer Quantity) or '3D' (X/Y/Z lane dimensions
+  // instead). Config-only, same save path as bufferQuantity — not read
+  // from an uploaded sheet; a 3D buffer always starts at X=Y=Z=1 until the
+  // user changes it here.
+  bufferConfigMode?: '2D' | '3D'
+  bufferX?: number
+  bufferY?: number
+  bufferZ?: number
+  // Editable Build-mode FIFO/LIFO choice — distinct from the read-only
+  // bufferDiscipline above (that one mirrors a completed run's stats).
+  // Saves to the scenario's 'Buffer Discipline' station field, same field
+  // every other station already uses (see ScenarioManager's Stations tab).
+  bufferOrder?: 'FIFO' | 'LIFO'
 }
 
 function FlowNode({ data, selected }: { data: FlowNodeData; selected: boolean }) {
@@ -547,7 +585,7 @@ const nodeTypes: NodeTypes = { station: StationNode, flow: FlowNode, endpoint: E
 // text draft so the field can sit empty while typing, only writing a parsed
 // number back once it's valid, and re-syncing from node.data when a
 // genuinely different node is selected.
-function NumericField({ value, onCommit, className }: { value: number; onCommit: (n: number) => void; className?: string }) {
+function NumericField({ value, onCommit, className, disabled }: { value: number; onCommit: (n: number) => void; className?: string; disabled?: boolean }) {
   const [draft, setDraft] = useState(String(value))
 
   useEffect(() => { setDraft(String(value)) }, [value])
@@ -556,6 +594,7 @@ function NumericField({ value, onCommit, className }: { value: number; onCommit:
     <Input
       type="number"
       value={draft}
+      disabled={disabled}
       onChange={(e) => {
         const raw = e.target.value
         setDraft(raw)
@@ -846,7 +885,7 @@ function MultiStyledSelect({
 // ─── Property editor ─────────────────────────────────────────────────────────
 
 function PropertyEditor({
-  node, nodes, edges, onChange, onDelete, onSaveStation, onAddParallel, onAddWorkplace, onRemoveWorkplace, onToggleWire, onAssignOperator, onUnassignOperator, numShifts, shiftNames, operatorsData,
+  node, nodes, edges, onChange, onDelete, onSaveStation, onAddParallel, onOpenMuTable, startProducts, onAddWorkplace, onRemoveWorkplace, onToggleWire, onAssignOperator, onUnassignOperator, numShifts, shiftNames, operatorsData,
 }: {
   node: Node<StationNodeData>
   nodes: Node<StationNodeData>[]
@@ -855,6 +894,9 @@ function PropertyEditor({
   onDelete: (id: string) => void
   onSaveStation: () => void
   onAddParallel: (id: string) => void
+  onOpenMuTable: (id: string) => void
+  // Start only: its products (MU table), for its Exit Controller.
+  startProducts: string[]
   onAddWorkplace: (id: string) => void
   onRemoveWorkplace: (id: string) => void
   onToggleWire: (sourceId: string, targetId: string, connect: boolean) => void
@@ -874,7 +916,8 @@ function PropertyEditor({
   // anyway would invite settings that do nothing.
   const isConnector = nodeType === 'Connector'
   const isConveyor = nodeType === 'Conveyor'
-  const isBookend = nodeType === 'Source' || nodeType === 'Drain'
+  const [sensorDialogOpen, setSensorDialogOpen] = useState(false)
+  const isBookend =nodeType === 'Source' || nodeType === 'Drain'
   // Worker and Worker Controller are zero-time annotation nodes, just like
   // Connector — they don't do work themselves. A Worker Controller becomes a
   // live dispatch pool at run time, drawing from every Worker wired upstream
@@ -1031,7 +1074,11 @@ function PropertyEditor({
     : isConveyor
       ? [
           { key: 'label',         label: 'Name',                type: 'text'   },
-          { key: 'transportTime', label: 'Transport Time (min)', type: 'number' },
+          { key: 'conveyorLength', label: 'Length (m)', type: 'number' },
+          { key: 'conveyorSpeed', label: 'Speed (m/min)', type: 'number' },
+          { key: 'conveyorCapacity', label: 'Capacity (units)', type: 'number' },
+          { key: 'conveyorWidth', label: 'Width (m)', type: 'number' },
+          { key: 'conveyorHeight', label: 'Height (m)', type: 'number' },
         ]
       // A Workplace is never its own processflow step (see the save
       // mutation's stepDuration — always 0 for Workplace) and its Operators
@@ -1052,6 +1099,7 @@ function PropertyEditor({
             { key: 'setupTime',   label: 'Setup Time (min)',   type: 'number' },
             { key: 'processTime', label: 'Process Time (min)', type: 'number' },
             { key: 'operators',   label: 'Operators',          type: 'number' },
+            { key: 'repairTime',  label: 'Repair Time (min)',  type: 'number' },
           ]
 
   // An operator is one real person — the same one can't be two separate
@@ -1076,42 +1124,28 @@ function PropertyEditor({
     ? node.data.stationType === 'Assembly'
     : baseStationName(node.data.label).startsWith('Assembly')
 
-  // Distinct destination STATIONS (base name, so parallel-machine boxes of the
-  // same station don't count as separate branches) this node's edges lead to.
-  // More than one distinct destination = this station needs an "Exit
-  // controller type" (routing) to decide which one a finished job goes to.
-  // A Workplace/Worker/Worker Controller reached from here is pool-wiring,
-  // not a real routing destination — excluded so wiring a Workplace next to
-  // a station never looks like a 2-way branch needing an Exit Controller.
-  const destinationBases = Array.from(new Set(
-    edges
-      .filter((e) => e.source === node.id)
-      .map((e) => nodes.find((n) => n.id === e.target))
-      .filter((n): n is Node<StationNodeData> => !!n)
-      .filter((n) => {
-        const t = inferStationType(n.data.label, n.data.stationType)
-        return t !== 'Workplace' && t !== 'Worker' && t !== 'Worker Controller'
-      })
-      .map((n) => baseStationName(n.data.label))
-  ))
-  const hasBranch = destinationBases.length > 1
-
   // Distinct upstream STATIONS feeding this node — the "Assembly type/table"
   // rows for an Assembly station: one row per incoming station, with a
-  // quantity-needed field. Mirrors destinationBases but walks edges backward.
+  // quantity-needed field.
   const sourceBases = Array.from(new Set(
     edges
       .filter((e) => e.target === node.id)
       .map((e) => nodes.find((n) => n.id === e.source))
       .filter((n): n is Node<StationNodeData> => !!n)
-      .map((n) => baseStationName(n.data.label))
+      .map(groupKey)
   ))
   const assemblyInputs = node.data.assemblyInputs ?? {}
 
-  const routingMode = node.data.routingMode ?? 'round_robin'
-  const routingWeights = node.data.routingWeights ?? {}
-  const routingRules = node.data.routingRules ?? []
-  const routingDefault = node.data.routingDefault ?? destinationBases[0]
+  // 2+ successors = this station needs an Exit Controller.
+  const successorBases = exitSuccessorLabels(node.id, nodes, edges)
+  const exitStrategy = node.data.exitStrategy ?? 'cyclic'
+  const exitPercentages = node.data.exitPercentages ?? {}
+  const exitPercentTotal = successorBases.reduce((sum, s) => sum + (exitPercentages[s] ?? 0), 0)
+  const exitPriorities = exitPriorityValues(node.data, successorBases)
+  const exitPrioritiesValid = exitPrioritiesAreValid(exitPriorities)
+  // This station splits jobs over different next stations — a shape the
+  // simulation doesn't support yet shows why here (Save is blocked too).
+  const splitProblem = canvasSplits(nodes, edges).find((s) => s.sourceId === node.id)?.problem
 
   return (
     <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
@@ -1145,10 +1179,15 @@ function PropertyEditor({
               {type === 'number' ? (
                 <NumericField
                   // Fields that only exist on some station types (e.g. a
-                  // Conveyor's transportTime) are undefined on a freshly added
+                  // Conveyor's conveyorLength) are undefined on a freshly added
                   // node — Number(undefined) is NaN, which would render an empty
-                  // uneditable box, so fall back to 0.
-                  value={Number(node.data[key as keyof StationNodeData] ?? 0)}
+                  // uneditable box, so fall back to 0. repairTime falls back to
+                  // 10 instead, matching the save mutation's own default — so
+                  // the box always shows the value that will actually be saved,
+                  // never a fake 0 that Save then silently overrides to 10.
+                  // conveyorCapacity likewise falls back to 1, the engine's
+                  // default for a conveyor saved without one.
+                  value={Number(node.data[key as keyof StationNodeData] ?? (key === 'repairTime' ? 10 : key === 'conveyorCapacity' ? 1 : 0))}
                   onCommit={(n) => onChange(node.id, { [key]: n })}
                   className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
                 />
@@ -1179,7 +1218,180 @@ function PropertyEditor({
                   {row.map(renderField)}
                 </div>
               ))}
+              {isConveyor && (() => {
+                const transport = conveyorTransportTime(node.data)
+                return (
+                  <div>
+                    <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+                      Transport Time (min)
+                    </label>
+                    <p className="h-8 px-3 flex items-center text-sm rounded-lg border border-gray-200 bg-gray-100 text-gray-600 tabular-nums">
+                      {transport !== undefined ? formatDecimal(transport, 4) : '—'}
+                    </p>
+                    <p className="text-[10px] text-gray-400 mt-1">Length ÷ Speed</p>
+                  </div>
+                )
+              })()}
+              {isConveyor && !((node.data.conveyorLength ?? 0) > 0) && (
+                <p className="text-[10px] text-amber-600">
+                  Length must be more than 0.
+                </p>
+              )}
+              {isConveyor && !((node.data.conveyorSpeed ?? 0) > 0) && (
+                <p className="text-[10px] text-amber-600">
+                  Speed must be more than 0.
+                </p>
+              )}
+              {isConveyor && (node.data.conveyorCapacity ?? 1) < 1 && (
+                <p className="text-[10px] text-amber-600">
+                  Capacity must be 1 or more.
+                </p>
+              )}
+              {/* Sensor — ticking opens the pop-up; unticking removes the
+                  sensor. The engine only counts jobs passing it. */}
+              {isConveyor && (
+                <div>
+                  <label className="flex items-center gap-2 text-xs font-semibold text-gray-700">
+                    <input
+                      type="checkbox"
+                      checked={!!node.data.conveyorSensor || sensorDialogOpen}
+                      onChange={(e) => {
+                        if (e.target.checked) {
+                          setSensorDialogOpen(true)
+                        } else {
+                          setSensorDialogOpen(false)
+                          onChange(node.id, { conveyorSensor: undefined })
+                        }
+                      }}
+                    />
+                    Sensor
+                  </label>
+                  {node.data.conveyorSensor && (
+                    <button
+                      type="button"
+                      onClick={() => setSensorDialogOpen(true)}
+                      className="mt-1 ml-5 text-[11px] text-blue-600 hover:underline"
+                    >
+                      Sensor at {formatDecimal(node.data.conveyorSensor.length)} m · {node.data.conveyorSensor.position === 'front' ? 'Front' : 'Rear'}
+                    </button>
+                  )}
+                  {node.data.conveyorSensor && node.data.conveyorSensor.length > (node.data.conveyorLength ?? 0) && (
+                    <p className="text-[10px] text-amber-600 mt-1">
+                      Sensor ({formatDecimal(node.data.conveyorSensor.length)} m) is longer than the conveyor ({formatDecimal(node.data.conveyorLength ?? 0)} m) — it will be ignored in the simulation.
+                    </p>
+                  )}
+                  {sensorDialogOpen && (
+                    <ConveyorSensorDialog
+                      conveyorName={node.data.label}
+                      conveyorLength={node.data.conveyorLength ?? 0}
+                      initial={node.data.conveyorSensor}
+                      onApply={(sensor) => onChange(node.id, { conveyorSensor: sensor })}
+                      onClose={() => setSensorDialogOpen(false)}
+                    />
+                  )}
+                </div>
+              )}
             </>
+          )
+        })()}
+
+        {/* Start: its MU table (the products it creates) — also opens on a
+            click on the Start box itself. */}
+        {nodeType === 'Source' && (
+          <div>
+            <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+              MU
+            </label>
+            <button
+              onClick={() => onOpenMuTable(node.id)}
+              className="w-full flex items-center justify-center gap-1.5 py-1.5 text-[11px] font-semibold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded-lg border border-indigo-100 transition-colors"
+            >
+              Open MU table{node.data.muTable ? ` (${node.data.muTable.length})` : ''}
+            </button>
+          </div>
+        )}
+
+        {/* Start's Exit Controller — the order its products are released in,
+            each product as one whole batch, one after another (each job its
+            product's Interval after the one before). Cyclic/Random/Successor
+            run in the simulation; Percentage is UI only for now. */}
+        {nodeType === 'Source' && startProducts.length > 1 && (() => {
+          // Nothing chosen = Cyclic (saved as Cyclic too).
+          const muStrategy = node.data.muStrategy ?? 'cyclic'
+          const muPriorities = startProducts.map((p, i) => node.data.muPriorities?.[p] ?? i + 1)
+          const muPrioritiesValid = exitPrioritiesAreValid(muPriorities)
+          const muPercentages = node.data.muPercentages ?? {}
+          const muPercentTotal = startProducts.reduce((sum, p) => sum + (muPercentages[p] ?? 0), 0)
+          return (
+            <div>
+              <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+                Exit Controller ({startProducts.length} products)
+              </label>
+              <select
+                value={muStrategy}
+                onChange={(e) => onChange(node.id, { muStrategy: e.target.value as StationNodeData['muStrategy'] })}
+                className="h-8 w-full text-sm rounded-lg border border-gray-200 bg-gray-50 focus:bg-white px-2"
+              >
+                <option value="cyclic">Cyclic</option>
+                <option value="random">Random</option>
+                <option value="successor">Successor</option>
+                <option value="percentage">Percentage</option>
+              </select>
+
+              {muStrategy === 'cyclic' && (
+                <p className="text-[10px] text-gray-400 mt-1.5">Releases each product's jobs in MU table order: all of {startProducts[0]}, then all of {startProducts[1]}, …</p>
+              )}
+              {muStrategy === 'random' && (
+                <p className="text-[10px] text-gray-400 mt-1.5">Releases the products in a random order — each product's jobs still all together.</p>
+              )}
+
+              {muStrategy === 'successor' && (
+                <div className="mt-2 space-y-1.5">
+                  <label className="text-[10px] text-gray-400 block">Priority (1 = released first)</label>
+                  {startProducts.map((p, i) => (
+                    <div key={p} className="flex items-center gap-2">
+                      <span className="text-xs text-gray-600 flex-1 truncate">{p}</span>
+                      <NumericField
+                        value={muPriorities[i]}
+                        onCommit={(n) => onChange(node.id, {
+                          muPriorities: {
+                            ...Object.fromEntries(startProducts.map((q, j) => [q, muPriorities[j]])),
+                            [p]: n,
+                          },
+                        })}
+                        className="h-8 w-20 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+                      />
+                    </div>
+                  ))}
+                  {!muPrioritiesValid && (
+                    <p className="text-[10px] text-amber-600">
+                      Use each number from 1 to {startProducts.length} once.
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {muStrategy === 'percentage' && (
+                <div className="mt-2 space-y-1.5">
+                  {startProducts.map((p) => (
+                    <div key={p} className="flex items-center gap-2">
+                      <span className="text-xs text-gray-600 flex-1 truncate">{p}</span>
+                      <div className="relative w-20">
+                        <NumericField
+                          value={muPercentages[p] ?? 0}
+                          onCommit={(n) => onChange(node.id, { muPercentages: { ...muPercentages, [p]: n } })}
+                          className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white pr-6 [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+                        />
+                        <span className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-gray-400 pointer-events-none">%</span>
+                      </div>
+                    </div>
+                  ))}
+                  <p className={`text-[10px] ${muPercentTotal === 100 ? 'text-gray-400' : 'text-amber-600'}`}>
+                    Total: {muPercentTotal}%{muPercentTotal !== 100 && ' — should add up to 100%'}
+                  </p>
+                </div>
+              )}
+            </div>
           )
         })()}
 
@@ -1207,6 +1419,29 @@ function PropertyEditor({
                 A Workplace node was added below this station — wire it to a Worker Controller to finish staffing it.
               </p>
             )}
+          </div>
+        )}
+
+        {/* What happens to a part already in progress when this station's
+            machine fails mid-operation — saves to the scenario's 'Failure
+            Policy' field (backend/engine/machine.py's FailurePolicy enum).
+            Same isPlainStation guard as Repair Time above: only a real
+            machine (not a Conveyor/Workplace/Buffer/annotation) can fail. */}
+        {isPlainStation && (
+          <div>
+            <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+              Failure Policy
+            </label>
+            <select
+              value={node.data.failurePolicy || 'resume'}
+              onChange={(e) => onChange(node.id, { failurePolicy: e.target.value })}
+              className="h-8 w-full text-sm rounded-lg border border-gray-200 bg-gray-50 focus:bg-white px-2"
+              title="What happens to a part already in progress when this machine fails"
+            >
+              <option value="resume">Resume</option>
+              <option value="restart">Restart</option>
+              <option value="scrap">Scrap</option>
+            </select>
           </div>
         )}
 
@@ -1569,6 +1804,101 @@ function PropertyEditor({
           </div>
         )}
 
+        {/* Buffer capacity — how many finished jobs this Buffer node can hold
+            at once. The engine blocks the upstream station once the Buffer
+            is full, same as a real station's own Buffer Capacity field (see
+            sim_core.py's _is_buffer hand-off). 0 means zero room (nothing
+            can wait here at all); check Unlimited for no cap.
+            2D/3D only changes HOW capacity is entered: one flat number, or
+            X/Y/Z lane dimensions (always starts 1-1-1, never imported from
+            a sheet — user edits them here if they want something else).
+            Buffer Order (FIFO/LIFO) applies the same way in both modes. */}
+        {isBuffer && (
+        <div>
+          <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+            Buffer Mode
+          </label>
+          <div className="flex gap-1.5 mb-3">
+            {(['2D', '3D'] as const).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => onChange(node.id, { bufferConfigMode: mode })}
+                className={`flex-1 h-8 text-sm font-medium rounded-lg border transition-colors ${
+                  (node.data.bufferConfigMode ?? '2D') === mode
+                    ? 'bg-blue-500 text-white border-blue-500'
+                    : 'bg-gray-50 text-gray-500 border-gray-200 hover:bg-gray-100'
+                }`}
+              >
+                {mode}
+              </button>
+            ))}
+          </div>
+
+          {(node.data.bufferConfigMode ?? '2D') === '2D' ? (
+            <>
+              <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+                Buffer Quantity
+              </label>
+              <NumericField
+                value={node.data.bufferQuantity ?? 0}
+                onCommit={(n) => onChange(node.id, { bufferQuantity: n })}
+                disabled={!!node.data.bufferUnlimited}
+                className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white disabled:opacity-50 [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+              />
+              <label className="flex items-center gap-1.5 mt-1.5 text-[11px] text-gray-500">
+                <input
+                  type="checkbox"
+                  checked={!!node.data.bufferUnlimited}
+                  onChange={(e) => onChange(node.id, { bufferUnlimited: e.target.checked })}
+                  className="h-3.5 w-3.5"
+                />
+                Unlimited
+              </label>
+            </>
+          ) : (
+            <div className="grid grid-cols-3 gap-2">
+              <div>
+                <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">X</label>
+                <NumericField
+                  value={node.data.bufferX ?? 1}
+                  onCommit={(n) => onChange(node.id, { bufferX: n })}
+                  className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">Y</label>
+                <NumericField
+                  value={node.data.bufferY ?? 1}
+                  onCommit={(n) => onChange(node.id, { bufferY: n })}
+                  className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">Z</label>
+                <NumericField
+                  value={node.data.bufferZ ?? 1}
+                  onCommit={(n) => onChange(node.id, { bufferZ: n })}
+                  className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+                />
+              </div>
+            </div>
+          )}
+
+          <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5 mt-3">
+            Buffer Order
+          </label>
+          <select
+            value={node.data.bufferOrder ?? 'FIFO'}
+            onChange={(e) => onChange(node.id, { bufferOrder: e.target.value as 'FIFO' | 'LIFO' })}
+            className="h-8 text-sm text-gray-800 bg-gray-50 border border-gray-200 rounded-lg px-2 w-full"
+          >
+            <option value="FIFO">FIFO</option>
+            <option value="LIFO">LIFO</option>
+          </select>
+        </div>
+        )}
+
         {/* Shift availability — any combination of the day's shifts (1, 2, 3)
             this station actually runs on, e.g. shift 2+3 while skipping
             shift 1. Feeds shifts_per_day, which the engine reads directly
@@ -1657,6 +1987,13 @@ function PropertyEditor({
           <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
             Parallel Machines
           </label>
+          {node.data.parallelGroup && (
+            <p className="text-[10px] text-gray-500 mb-1.5">
+              Machine of group <span className="font-semibold text-gray-700">{node.data.parallelGroup}</span>
+              {' · '}{nodes.filter((n) => n.data.parallelGroup === node.data.parallelGroup).length} machines,
+              one shared waiting line. This machine's settings are its own.
+            </p>
+          )}
           <button
             onClick={() => onAddParallel(node.id)}
             className="w-full flex items-center justify-center gap-1.5 py-1.5 text-[11px] font-semibold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded-lg border border-indigo-100 transition-colors"
@@ -1763,81 +2100,83 @@ function PropertyEditor({
           </div>
         )}
 
-        {/* Exit controller / routing — only shown once this station has more
-            than one distinct next-station connected (a branch). Decides
-            which downstream station a finished job goes to. */}
-        {hasBranch && (
-          <div className="pt-3 border-t border-gray-100">
+        {/* Exit Controller — which of this station's next stations (parallel
+            copies or different stations) each finished job goes to.
+            Cyclic/Random/Successor run in the simulation; Percentage is UI
+            only for now. */}
+        {successorBases.length > 1 && (
+          <div>
             <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
-              Exit Controller ({destinationBases.length} paths)
+              Exit Controller ({successorBases.length} paths)
             </label>
+            {splitProblem && (
+              <p className="text-[10px] text-amber-600 mb-1.5">
+                {splitProblem} The simulation can't run this layout yet.
+              </p>
+            )}
             <select
-              value={routingMode}
-              onChange={(e) => onChange(node.id, { routingMode: e.target.value as StationNodeData['routingMode'] })}
-              className="w-full h-8 text-xs rounded-lg border border-gray-200 bg-gray-50 focus:bg-white px-2 mb-2"
+              value={exitStrategy}
+              onChange={(e) => onChange(node.id, { exitStrategy: e.target.value as StationNodeData['exitStrategy'] })}
+              className="h-8 w-full text-sm rounded-lg border border-gray-200 bg-gray-50 focus:bg-white px-2"
             >
-              <option value="round_robin">Round-robin</option>
-              <option value="percentage">Percentage split</option>
-              <option value="condition">Condition (by variant)</option>
-              <option value="shortest_queue">Shortest queue</option>
+              <option value="cyclic">Cyclic</option>
+              <option value="random">Random</option>
+              <option value="successor">Successor</option>
+              <option value="percentage">Percentage</option>
             </select>
 
-            {routingMode === 'percentage' && (
-              <div className="space-y-1.5">
-                {destinationBases.map((dest) => (
-                  <div key={dest} className="flex items-center gap-2">
-                    <span className="text-[11px] text-gray-500 flex-1 truncate">{dest}</span>
-                    <Input
-                      type="number"
-                      value={String(routingWeights[dest] ?? '')}
-                      onChange={(e) => onChange(node.id, {
-                        routingWeights: { ...routingWeights, [dest]: Number(e.target.value) },
+            {exitStrategy === 'cyclic' && (
+              <p className="text-[10px] text-gray-400 mt-1.5">Sends jobs to each next station in turn.</p>
+            )}
+            {exitStrategy === 'random' && (
+              <p className="text-[10px] text-gray-400 mt-1.5">Sends each job to a randomly chosen next station.</p>
+            )}
+
+            {exitStrategy === 'successor' && (
+              <div className="mt-2 space-y-1.5">
+                <label className="text-[10px] text-gray-400 block">Priority (1 = first choice)</label>
+                {successorBases.map((s, i) => (
+                  <div key={s} className="flex items-center gap-2">
+                    <span className="text-xs text-gray-600 flex-1 truncate">{s}</span>
+                    <NumericField
+                      value={exitPriorities[i]}
+                      onCommit={(n) => onChange(node.id, {
+                        exitPriorities: {
+                          ...Object.fromEntries(successorBases.map((b, j) => [b, exitPriorities[j]])),
+                          [s]: n,
+                        },
                       })}
-                      placeholder="%"
-                      className="h-7 w-16 text-xs rounded-lg border-gray-200 bg-gray-50 focus:bg-white"
+                      className="h-8 w-20 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
                     />
                   </div>
                 ))}
+                {!exitPrioritiesValid && (
+                  <p className="text-[10px] text-amber-600">
+                    Use each number from 1 to {successorBases.length} once.
+                  </p>
+                )}
               </div>
             )}
 
-            {routingMode === 'condition' && (
-              <div className="space-y-2">
-                {destinationBases.map((dest) => (
-                  <div key={dest} className="flex items-center gap-2">
-                    <Input
-                      value={routingRules.find((r) => r.resource === dest)?.variantType ?? ''}
-                      onChange={(e) => {
-                        const others = routingRules.filter((r) => r.resource !== dest)
-                        const value = e.target.value.trim()
-                        onChange(node.id, {
-                          routingRules: value ? [...others, { variantType: value, resource: dest }] : others,
-                        })
-                      }}
-                      placeholder="Variant name…"
-                      className="h-7 text-xs rounded-lg border-gray-200 bg-gray-50 focus:bg-white flex-1"
-                    />
-                    <span className="text-[10px] text-gray-400 shrink-0">→ {dest}</span>
+            {exitStrategy === 'percentage' && (
+              <div className="mt-2 space-y-1.5">
+                {successorBases.map((s) => (
+                  <div key={s} className="flex items-center gap-2">
+                    <span className="text-xs text-gray-600 flex-1 truncate">{s}</span>
+                    <div className="relative w-20">
+                      <NumericField
+                        value={exitPercentages[s] ?? 0}
+                        onCommit={(n) => onChange(node.id, { exitPercentages: { ...exitPercentages, [s]: n } })}
+                        className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white pr-6 [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+                      />
+                      <span className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-gray-400 pointer-events-none">%</span>
+                    </div>
                   </div>
                 ))}
-                <div>
-                  <label className="text-[9px] text-gray-400 uppercase tracking-wide">Default (no match)</label>
-                  <select
-                    value={routingDefault}
-                    onChange={(e) => onChange(node.id, { routingDefault: e.target.value })}
-                    className="w-full h-7 text-xs rounded-lg border border-gray-200 bg-gray-50 focus:bg-white px-2 mt-1"
-                  >
-                    {destinationBases.map((dest) => <option key={dest} value={dest}>{dest}</option>)}
-                  </select>
-                </div>
+                <p className={`text-[10px] ${exitPercentTotal === 100 ? 'text-gray-400' : 'text-amber-600'}`}>
+                  Total: {exitPercentTotal}%{exitPercentTotal !== 100 && ' — should add up to 100%'}
+                </p>
               </div>
-            )}
-
-            {routingMode === 'shortest_queue' && (
-              <p className="text-[10px] text-gray-400">Sends each job to whichever of the {destinationBases.length} paths currently has the least work waiting — no extra setup needed.</p>
-            )}
-            {routingMode === 'round_robin' && (
-              <p className="text-[10px] text-gray-400">Cycles through the {destinationBases.length} paths in order — no extra setup needed.</p>
             )}
           </div>
         )}
@@ -1887,23 +2226,41 @@ const PALETTE_ITEMS = [
   { label: 'Drain',            displayLabel: 'End',   description: 'Job exit point',     color: 'bg-red-50 text-red-500 border-red-400' },
 ]
 
-// A step's `resource` is either a plain station name, or a routing dict
-// ({mode, options, weights?/rules?}) for a branching "Exit Controller" step
-// (see backend/engine/sim_core.py's _resolve_step_resource). Canvas only
-// ever needs the list of real station names it can point at — never the
-// raw dict, which must never be used as a string/object key or rendered
-// directly (React throws trying to render a plain object as a child).
+// A step's `resource` is a plain station name. Scenarios saved while the Exit
+// Controller existed may still hold a {mode, options, ...} dict — only its
+// first station is used, matching backend/engine/sim_core.py's
+// _resolve_step_resource. Never render/key the raw dict (React throws on a
+// plain object child).
 function stepResourceOptions(resource: string | { options?: string[] }): string[] {
   if (typeof resource === 'string') return [resource]
-  return resource?.options ?? []
+  const first = resource?.options?.[0]
+  return first ? [first] : []
+}
+
+// The columns of a variant's flow, in order: a plain step is a column of its
+// own; consecutive steps sharing a "branch" number (a split — each job visits
+// only one of them) are one column, drawn as stacked boxes. Matches
+// _branch_slots in backend/engine/sim_core.py.
+function stepColumns<T extends { branch?: number }>(steps: T[]): T[][] {
+  const columns: T[][] = []
+  for (const step of steps) {
+    const last = columns[columns.length - 1]
+    if (step.branch !== undefined && last && last[0].branch === step.branch) last.push(step)
+    else columns.push([step])
+  }
+  return columns
 }
 
 // ─── Flow builder from scenario ───────────────────────────────────────────────
 
 function buildFlowGraph(
-  processflow: Record<string, { operation: string; resource: string | { mode: string; options: string[] }; duration: number }[]>,
+  processflow: Record<string, { operation: string; resource: string | { options?: string[] }; duration: number; branch?: number }[]>,
   variant: string,
-  stationStats: Record<string, { utilization: number; jobs: number }>,
+  stationStats: Record<string, {
+    utilization: number; jobs: number
+    bufferCapacity: number; bufferDiscipline: string
+    bufferBlockedRatio: number; bufferBlockedTime: number
+  }>,
   stationsData: Record<string, { capacity?: number; 'Station Type'?: string; shifts_per_day?: number | number[]; 'Worker Controller'?: string }> = {},
 ): { nodes: Node<FlowNodeData>[]; edges: Edge[] } {
   const steps = processflow[variant] ?? []
@@ -1915,32 +2272,28 @@ function buildFlowGraph(
   const ROW_GAP = 170     // vertical spacing between parallel machines
 
   const nodes: Node<FlowNodeData>[] = []
-  // stepNodeIds[i] = list of node ids in column i (one per parallel machine,
-  // AND/OR one per branch option for an Exit Controller step)
+  // stepNodeIds[i] = list of node ids in column i (one per parallel machine)
   const stepNodeIds: string[][] = []
 
-  steps.forEach((step, i) => {
-    const options = stepResourceOptions(step.resource)
-    const isBranch = options.length > 1
+  stepColumns(steps).forEach((column, i) => {
+    // One entry per station in this column (a split stacks several).
+    const options = column.flatMap((step) => stepResourceOptions(step.resource).map((name) => ({ name, step })))
     const ids: string[] = []
 
-    // Each branch option gets its own row-group; within a group, capacity>1
-    // still fans out into stacked parallel-machine boxes as before.
-    const groupCapacities = options.map((opt) => stationsData[opt]?.capacity ?? 1)
+    // capacity>1 fans out into stacked parallel-machine boxes.
+    const groupCapacities = options.map(({ name }) => stationsData[name]?.capacity ?? 1)
     const totalRows = groupCapacities.reduce((a, b) => a + b, 0)
     const BASE_Y = 100
     const stackHeight = (totalRows - 1) * ROW_GAP
     let rowCursor = 0
 
-    options.forEach((resourceName, oi) => {
+    options.forEach(({ name: resourceName, step }, oi) => {
       const stat = stationStats[resourceName]
       const capacity = groupCapacities[oi]
       for (let m = 0; m < capacity; m++) {
         const id = `step_${i}_o${oi}_m${m}`
         ids.push(id)
-        const label = isBranch
-          ? (capacity > 1 ? `${resourceName} #${m + 1}` : resourceName)
-          : (capacity > 1 ? `${step.operation} #${m + 1}` : step.operation)
+        const label = capacity > 1 ? `${step.operation} #${m + 1}` : step.operation
         nodes.push({
           id,
           type: 'flow',
@@ -1958,6 +2311,12 @@ function buildFlowGraph(
             stationType: stationsData[resourceName]?.['Station Type'],
             shiftsPerDay: normalizeShiftsPerDay(stationsData[resourceName]?.shifts_per_day),
             workerController: stationsData[resourceName]?.['Worker Controller'],
+            bufferCapacity: stat?.bufferCapacity,
+            bufferDiscipline: stat?.bufferDiscipline,
+            bufferBlockedRatio: stat?.bufferBlockedRatio,
+            bufferBlockedTime: stat?.bufferBlockedTime,
+            rackLaneCount: stat?.rackLaneCount,
+            rackOccupied: stat?.rackOccupied,
           },
         })
         rowCursor += 1
@@ -2049,13 +2408,9 @@ function buildFlowGraph(
 
 /** Convert a saved scenario's process flow into editable Build-mode nodes —
  *  mirrors View exactly: a station with capacity=2 is fanned out into 2 separate
- *  editable boxes (same layout/positions as buildFlowGraph), each fully editable.
- *  A step whose `resource` is a routing dict (Exit Controller branch) is fanned
- *  out into one node per option, and the routing config is restored onto the
- *  PRECEDING step's node(s) — that's where PropertyEditor reads/writes it from,
- *  since it's keyed off "this node's outgoing edges reach >1 destination". */
+ *  editable boxes (same layout/positions as buildFlowGraph), each fully editable. */
 function buildEditableGraph(
-  processflow: Record<string, { operation: string; resource: string | { mode: string; options: string[]; weights?: number[]; rules?: { if: string; resource: string }[]; default?: string }; duration: number }[]>,
+  processflow: Record<string, { operation: string; resource: string | { options?: string[] }; duration: number; branch?: number }[]>,
   variant: string,
   stationsData: Record<string, StationConfig>,
 ): { nodes: Node<StationNodeData>[]; edges: Edge[] } {
@@ -2071,17 +2426,17 @@ function buildEditableGraph(
   const nodes: Node<StationNodeData>[] = []
   const stepNodeIds: string[][] = []
 
-  steps.forEach((step, i) => {
-    const options = stepResourceOptions(step.resource)
-    const isBranch = options.length > 1
-    const groupCapacities = options.map((opt) => stationsData[opt]?.capacity ?? 1)
+  stepColumns(steps).forEach((column, i) => {
+    // One entry per station in this column (a split stacks several).
+    const options = column.flatMap((step) => stepResourceOptions(step.resource).map((name) => ({ name, step })))
+    const groupCapacities = options.map(({ name }) => stationsData[name]?.capacity ?? 1)
     const totalRows = groupCapacities.reduce((a, b) => a + b, 0)
     const BASE_Y = 100
     const stackHeight = (totalRows - 1) * ROW_GAP
     let rowCursor = 0
     const ids: string[] = []
 
-    options.forEach((resourceName, oi) => {
+    options.forEach(({ name: resourceName, step }, oi) => {
       const cfg = stationsData[resourceName]
       const capacity = groupCapacities[oi]
       for (let m = 0; m < capacity; m++) {
@@ -2093,15 +2448,47 @@ function buildEditableGraph(
           position: { x: i * COL_GAP + 40, y: BASE_Y - stackHeight / 2 + rowCursor * ROW_GAP },
           data: {
             label: capacity > 1 ? `${resourceName} #${m + 1}` : resourceName,
+            savedName: resourceName,
+            // A machine of a parallel group keeps its group. An older station
+            // with N machines becomes a group of N, each box a machine of its
+            // own (starting from the station's settings) once it is saved.
+            parallelGroup: cfg?.['Parallel Group'] || (capacity > 1 ? resourceName : undefined),
             stationType: cfg?.['Station Type'],
-            capacity,
+            capacity: capacity > 1 ? 1 : capacity,
             cycleTime: step.duration,
             operators: cfg?.operator_per_station ?? 1,
             shiftsPerDay: normalizeShiftsPerDay(cfg?.shifts_per_day),
-            transportTime: cfg?.['Transport Time'],
+            // An older conveyor saved with Length + Transport Time (no Speed)
+            // gets its Speed as Length / Transport Time, so it rides the same.
+            conveyorSpeed: cfg?.['Conveyor Speed']
+              ?? ((cfg?.['Conveyor Length'] ?? 0) > 0 && (cfg?.['Transport Time'] ?? 0) > 0
+                ? cfg!['Conveyor Length']! / cfg!['Transport Time']!
+                : undefined),
+            conveyorLength: cfg?.['Conveyor Length'],
+            conveyorWidth: cfg?.['Conveyor Width'],
+            conveyorHeight: cfg?.['Conveyor Height'],
+            conveyorCapacity: cfg?.['Conveyor Capacity'],
+            conveyorSensor: cfg?.['Conveyor Sensor Length'] !== undefined
+              ? {
+                  length: cfg['Conveyor Sensor Length'],
+                  position: cfg['Conveyor Sensor Position'] === 'Rear' ? 'rear' : 'front',
+                }
+              : undefined,
+            exitStrategy: cfg?.['Exit Strategy'],
+            exitPercentages: cfg?.['Exit Percentages'],
+            exitPriorities: cfg?.['Exit Priorities'],
             assemblyCount: cfg?.['Assembly Count'],
             assemblyInputs: cfg?.['Assembly Inputs'],
             setupTime: cfg?.['Setup time'],
+            repairTime: cfg?.['Repair Time'],
+            failurePolicy: cfg?.['Failure Policy'],
+            bufferQuantity: cfg?.['Buffer Capacity'],
+            bufferUnlimited: cfg?.['Buffer Unlimited'],
+            bufferConfigMode: cfg?.['Buffer Config Mode'],
+            bufferX: cfg?.['Buffer X'],
+            bufferY: cfg?.['Buffer Y'],
+            bufferZ: cfg?.['Buffer Z'],
+            bufferOrder: cfg?.['Buffer Discipline'],
             // Worker/Worker Controller/Workplace are never real processflow
             // steps, so they never reach this per-step loop at all — they're
             // reconstructed separately, straight from stationsData, right
@@ -2113,30 +2500,6 @@ function buildEditableGraph(
       }
     })
     stepNodeIds.push(ids)
-
-    // Restore the routing config onto the PRECEDING step's node(s) — for a
-    // branch at step i, it's step i-1's boxes whose outgoing edges fan out
-    // to >1 destination, which is what PropertyEditor keys off.
-    if (isBranch && typeof step.resource === 'object' && i > 0) {
-      const routing = step.resource
-      const routingWeights: Record<string, number> = {}
-      if (routing.weights) {
-        options.forEach((opt, oi) => { routingWeights[opt] = routing.weights![oi] ?? 1 })
-      }
-      const routingRules = (routing.rules ?? []).map((r) => {
-        const match = /variant_type==['"]([^'"]*)['"]/.exec(r.if)
-        return { variantType: match?.[1] ?? '', resource: r.resource }
-      })
-      for (const prevId of stepNodeIds[i - 1]) {
-        const prevNode = nodes.find((n) => n.id === prevId)
-        if (prevNode) {
-          prevNode.data.routingMode = routing.mode as StationNodeData['routingMode']
-          prevNode.data.routingWeights = routingWeights
-          prevNode.data.routingRules = routingRules
-          prevNode.data.routingDefault = routing.default
-        }
-      }
-    }
   })
 
   // Fan every box in column i into every box in column i+1 (same as View)
@@ -2185,6 +2548,7 @@ function buildEditableGraph(
         position: { x: controllerX, y: poolY },
         data: {
           label: controllerBase,
+          savedName: controllerBase,
           stationType: 'Worker Controller',
           capacity: 1,
           cycleTime: 0,
@@ -2226,8 +2590,12 @@ function buildEditableGraph(
       // Controller, matching how Canvas.tsx's save mutation walks them).
       const staffed = staffedByController[controllerBase] ?? []
       staffed.forEach((stationBase, si) => {
-        const stationNodeId = nodes.find((n) => baseStationName(n.data.label) === stationBase)?.id
-        if (!stationNodeId) return
+        // Every box saved under that name — an older station with N machines
+        // is N boxes, each staffed like the station was.
+        const stationNodeIds = nodes
+          .filter((n) => n.data.label === stationBase || n.data.savedName === stationBase)
+          .map((n) => n.id)
+        if (stationNodeIds.length === 0) return
         const workplaceId = `wp_${poolNodeIndex++}_${controllerBase}_${si}`
         nodes.push({
           id: workplaceId,
@@ -2241,7 +2609,9 @@ function buildEditableGraph(
             operators: 0,
           },
         })
-        edges.push({ id: `e_${stationNodeId}__${workplaceId}`, source: stationNodeId, target: workplaceId })
+        for (const stationNodeId of stationNodeIds) {
+          edges.push({ id: `e_${stationNodeId}__${workplaceId}`, source: stationNodeId, target: workplaceId })
+        }
         edges.push({ id: `e_${workplaceId}__${controllerNodeId}`, source: workplaceId, target: controllerNodeId })
       })
     })
@@ -2249,6 +2619,23 @@ function buildEditableGraph(
 
   return { nodes, edges }
 }
+
+// Station settings the Canvas save writes itself (from the boxes and their
+// wiring). Everything else in a station's saved settings is kept as is.
+const CANVAS_STATION_KEYS = [
+  'capacity', 'shifts_per_day', 'operator_per_station', 'Station Type', 'Parallel Group',
+  // Start's Exit Controller (restored onto the Start box when it loads).
+  'MU Strategy', 'MU Priorities', 'MU Percentages',
+  'Conveyor Speed', 'Conveyor Length', 'Conveyor Width', 'Conveyor Height', 'Conveyor Capacity',
+  'Conveyor Sensor Length', 'Conveyor Sensor Position',
+  'Exit Strategy', 'Exit Percentages', 'Exit Priorities',
+  'Assembly Count', 'Assembly Inputs', 'Setup time',
+  'Buffer Capacity', 'Buffer Unlimited', 'Buffer Config Mode', 'Buffer X', 'Buffer Y', 'Buffer Z', 'Buffer Discipline',
+  'Repair Time', 'Failure Policy',
+  // Worker Controller wiring — rebuilt from the edges on every save.
+  'Worker Controller', 'Pool Workers', 'Enabled', 'Assignment Strategy', 'Queue Policy', 'Max Queue Size',
+  'Shift Start', 'Shift End', 'Allow Overtime', 'Use Worker Travel Time',
+]
 
 // Column/row spacing matching buildEditableGraph's own layout, needed again
 // here since ensureSourceAndDrain positions its inserted boxes relative to it.
@@ -2312,9 +2699,592 @@ function ensureSourceAndDrain(
   return { nodes: nextNodes, edges: nextEdges }
 }
 
+/** A conveyor's transport time (min) = Length (m) / Speed (m/min); undefined until both are > 0. */
+function conveyorTransportTime(data: StationNodeData): number | undefined {
+  const length = data.conveyorLength ?? 0
+  const speed = data.conveyorSpeed ?? 0
+  return length > 0 && speed > 0 ? length / speed : undefined
+}
+
+/** Up to `digits` decimals (default 2), no trailing zeros (30, 2.5, 3.33). */
+function formatDecimal(n: number, digits = 2): string {
+  const f = 10 ** digits
+  return String(Math.round(n * f) / f)
+}
+
+// Conveyor Sensor pop-up — a sensor's position along the belt (Length, m)
+// and whether a job's Front or Rear end triggers it (only one). OK saves and
+// closes, Apply saves and stays open, Cancel closes without changes.
+function ConveyorSensorDialog({ conveyorName, conveyorLength, initial, onApply, onClose }: {
+  conveyorName: string
+  conveyorLength: number
+  initial?: { length: number; position: 'front' | 'rear' }
+  onApply: (sensor: { length: number; position: 'front' | 'rear' }) => void
+  onClose: () => void
+}) {
+  const [lengthDraft, setLengthDraft] = useState(String(initial?.length ?? 0))
+  const [position, setPosition] = useState<'front' | 'rear'>(initial?.position ?? 'front')
+
+  const length = lengthDraft.trim() === '' ? NaN : Number(lengthDraft)
+  const valid = Number.isFinite(length) && length >= 0 && length <= conveyorLength
+  const sensor = { length, position }
+
+  return createPortal(
+    <div className="fixed inset-0 z-[9999] flex items-center justify-center">
+      <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={onClose} />
+      <div className="relative bg-white rounded-2xl shadow-2xl w-[340px] overflow-hidden">
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100 bg-gradient-to-r from-blue-50 to-indigo-50">
+          <div>
+            <h2 className="text-sm font-bold text-gray-900">Sensor</h2>
+            <p className="text-xs text-gray-400 mt-0.5">{conveyorName}</p>
+          </div>
+          <button onClick={onClose} className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        {/* Fields */}
+        <div className="p-5 space-y-4">
+          <div>
+            <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+              Length (m)
+            </label>
+            <Input
+              type="number"
+              min={0}
+              value={lengthDraft}
+              onChange={(e) => setLengthDraft(e.target.value)}
+              className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+            />
+            {!valid && (
+              <p className="text-[10px] text-amber-600 mt-1">
+                Sensor length must be between 0 and the conveyor length ({formatDecimal(conveyorLength)} m).
+              </p>
+            )}
+          </div>
+          <div className="space-y-2">
+            {(['front', 'rear'] as const).map((p) => (
+              <label key={p} className="flex items-center gap-2 text-xs font-semibold text-gray-700">
+                <input
+                  type="checkbox"
+                  checked={position === p}
+                  onChange={() => setPosition(p)}
+                />
+                {p === 'front' ? 'Front' : 'Rear'}
+              </label>
+            ))}
+          </div>
+        </div>
+
+        {/* Buttons */}
+        <div className="flex justify-end gap-2 px-5 py-4 border-t border-gray-100">
+          <Button
+            size="sm"
+            disabled={!valid}
+            onClick={() => { onApply(sensor); onClose() }}
+          >
+            OK
+          </Button>
+          <Button size="sm" variant="outline" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button size="sm" variant="outline" disabled={!valid} onClick={() => onApply(sensor)}>
+            Apply
+          </Button>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  )
+}
+
+// A row of the MU table pop-up: a MuRow plus where it came from — `orig` is
+// the product's name when the pop-up opened (undefined for a row added here),
+// `copyFrom` the existing product whose route a new row copies.
+interface MuDialogRow extends MuRow {
+  orig?: string
+  copyFrom?: string
+}
+
+// Start's MU table (Tecnomatix style): one row per product the Start
+// creates — MU (the product), Number (how many), Name (a display name),
+// Interval (minutes between its jobs), Colour (its jobs on the Canvas).
+// Apply saves it to the scenario at
+// once (see applyMuTable): a new row copies an existing product's route, a
+// deleted row (after a confirmation) takes its route with it, a renamed MU
+// renames the product everywhere.
+function MuTableDialog({ startName, initial, onApply, onClose }: {
+  startName: string
+  initial: MuDialogRow[]
+  onApply: (rows: MuDialogRow[]) => Promise<void> | void
+  onClose: () => void
+}) {
+  const [rows, setRows] = useState<MuDialogRow[]>(initial)
+  const [confirmDelete, setConfirmDelete] = useState<number | null>(null)
+  const [saving, setSaving] = useState(false)
+  const update = (i: number, patch: Partial<MuDialogRow>) =>
+    setRows((rs) => rs.map((r, ri) => (ri === i ? { ...r, ...patch } : r)))
+  // Products a new row can copy its route from — as named in the table now.
+  const existing = rows.filter((r) => r.orig !== undefined)
+
+  const names = rows.map((r) => r.mu.trim())
+  const problem =
+    names.some((n) => !n) ? 'Every row needs an MU (product) name.'
+      : new Set(names).size !== names.length ? 'Two rows have the same MU — each product needs its own name.'
+        : rows.some((r) => !Number.isInteger(r.number) || r.number < 0) ? 'Number must be a whole number, 0 or more.'
+          : rows.some((r) => r.interval != null && (!Number.isFinite(r.interval) || r.interval < 0)) ? 'Interval must be 0 or more (empty = all jobs at once).'
+            : rows.some((r) => r.orig === undefined && !r.copyFrom) ? 'Pick which product a new row copies its route from.'
+              : undefined
+  // Two products with one colour is allowed, just hard to tell apart.
+  const colors = rows.map((r) => (r.color ?? '').toLowerCase())
+  const sameColor = rows.find((r, i) => r.color && colors.indexOf(colors[i]) !== i)
+  const sameColorAs = sameColor ? rows[colors.indexOf((sameColor.color ?? '').toLowerCase())] : undefined
+
+  const apply = async () => {
+    setSaving(true)
+    try {
+      await onApply(rows.map((r) => ({ ...r, mu: r.mu.trim(), name: r.name.trim() })))
+      onClose()
+    } catch {
+      // Not saved (the error was already shown) — stay open to retry.
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const head = 'px-2 py-1.5 text-[10px] font-bold uppercase tracking-widest text-left whitespace-nowrap'
+  const cellInput = 'h-8 text-sm rounded-md border-gray-200 bg-gray-50 focus:bg-white'
+  const deleting = confirmDelete !== null ? rows[confirmDelete] : null
+
+  return createPortal(
+    <div className="fixed inset-0 z-[9999] flex items-center justify-center">
+      <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={onClose} />
+      <div className="relative bg-white rounded-2xl shadow-2xl w-[760px] max-h-[80vh] flex flex-col overflow-hidden">
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100 bg-gradient-to-r from-blue-50 to-indigo-50">
+          <div>
+            <h2 className="text-sm font-bold text-gray-900">MU</h2>
+            <p className="text-xs text-gray-400 mt-0.5">{startName}</p>
+          </div>
+          <button onClick={onClose} className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        {/* Table */}
+        <div className="p-5 overflow-auto">
+          <table className="w-full text-sm border border-gray-200 rounded-lg">
+            <thead>
+              {/* Column data types, as in Tecnomatix */}
+              <tr className="bg-gray-50 text-gray-400 border-b border-gray-200">
+                <th className={`${head} w-12`}></th>
+                <th className={head}>object <span className="text-gray-300">1</span></th>
+                <th className={head}>integer <span className="text-gray-300">2</span></th>
+                <th className={head}>string <span className="text-gray-300">3</span></th>
+                <th className={head}>time <span className="text-gray-300">4</span></th>
+                <th className={head}>color <span className="text-gray-300">5</span></th>
+                <th className="w-8"></th>
+              </tr>
+              <tr className="bg-blue-50/60 text-gray-700 border-b border-gray-200">
+                <th className={`${head} text-gray-400`}>string</th>
+                <th className={head}>MU</th>
+                <th className={head}>Number</th>
+                <th className={head}>Name</th>
+                <th className={head}>Interval (min)</th>
+                <th className={head}>Colour</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, i) => (
+                <tr key={i} className="border-b border-gray-100 last:border-0 align-top">
+                  <td className="px-2 py-2.5 text-xs font-semibold text-gray-400">{i + 1}</td>
+                  <td className="px-2 py-1">
+                    <Input
+                      value={r.mu}
+                      onChange={(e) => update(i, { mu: e.target.value })}
+                      placeholder="Product"
+                      className={cellInput}
+                    />
+                    {/* A new product starts with a copy of an existing route. */}
+                    {r.orig === undefined && (
+                      <select
+                        value={r.copyFrom ?? ''}
+                        onChange={(e) => update(i, { copyFrom: e.target.value || undefined })}
+                        className="mt-1 w-full h-7 text-[11px] text-gray-700 bg-white border border-gray-200 rounded-md px-1.5"
+                      >
+                        <option value="">Copy route from…</option>
+                        {existing.map((x) => (
+                          <option key={x.orig} value={x.orig}>Copy route from {x.mu.trim() || x.orig}</option>
+                        ))}
+                      </select>
+                    )}
+                  </td>
+                  <td className="px-2 py-1">
+                    <Input
+                      type="number"
+                      min={0}
+                      step={1}
+                      value={Number.isFinite(r.number) ? r.number : ''}
+                      onFocus={(e) => e.target.select()}
+                      onChange={(e) => update(i, { number: e.target.value === '' ? NaN : Number(e.target.value) })}
+                      className={`${cellInput} w-24`}
+                    />
+                  </td>
+                  <td className="px-2 py-1">
+                    <Input
+                      value={r.name}
+                      onChange={(e) => update(i, { name: e.target.value })}
+                      placeholder="Display name"
+                      className={cellInput}
+                    />
+                  </td>
+                  <td className="px-2 py-1">
+                    <Input
+                      type="number"
+                      min={0}
+                      value={r.interval != null && Number.isFinite(r.interval) ? r.interval : ''}
+                      onFocus={(e) => e.target.select()}
+                      onChange={(e) => update(i, { interval: e.target.value === '' ? null : Number(e.target.value) })}
+                      placeholder="—"
+                      className={`${cellInput} w-24`}
+                    />
+                  </td>
+                  <td className="px-2 py-1">
+                    <input
+                      type="color"
+                      value={r.color ?? '#3b82f6'}
+                      onChange={(e) => update(i, { color: e.target.value })}
+                      title="Pick this product's colour"
+                      className="h-8 w-12 cursor-pointer rounded-md border border-gray-200 bg-gray-50 p-0.5"
+                    />
+                  </td>
+                  <td className="px-1 py-2">
+                    <button
+                      onClick={() => (r.orig === undefined
+                        ? setRows((rs) => rs.filter((_, ri) => ri !== i))
+                        : setConfirmDelete(i))}
+                      className="text-gray-300 hover:text-red-500 transition-colors"
+                      aria-label="Delete row"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+              {rows.length === 0 && (
+                <tr>
+                  <td colSpan={7} className="py-6 text-center text-gray-400 text-xs">No products yet — add a row below.</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+          <button
+            onClick={() => setRows((rs) => [...rs, {
+              mu: '', number: 0, name: '', interval: null, copyFrom: rs.find((x) => x.orig !== undefined)?.orig,
+              color: unusedVariantColor(rs.map((x) => x.color ?? ''), rs.length),
+            }])}
+            className="mt-3 flex items-center gap-1.5 text-xs font-semibold text-blue-600 hover:text-blue-700"
+          >
+            <Plus className="h-3.5 w-3.5" /> Add row
+          </button>
+          {problem && (
+            <p className="text-[10px] text-amber-600 mt-2">{problem}</p>
+          )}
+          {sameColor && sameColorAs && (
+            <p className="text-[10px] text-amber-600 mt-2">
+              {sameColorAs.mu || 'A row'} and {sameColor.mu || 'another row'} have the same colour — their jobs will look alike.
+            </p>
+          )}
+        </div>
+
+        {/* Buttons */}
+        <div className="flex justify-end gap-2 px-5 py-4 border-t border-gray-100">
+          <Button size="sm" variant="outline" disabled={saving} onClick={onClose}>
+            Cancel
+          </Button>
+          <Button size="sm" variant="outline" disabled={!!problem || saving} onClick={apply}>
+            {saving ? 'Saving…' : 'Apply'}
+          </Button>
+        </div>
+
+        {/* Deleting a product also deletes its route — ask first. */}
+        {deleting && (
+          <div className="absolute inset-0 flex items-center justify-center bg-white/70">
+            <div className="bg-white rounded-xl shadow-xl border border-gray-100 w-[340px] p-5">
+              <p className="text-sm text-gray-800">
+                Delete <span className="font-semibold">{deleting.orig}</span> and its route?
+              </p>
+              <p className="text-xs text-gray-400 mt-1">
+                Its quantity, interval and its route through the stations are removed when you click Apply.
+              </p>
+              <div className="flex justify-end gap-2 mt-4">
+                <Button size="sm" variant="outline" onClick={() => setConfirmDelete(null)}>
+                  Cancel
+                </Button>
+                <Button
+                  size="sm"
+                  className="bg-red-600 hover:bg-red-700"
+                  onClick={() => {
+                    setRows((rs) => rs
+                      .filter((_, ri) => ri !== confirmDelete)
+                      .map((x) => (x.copyFrom === deleting.orig ? { ...x, copyFrom: undefined } : x)))
+                    setConfirmDelete(null)
+                  }}
+                >
+                  Delete
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>,
+    document.body,
+  )
+}
+
+// What Save would write from the canvas — compared to tell unsaved changes.
+// Box positions aren't saved, so they don't count.
+function canvasSignatureOf(nodes: Node<StationNodeData>[], edges: Edge[]): string {
+  return JSON.stringify({
+    n: nodes.map((n) => [n.id, n.data]),
+    e: edges.map((e) => [e.source, e.target]),
+  })
+}
+
+// Asked before Delete removes the selected stations / lines from the Canvas.
+function ConfirmDeleteDialog({ stations, lines, onDelete, onClose }: {
+  stations: number
+  lines: number
+  onDelete: () => void
+  onClose: () => void
+}) {
+  const what = [
+    stations > 0 ? `${stations} station${stations > 1 ? 's' : ''}` : '',
+    lines > 0 ? `${lines} connection${lines > 1 ? 's' : ''}` : '',
+  ].filter(Boolean).join(' and ')
+  return createPortal(
+    <div className="fixed inset-0 z-[9999] flex items-center justify-center">
+      <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={onClose} />
+      <div className="relative bg-white rounded-2xl shadow-2xl w-[380px] overflow-hidden">
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100 bg-gradient-to-r from-blue-50 to-indigo-50">
+          <h2 className="text-sm font-bold text-gray-900">Delete</h2>
+          <button onClick={onClose} className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="p-5 text-sm text-gray-700">
+          Are you sure you want to delete <span className="font-semibold">{what}</span>?
+          {stations > 0 && (
+            <p className="text-xs text-gray-400 mt-1">Their connections are removed too.</p>
+          )}
+        </div>
+
+        {/* Buttons */}
+        <div className="flex justify-end gap-2 px-5 py-4 border-t border-gray-100">
+          <Button size="sm" variant="outline" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button size="sm" className="bg-red-600 hover:bg-red-700" onClick={onDelete} autoFocus>
+            Delete
+          </Button>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  )
+}
+
+// Asked when switching product in Build with unsaved changes on the Canvas.
+function SwitchProductDialog({ from, to, saving, onSave, onDiscard, onClose }: {
+  from: string
+  to: string
+  saving: boolean
+  onSave: () => void
+  onDiscard: () => void
+  onClose: () => void
+}) {
+  return createPortal(
+    <div className="fixed inset-0 z-[9999] flex items-center justify-center">
+      <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={onClose} />
+      <div className="relative bg-white rounded-2xl shadow-2xl w-[380px] overflow-hidden">
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100 bg-gradient-to-r from-blue-50 to-indigo-50">
+          <div>
+            <h2 className="text-sm font-bold text-gray-900">Unsaved changes</h2>
+            <p className="text-xs text-gray-400 mt-0.5">{from}</p>
+          </div>
+          <button onClick={onClose} className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="p-5 text-sm text-gray-700">
+          Save changes to <span className="font-semibold">{from}</span> before opening <span className="font-semibold">{to}</span>?
+        </div>
+
+        {/* Buttons */}
+        <div className="flex justify-end gap-2 px-5 py-4 border-t border-gray-100">
+          <Button size="sm" disabled={saving} onClick={onSave}>
+            {saving ? 'Saving…' : 'Save'}
+          </Button>
+          <Button size="sm" variant="outline" disabled={saving} onClick={onDiscard}>
+            Discard
+          </Button>
+          <Button size="sm" variant="outline" disabled={saving} onClick={onClose}>
+            Cancel
+          </Button>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  )
+}
+
 /** Strip a trailing " #N" suffix used to label parallel-machine boxes, e.g. "Stitching #2" -> "Stitching" */
 function baseStationName(label: string): string {
   return label.replace(/\s+#\d+$/, '')
+}
+
+/** The station a box is saved as. A machine of a parallel group is a station
+ *  of its own, named exactly like its box; otherwise "Name #2" boxes are
+ *  machines of one station "Name" (boxes drawn before groups existed). */
+function stationKey(n: Node<StationNodeData>): string {
+  return n.data.parallelGroup ? n.data.label : baseStationName(n.data.label)
+}
+
+/** What a box counts as for routing: its parallel group (all its machines
+ *  are one stop), or its station. */
+function groupKey(n: Node<StationNodeData>): string {
+  return n.data.parallelGroup ?? baseStationName(n.data.label)
+}
+
+// Distinct next boxes of a station (full label, so each parallel machine
+// "Station 2 #1", "#2", ... counts as its own path). Workplace/Worker/Worker
+// Controller edges are pool wiring, not a job's next step.
+function exitSuccessorLabels(nodeId: string, nodes: Node<StationNodeData>[], edges: Edge[]): string[] {
+  return Array.from(new Set(
+    edges
+      .filter((e) => e.source === nodeId)
+      .map((e) => nodes.find((n) => n.id === e.target))
+      .filter((n): n is Node<StationNodeData> => !!n)
+      .filter((n) => {
+        const t = inferStationType(n.data.label, n.data.stationType)
+        return t !== 'Workplace' && t !== 'Worker' && t !== 'Worker Controller'
+      })
+      .map((n) => n.data.label)
+  ))
+}
+
+// A split: a station connected to 2+ DIFFERENT next stations (Station 2,
+// Station 3, ... — parallel copies of one station don't count on their own).
+// Each job goes to only one of them, picked by the station's Exit
+// Controller. Supported for now: every path is one station, and all paths
+// meet again at the same next station (or all end). `problem` explains a
+// shape that isn't supported yet.
+interface CanvasSplit {
+  sourceId: string
+  sourceLabel: string
+  bases: string[]
+  problem?: string
+}
+
+function canvasSplits(nodes: Node<StationNodeData>[], edges: Edge[]): CanvasSplit[] {
+  const typeOf = (n: Node<StationNodeData>) => inferStationType(n.data.label, n.data.stationType)
+  const isWiring = (n: Node<StationNodeData>) => ['Worker', 'Worker Controller', 'Workplace'].includes(typeOf(n))
+  const byId = new Map(nodes.map((n) => [n.id, n]))
+  const nextOf = (id: string) => edges
+    .filter((e) => e.source === id)
+    .map((e) => byId.get(e.target))
+    .filter((n): n is Node<StationNodeData> => !!n && !isWiring(n))
+  const prevOf = (id: string) => edges
+    .filter((e) => e.target === id)
+    .map((e) => byId.get(e.source))
+    .filter((n): n is Node<StationNodeData> => !!n && !isWiring(n))
+  const baseSet = (list: Node<StationNodeData>[]) => Array.from(new Set(list.map(groupKey)))
+
+  const splits: CanvasSplit[] = []
+  for (const n of nodes) {
+    if (isWiring(n) || typeOf(n) === 'Drain') continue
+    const bases = baseSet(nextOf(n.id).filter((d) => typeOf(d) !== 'Drain' && typeOf(d) !== 'Source'))
+    if (bases.length < 2) continue
+    const sourceBase = groupKey(n)
+    const branchNodes = nodes.filter((b) => bases.includes(groupKey(b)))
+    let problem: string | undefined
+    const ends = new Set<string>()
+    for (const b of branchNodes) {
+      const t = typeOf(b)
+      if (t === 'Buffer' || t === 'Connector') {
+        problem = `${b.data.label}: a path must start with a station, not a ${t}.`
+        break
+      }
+      const after = baseSet(nextOf(b.id))
+      if (after.length > 1) {
+        problem = `${b.data.label} splits again — a split inside a path isn't supported yet.`
+        break
+      }
+      ends.add(after[0] ?? '')
+      if (baseSet(prevOf(b.id)).some((p) => p !== sourceBase)) {
+        problem = `${b.data.label} is also fed from another station — each path must come only from ${sourceBase}.`
+        break
+      }
+    }
+    if (!problem && ends.size > 1) {
+      problem = 'Each path must be one station, and all paths must meet at the same next station.'
+    }
+    splits.push({ sourceId: n.id, sourceLabel: n.data.label, bases, problem })
+  }
+  return splits
+}
+
+// Why the parallel groups can't be saved as drawn, or undefined. Every box is
+// saved as a station of its own name, so names must be unique; and a group's
+// machines are one stop, so they must all be wired to the same stations.
+function parallelGroupProblem(nodes: Node<StationNodeData>[], edges: Edge[]): string | undefined {
+  const typeOf = (n: Node<StationNodeData>) => inferStationType(n.data.label, n.data.stationType)
+  const isWiring = (n: Node<StationNodeData>) => ['Worker', 'Worker Controller', 'Workplace'].includes(typeOf(n))
+  const byId = new Map(nodes.map((n) => [n.id, n]))
+  const named = new Map<string, Node<StationNodeData>>()
+  for (const n of nodes) {
+    if (!n.data.parallelGroup) continue
+    const other = named.get(n.data.label)
+    if (other) return `Two boxes are named "${n.data.label}" — give each machine its own name.`
+    named.set(n.data.label, n)
+    const clash = nodes.find((o) => o !== n && !o.data.parallelGroup && stationKey(o) === n.data.label)
+    if (clash) return `Two boxes are named "${n.data.label}" — give each machine its own name.`
+  }
+  const wiredTo = (n: Node<StationNodeData>, dir: 'next' | 'prev') => Array.from(new Set(edges
+    .filter((e) => (dir === 'next' ? e.source : e.target) === n.id)
+    .map((e) => byId.get(dir === 'next' ? e.target : e.source))
+    .filter((o): o is Node<StationNodeData> => !!o && !isWiring(o))
+    .map(groupKey))).sort().join('|')
+  const groups = new Map<string, Node<StationNodeData>[]>()
+  for (const n of nodes) if (n.data.parallelGroup) groups.set(n.data.parallelGroup, [...(groups.get(n.data.parallelGroup) ?? []), n])
+  for (const [group, members] of groups) {
+    if (members.length < 2) continue
+    for (const dir of ['prev', 'next'] as const) {
+      const odd = members.find((m) => wiredTo(m, dir) !== wiredTo(members[0], dir))
+      if (odd) {
+        return `${odd.data.label} and ${members[0].data.label} are machines of parallel group ${group}, so they must be connected to the same stations.`
+      }
+    }
+  }
+  return undefined
+}
+
+// Exit Controller "Successor" priorities, one per successor. Unset boxes
+// show their position (1, 2, 3, ...) as the default order.
+function exitPriorityValues(data: StationNodeData, successors: string[]): number[] {
+  return successors.map((s, i) => data.exitPriorities?.[s] ?? i + 1)
+}
+
+// Valid = each of 1..N used exactly once.
+function exitPrioritiesAreValid(priorities: number[]): boolean {
+  return [...priorities].sort((a, b) => a - b).every((p, i) => p === i + 1)
 }
 
 /**
@@ -2335,7 +3305,7 @@ function normalizeShiftsPerDay(value: number | number[] | undefined): number[] {
 export default function Canvas() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const { activeScenario, activeRun, setActiveScenario, showToast, setJustReset } = useAppStore()
+  const { activeScenario, activeRun, setActiveScenario, setActiveRun, showToast, setJustReset } = useAppStore()
   const isDark = useAppStore(s => s.theme) === 'dark'
 
   // Memoized so React Flow always sees the same object reference across renders/HMR —
@@ -2355,6 +3325,22 @@ export default function Canvas() {
   // Build mode state
   const [nodes, setNodes, onNodesChange] = useNodesState<StationNodeData>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState([])
+  // The product (variant) whose line is on the Build canvas — Save writes
+  // only that product's route; every other product is kept as it is.
+  const [buildVariant, setBuildVariant] = useState<string | null>(null)
+  // The product the last Save wrote (read once it succeeds).
+  const savedVariantRef = useRef<string | null>(null)
+  // Unsaved changes: the canvas as last loaded/saved, compared with now.
+  // Box positions aren't saved, so they don't count.
+  const canvasSignature = canvasSignatureOf(nodes, edges)
+  const [savedSignature, setSavedSignature] = useState<string | null>(null)
+  const canvasDirty = savedSignature === null ? nodes.length > 0 : savedSignature !== canvasSignature
+  // Bumped to make Build reload the selected product's line.
+  const [reloadTick, setReloadTick] = useState(0)
+  // The Start box whose MU table pop-up is open.
+  const [muDialogNodeId, setMuDialogNodeId] = useState<string | null>(null)
+  // Product to open once the "unsaved changes" question is answered.
+  const [switchTarget, setSwitchTarget] = useState<string | null>(null)
   // Worker/Worker Controller/Workplace wiring is a data relationship, not a
   // process-flow connection — hide those edges' lines on the canvas however
   // they were created (drag-drawn, or via a picker checkbox), so the
@@ -2420,9 +3406,23 @@ export default function Canvas() {
   }, [variants, selectedVariant])
 
   const stationStats = useMemo(() => {
-    const out: Record<string, { utilization: number; jobs: number }> = {}
+    const out: Record<string, {
+      utilization: number; jobs: number
+      bufferCapacity: number; bufferDiscipline: string
+      bufferBlockedRatio: number; bufferBlockedTime: number
+      rackLaneCount: number | null | undefined; rackOccupied: number | null | undefined
+    }> = {}
     for (const s of (activeRun?.station_stats ?? [])) {
-      out[s.station_name] = { utilization: s.station_utilization, jobs: s.completed_jobs }
+      out[s.station_name] = {
+        utilization: s.station_utilization,
+        jobs: s.completed_jobs,
+        bufferCapacity: s.buffer_capacity,
+        bufferDiscipline: s.buffer_discipline,
+        bufferBlockedRatio: s.buffer_blocked_ratio,
+        bufferBlockedTime: s.buffer_blocked_time,
+        rackLaneCount: s.rack_lane_count,
+        rackOccupied: s.rack_occupied,
+      }
     }
     return out
   }, [activeRun])
@@ -2461,6 +3461,15 @@ export default function Canvas() {
   const selectedFlowNode = useMemo(
     () => viewNodes.find((n) => n.id === selectedFlowNodeId && n.type === 'flow') as Node<FlowNodeData> | undefined,
     [viewNodes, selectedFlowNodeId]
+  )
+
+  // The View-mode panel needs the *inferred* type (queue/buffer name-matching
+  // included), not just the raw stations_data "Station Type" field — a lot of
+  // Buffer nodes (e.g. "Welding_Queue2") have no explicit Station Type set and
+  // are only recognised as Buffer via inferStationType's name heuristics.
+  const selectedFlowNodeType = useMemo(
+    () => selectedFlowNode ? inferStationType(baseStationName(selectedFlowNode.data.resource), selectedFlowNode.data.stationType) : undefined,
+    [selectedFlowNode]
   )
 
   // Per-station completion-log breakdown (job_id + status) for the clicked
@@ -2511,7 +3520,8 @@ export default function Canvas() {
   // plus overall completed/in-progress/still-waiting split.
   const exitCount = activeRun?.status === 'completed' ? (activeRun.completed_jobs ?? 0) : 0
   const exitInProgress = activeRun?.in_progress_jobs ?? 0
-  const exitStillWaiting = Math.max(0, entryCount - exitCount - exitInProgress)
+  const exitScrapped = Number((activeRun?.result?.simulation_state as { scrapped_jobs?: number } | undefined)?.scrapped_jobs ?? 0)
+  const exitStillWaiting = Math.max(0, entryCount - exitCount - exitInProgress - exitScrapped)
   const exitPct = entryCount > 0 ? Math.round((exitCount / entryCount) * 100) : 0
   const exitPerStation = useMemo(
     () => [...(activeRun?.station_stats ?? [])]
@@ -2529,8 +3539,10 @@ export default function Canvas() {
     if (!activeScenario || activeRun?.status !== 'completed') return []
     const log = (activeRun.result?.['completion_log'] as Record<string, { job_id?: string; status?: string }[]> | undefined) ?? {}
     return Object.entries(activeScenario.processflow_data ?? {}).map(([variant, steps]) => {
-      const lastStep = steps[steps.length - 1]
-      const finalStations = lastStep ? stepResourceOptions(lastStep.resource) : []
+      // Every station of the last column — a flow ending in a split finishes
+      // at whichever one each job went to.
+      const columns = stepColumns(steps)
+      const finalStations = (columns[columns.length - 1] ?? []).flatMap((s) => stepResourceOptions(s.resource))
       const alnumPrefix = variant.replace(/[^a-zA-Z0-9]/g, '')
       let completed = 0
       for (const station of finalStations) {
@@ -2562,30 +3574,95 @@ export default function Canvas() {
     (activeRun?.result as Record<string, unknown> | null)?.completion_log as Record<string, unknown[]> | undefined,
     [activeRun]
   )
+  // Build-mode job replay: which box each station (and parallel machine,
+  // "Station 2 #2" -> machine 2) is drawn at.
+  const replayTargets = useMemo<ReplayTarget[]>(() => nodes.map((n) => {
+    // A machine of a parallel group is a station of its own — unless the box
+    // still stands for machine N of an older station not yet saved as a group.
+    const ownStation = n.data.parallelGroup && (n.data.savedName === undefined || n.data.savedName === n.data.label)
+    const suffix = ownStation ? null : n.data.label.match(/\s+#(\d+)$/)
+    return {
+      nodeId: n.id,
+      station: ownStation ? n.data.label : baseStationName(n.data.label),
+      machine: suffix ? Number(suffix[1]) : 1,
+      isSource: inferStationType(n.data.label, n.data.stationType) === 'Source',
+      isDrain: inferStationType(n.data.label, n.data.stationType) === 'Drain',
+    }
+  }), [nodes])
+  const replayState = (activeRun?.result as { simulation_state?: { job_release_times?: Record<string, unknown>; job_finish_times?: Record<string, unknown> } } | null)?.simulation_state
+
+  // The store's copy of the scenario can be older than the saved one — the
+  // Scenarios page saves straight to the server without touching it. Fetch
+  // the latest once each time the Canvas opens (or the scenario changes),
+  // before any boxes are built from it, so the boxes never show — and Save
+  // never writes back — values already changed elsewhere.
+  const [freshScenarioId, setFreshScenarioId] = useState<number | null>(null)
+  useEffect(() => {
+    const id = activeScenario?.id
+    if (id === undefined || freshScenarioId === id) return
+    let cancelled = false
+    scenariosApi.get(id)
+      .then((fresh) => {
+        if (cancelled) return
+        setActiveScenario(fresh)
+        setFreshScenarioId(id)
+      })
+      // Offline / failed: fall back to the copy we have rather than an empty canvas.
+      .catch(() => { if (!cancelled) setFreshScenarioId(id) })
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeScenario?.id, freshScenarioId])
 
   // When switching into Build mode with a scenario loaded, populate the canvas
   // with editable boxes for that scenario (only if Build is currently empty —
   // so we never clobber in-progress manual edits).
   useEffect(() => {
     if (mode !== 'build' || !activeScenario || !selectedVariant) return
-    if (nodes.length > 0) return
+    if (freshScenarioId !== activeScenario.id) return
+    // Boxes already on the canvas stay — unless they are another product's
+    // line with nothing unsaved (e.g. a different product was picked in View).
+    if (nodes.length > 0 && (buildVariant === null || buildVariant === selectedVariant || canvasDirty)) return
     const { nodes: editNodes, edges: editEdges } = buildEditableGraph(
       activeScenario.processflow_data, selectedVariant, activeScenario.stations_data
     )
-    if (editNodes.length === 0) return
+    if (editNodes.length === 0) {
+      // A product with no route yet: an empty canvas, saved as that product.
+      setBuildVariant(selectedVariant)
+      return
+    }
     // Every line should start with a Source and end with a Drain (Tecnomatix
     // convention) — added automatically for scenarios saved before this
     // existed, or imported from Excel/YAML, which never have them.
-    const { nodes: finalNodes, edges: finalEdges } = ensureSourceAndDrain(editNodes, editEdges, nextNodeId)
+    const { nodes: drawnNodes, edges: finalEdges } = ensureSourceAndDrain(editNodes, editEdges, nextNodeId)
+    // The Start isn't a route step, so it is drawn fresh — give it back its
+    // saved MU table and Exit Controller.
+    const finalNodes = drawnNodes.map((n) => {
+      if (inferStationType(n.data.label, n.data.stationType) !== 'Source') return n
+      const cfg = activeScenario.stations_data?.[n.data.label]
+      if (!cfg) return n
+      return {
+        ...n,
+        data: {
+          ...n.data,
+          ...(cfg['MU Table'] ? { muTable: cfg['MU Table'] } : {}),
+          ...(cfg['MU Strategy'] ? { muStrategy: cfg['MU Strategy'] } : {}),
+          ...(cfg['MU Priorities'] ? { muPriorities: cfg['MU Priorities'] } : {}),
+          ...(cfg['MU Percentages'] ? { muPercentages: cfg['MU Percentages'] } : {}),
+        },
+      }
+    })
     // Reconstructed/imported edges carry no handle info of their own —
     // normalized the same way onConnect normalizes new edges, so a reload
     // renders the same clean right-to-left flow instead of React Flow
     // picking default (possibly backward-looking) anchor points.
+    const loadedEdges = finalEdges.map((e) => ({ ...e, sourceHandle: 'right', targetHandle: 'left' }))
     setNodes(finalNodes)
-    setEdges(finalEdges.map((e) => ({ ...e, sourceHandle: 'right', targetHandle: 'left' })))
+    setEdges(loadedEdges)
     setScenarioName(activeScenario.name)
+    setBuildVariant(selectedVariant)
+    setSavedSignature(canvasSignatureOf(finalNodes, loadedEdges))
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, activeScenario, selectedVariant])
+  }, [mode, activeScenario, selectedVariant, freshScenarioId, reloadTick])
 
   // Build mode handlers.
   // Every station has a "left" and "right" dot, both declared type="source"
@@ -2649,7 +3726,7 @@ export default function Canvas() {
         typeName === 'Connector' || typeName === 'Worker' || typeName === 'Worker Controller'
           ? { label, stationType: typeName, capacity: 1, cycleTime: 0, operators: 0, shiftsPerDay: [1] }
           : typeName === 'Conveyor'
-            ? { label, stationType: typeName, capacity: 1, cycleTime: 0, operators: 0, transportTime: 5, shiftsPerDay: [1] }
+            ? { label, stationType: typeName, capacity: 1, cycleTime: 0, operators: 0, conveyorSpeed: 1, conveyorCapacity: 1, shiftsPerDay: [1] }
             : { label, stationType: typeName, capacity: 1, cycleTime: 30, operators: 1, shiftsPerDay: [1] }
       return [
         ...nds,
@@ -2758,6 +3835,89 @@ export default function Canvas() {
     if (selectedNode?.id === id) setSelectedNode((p) => p ? { ...p, data: { ...p.data, ...patch } } : null)
   }
 
+  // Ctrl+C / Ctrl+V on the Build canvas: copies the selected stations (not
+  // Start/End — a line has one of each) and the lines between them; each
+  // paste lands a little lower-right, named "<name> copy", with the original's
+  // settings. Copied machines of a parallel group form a new group of their own.
+  const clipboardRef = useRef<{ nodes: Node<StationNodeData>[]; edges: Edge[] } | null>(null)
+  // What Delete is about to remove, waiting for the user to confirm.
+  const [pendingDelete, setPendingDelete] = useState<{ nodeIds: string[]; edgeIds: string[] } | null>(null)
+  const confirmDelete = () => {
+    if (!pendingDelete) return
+    const ids = new Set(pendingDelete.nodeIds)
+    const lines = new Set(pendingDelete.edgeIds)
+    setNodes((nds) => nds.filter((n) => !ids.has(n.id)))
+    // Lines of removed stations go too, hidden worker wiring included.
+    setEdges((eds) => eds.filter((ed) => !lines.has(ed.id) && !ids.has(ed.source) && !ids.has(ed.target)))
+    setSelectedNode(null)
+    setSelectedEdgeId(null)
+    setPendingDelete(null)
+  }
+  const pasteCountRef = useRef(0)
+  useEffect(() => {
+    if (mode !== 'build') return
+    const onKey = (e: KeyboardEvent) => {
+      const el = e.target as HTMLElement | null
+      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable)) return
+      // Delete / Backspace: ask before removing what is selected.
+      if ((e.key === 'Delete' || e.key === 'Backspace') && !e.ctrlKey && !e.metaKey) {
+        const nodeIds = nodes.filter((n) => n.selected).map((n) => n.id)
+        const edgeIds = edges.filter((ed) => ed.selected).map((ed) => ed.id)
+        if (nodeIds.length + edgeIds.length === 0) return
+        e.preventDefault()
+        setPendingDelete({ nodeIds, edgeIds })
+        return
+      }
+      if (!(e.ctrlKey || e.metaKey)) return
+      const key = e.key.toLowerCase()
+      if (key === 'c') {
+        const picked = nodes.filter((n) => n.selected && !['Source', 'Drain'].includes(inferStationType(n.data.label, n.data.stationType)))
+        if (picked.length === 0) return
+        const ids = new Set(picked.map((n) => n.id))
+        clipboardRef.current = { nodes: picked, edges: edges.filter((ed) => ids.has(ed.source) && ids.has(ed.target)) }
+        pasteCountRef.current = 0
+        showToast(`Copied ${picked.length} station${picked.length > 1 ? 's' : ''}`)
+      } else if (key === 'v' && clipboardRef.current) {
+        e.preventDefault()
+        const clip = clipboardRef.current
+        pasteCountRef.current += 1
+        const shift = 60 * pasteCountRef.current
+        const taken = new Set(nodes.flatMap((n) => [n.data.label, n.data.parallelGroup ?? '']))
+        const copyName = (name: string) => {
+          let candidate = `${name} copy`
+          for (let k = 2; taken.has(candidate); k++) candidate = `${name} copy ${k}`
+          taken.add(candidate)
+          return candidate
+        }
+        const newGroup: Record<string, string> = {}
+        const newId: Record<string, string> = {}
+        const pasted = clip.nodes.map((n) => {
+          newId[n.id] = `station_${nextNodeId()}`
+          const group = n.data.parallelGroup
+          if (group && !(group in newGroup)) newGroup[group] = copyName(group)
+          const data: StationNodeData = {
+            ...n.data,
+            label: copyName(n.data.label),
+            parallelGroup: group ? newGroup[group] : undefined,
+            savedName: undefined,
+            copiedFrom: n.data.savedName ?? stationKey(n),
+          }
+          return { ...n, id: newId[n.id], position: { x: n.position.x + shift, y: n.position.y + shift }, selected: true, data }
+        })
+        const pastedEdges = clip.edges.map((ed) => ({
+          ...ed, id: `e_${newId[ed.source]}__${newId[ed.target]}`, source: newId[ed.source], target: newId[ed.target], selected: false,
+        }))
+        setNodes((nds) => [...nds.map((n) => (n.selected ? { ...n, selected: false } : n)), ...pasted])
+        setEdges((eds) => [...eds.map((ed) => (ed.selected ? { ...ed, selected: false } : ed)), ...pastedEdges])
+        setSelectedNode(null)
+        showToast(`Pasted ${pasted.length} station${pasted.length > 1 ? 's' : ''}`)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, nodes, edges])
+
   const deleteNode = (id: string) => {
     setNodes((nds) => nds.filter((n) => n.id !== id))
     setEdges((eds) => eds.filter((e) => e.source !== id && e.target !== id))
@@ -2801,7 +3961,7 @@ export default function Canvas() {
     setNodes((nds) => {
       const station = nds.find((n) => n.id === stationId)
       if (!station) return nds
-      const label = `${baseStationName(station.data.label)} Workplace`
+      const label = `${stationKey(station)} Workplace`
       return [
         ...nds,
         {
@@ -2848,9 +4008,11 @@ export default function Canvas() {
   const shiftNames: Record<number, string | undefined> = Object.fromEntries(
     Array.from({ length: numShifts }, (_, i) => i + 1).map((n) => [n, simCfgRaw[`SHIFT_${n}_NAME`] as string | undefined])
   )
-  /** Add another parallel machine for this station: duplicates the box, renames
-   *  both to "Name #1" / "Name #2" (etc.), and wires the copy to the same
-   *  predecessors/successors so it stays a proper parallel branch. */
+  /** Add another parallel machine for this station: duplicates the box into
+   *  the station's parallel group ("Name #1", "Name #2", ...) and wires the
+   *  copy to the same predecessors/successors so it stays a proper parallel
+   *  branch. Each machine is a station of its own (own settings, own name —
+   *  renaming one keeps it in the group). */
   const addParallelMachine = (id: string) => {
     const newIdNum = nextNodeId()
     const newId = `station_${newIdNum}`
@@ -2858,16 +4020,19 @@ export default function Canvas() {
     setNodes((nds) => {
       const source = nds.find((n) => n.id === id)
       if (!source) return nds
-      const base = baseStationName(source.data.label)
-      const siblings = nds.filter((n) => baseStationName(n.data.label) === base)
-      const nextIndex = siblings.length + 1
+      const group = groupKey(source)
+      const siblings = nds.filter((n) => groupKey(n) === group)
 
-      // Ensure existing siblings (including the source) are labeled "#1", "#2", ...
+      // The first time, the station becomes machine #1 of its new group.
+      // Machines already in the group keep their names.
       const renamed = nds.map((n) => {
-        if (baseStationName(n.data.label) !== base) return n
-        const idx = siblings.indexOf(n) + 1
-        return { ...n, data: { ...n.data, label: `${base} #${idx}` } }
+        if (groupKey(n) !== group) return n
+        const label = n.data.parallelGroup || siblings.length > 1 ? n.data.label : `${group} #1`
+        return { ...n, data: { ...n.data, label, parallelGroup: group } }
       })
+      const taken = new Set(renamed.map((n) => n.data.label))
+      let nextIndex = siblings.length + 1
+      while (taken.has(`${group} #${nextIndex}`)) nextIndex += 1
 
       const stackOffset = 170   // vertical gap between stacked parallel-machine boxes
       const boxWidth = 180      // approx box width used for collision checks
@@ -2890,7 +4055,7 @@ export default function Canvas() {
         id: newId,
         type: 'station',
         position: { x: source.position.x, y: candidateY },
-        data: { ...source.data, label: `${base} #${nextIndex}` },
+        data: { ...source.data, label: `${group} #${nextIndex}`, parallelGroup: group },
       }
       return [...renamed, newNode]
     })
@@ -2909,30 +4074,93 @@ export default function Canvas() {
   }
 
   const saveMutation = useMutation({
-    mutationFn: () => {
-      // Boxes sharing a base name (e.g. "Stitching #1" / "Stitching #2") represent
-      // parallel machines of the SAME station — merge them into one station whose
-      // capacity is the count of boxes sharing that name.
+    mutationFn: async () => {
+      // Each station's settings as saved right now (fetched fresh, so edits
+      // made meanwhile in the Scenarios page are kept). Save starts from
+      // these and only changes what this Canvas manages — settings it
+      // doesn't show (Rework %, Enable Failures, Availability/MTBF, Material
+      // Shortage %, PM Schedule, ...) stay exactly as they were.
+      // Fetched fresh too: the other products' routes, quantities and
+      // intervals, which this Save keeps as they are.
+      const savedScenario = activeScenario ? await scenariosApi.get(activeScenario.id) : null
+      const savedStations: Record<string, Record<string, unknown>> =
+        (savedScenario?.stations_data ?? {}) as Record<string, Record<string, unknown>>
+
+      // Each machine of a parallel group is a station of its own, saved under
+      // its box's name (stationKey). Boxes drawn before groups existed that
+      // share a base name ("Stitching #1" / "Stitching #2") are still merged
+      // into one station whose capacity is the number of such boxes.
       const stationsData: ScenarioCreate['stations_data'] = {}
       const capacityCount: Record<string, number> = {}
       nodes.forEach((n) => {
-        const base = baseStationName(n.data.label)
+        const base = stationKey(n)
         capacityCount[base] = (capacityCount[base] ?? 0) + 1
       })
       nodes.forEach((n) => {
-        const base = baseStationName(n.data.label)
+        const base = stationKey(n)
+        // Its saved settings — under the name it was loaded with, so a
+        // station renamed here keeps them (a new machine copies the one it
+        // was added from). Minus every key this save writes itself (below,
+        // and the Worker Controller wiring further down), so something
+        // removed on the Canvas (a sensor, a wiring, ...) doesn't come back
+        // from the old copy.
+        const saved: Record<string, unknown> = {
+          ...(savedStations[n.data.savedName ?? base] ?? savedStations[base]
+            ?? (n.data.copiedFrom ? savedStations[n.data.copiedFrom] : undefined) ?? {}),
+        }
+        for (const key of CANVAS_STATION_KEYS) delete saved[key]
+        // Conveyor time is Length / Speed now; an older saved Transport Time
+        // would only confuse whoever reads the scenario.
+        if (n.data.conveyorSpeed !== undefined) delete saved['Transport Time']
         stationsData[base] = {
+          // A brand-new station's defaults; a saved one keeps its own.
+          'Failure rate': 0, 'PM Schedule': 'Monthly',
+          'Material Shortage Probability (%)': 0, 'Rework Probability (%)': 0,
+          shift1: '', shift2: '', shift3: '', STATION_DOWNTIME: 0,
+          ...saved,
           capacity: capacityCount[base], shifts_per_day: n.data.shiftsPerDay ?? [1],
           operator_per_station: n.data.operators,
+          ...(n.data.parallelGroup ? { 'Parallel Group': n.data.parallelGroup } : {}),
+          ...(n.data.muTable ? { 'MU Table': n.data.muTable } : {}),
+          // A Start saved from now on releases its products batch by batch:
+          // Cyclic unless another order was chosen. (A scenario never saved
+          // since keeps its old arrivals — the engine only orders a Start
+          // that has an MU Strategy.)
+          ...(inferStationType(n.data.label, n.data.stationType) === 'Source'
+            ? { 'MU Strategy': n.data.muStrategy ?? 'cyclic' } : {}),
+          ...(n.data.muPriorities ? { 'MU Priorities': n.data.muPriorities } : {}),
+          ...(n.data.muPercentages ? { 'MU Percentages': n.data.muPercentages } : {}),
           ...(n.data.stationType !== undefined ? { 'Station Type': n.data.stationType } : {}),
-          ...(n.data.transportTime !== undefined ? { 'Transport Time': n.data.transportTime } : {}),
+          ...(n.data.conveyorSpeed !== undefined ? { 'Conveyor Speed': n.data.conveyorSpeed } : {}),
+          ...(n.data.conveyorLength !== undefined ? { 'Conveyor Length': n.data.conveyorLength } : {}),
+          ...(n.data.conveyorWidth !== undefined ? { 'Conveyor Width': n.data.conveyorWidth } : {}),
+          ...(n.data.conveyorHeight !== undefined ? { 'Conveyor Height': n.data.conveyorHeight } : {}),
+          ...(n.data.conveyorCapacity !== undefined ? { 'Conveyor Capacity': n.data.conveyorCapacity } : {}),
+          ...(n.data.conveyorSensor ? {
+            'Conveyor Sensor Length': n.data.conveyorSensor.length,
+            'Conveyor Sensor Position': n.data.conveyorSensor.position === 'rear' ? 'Rear' : 'Front',
+          } : {}),
+          ...(n.data.exitStrategy !== undefined ? { 'Exit Strategy': n.data.exitStrategy } : {}),
+          ...(n.data.exitPercentages !== undefined ? { 'Exit Percentages': n.data.exitPercentages } : {}),
+          ...(n.data.exitPriorities !== undefined ? { 'Exit Priorities': n.data.exitPriorities } : {}),
           ...(n.data.assemblyCount !== undefined ? { 'Assembly Count': n.data.assemblyCount } : {}),
           ...(n.data.assemblyInputs !== undefined ? { 'Assembly Inputs': n.data.assemblyInputs } : {}),
           ...(n.data.setupTime !== undefined ? { 'Setup time': n.data.setupTime } : {}),
-          'Failure rate': 0, 'Repair Time': 10, 'PM Schedule': 'Monthly',
-          'Material Shortage Probability (%)': 0, 'Rework Probability (%)': 0,
-          shift1: '', shift2: '', shift3: '', STATION_DOWNTIME: 0,
-        }
+          // Buffer Quantity from the Build panel — only meaningful for a
+          // Buffer node (see backend's _is_buffer hand-off); harmless to
+          // include on every station since a real station reads its OWN
+          // 'Buffer Capacity'/'Buffer Unlimited' fields the same way (see
+          // ScenarioManager's Stations tab), just never set from here.
+          ...(n.data.bufferQuantity !== undefined ? { 'Buffer Capacity': n.data.bufferQuantity } : {}),
+          ...(n.data.bufferUnlimited !== undefined ? { 'Buffer Unlimited': n.data.bufferUnlimited } : {}),
+          ...(n.data.bufferConfigMode !== undefined ? { 'Buffer Config Mode': n.data.bufferConfigMode } : {}),
+          ...(n.data.bufferX !== undefined ? { 'Buffer X': n.data.bufferX } : {}),
+          ...(n.data.bufferY !== undefined ? { 'Buffer Y': n.data.bufferY } : {}),
+          ...(n.data.bufferZ !== undefined ? { 'Buffer Z': n.data.bufferZ } : {}),
+          ...(n.data.bufferOrder !== undefined ? { 'Buffer Discipline': n.data.bufferOrder } : {}),
+          'Repair Time': n.data.repairTime ?? 10,
+          'Failure Policy': n.data.failurePolicy ?? 'resume',
+        } as ScenarioCreate['stations_data'][string]
       })
 
       // Worker Controller is a live dispatch pool at run time (see
@@ -2983,7 +4211,7 @@ export default function Canvas() {
       nodes.forEach((n) => {
         const nodeType = inferStationType(n.data.label, n.data.stationType)
         if (nodeType !== 'Worker Controller') return
-        const controllerBase = baseStationName(n.data.label)
+        const controllerBase = stationKey(n)
         const controllerConfig = stationsData[controllerBase]
         if (!controllerConfig) return
 
@@ -3029,33 +4257,33 @@ export default function Canvas() {
         const staffedStations = upstreamNodes
           .filter((s) => inferStationType(s.data.label, s.data.stationType) !== 'Worker')
         for (const target of staffedStations) {
-          const targetConfig = stationsData[baseStationName(target.data.label)]
+          const targetConfig = stationsData[stationKey(target)]
           if (!targetConfig) continue
           targetConfig['Worker Controller'] = controllerBase
         }
       })
 
-      // Walk the graph (which may branch/merge for parallel stations, AND may
-      // branch for routing — "Exit controller type") into a single linear
-      // list of steps, one per distinct base station name, in flow order.
-      // A routing branch (one station with 2+ distinct next-stations, one of
-      // which has a routingMode set) becomes ONE step whose `resource` is a
-      // routing dict instead of a plain station name — the engine picks the
-      // actual destination per job at run time. Only a simple "fan out, then
-      // reconverge" shape is supported: after emitting the routing step, the
-      // walk continues from just ONE of the branches (any one — they're
-      // assumed to reconverge onto the same downstream stations).
+      // Walk the graph (which may branch/merge for parallel stations) into a
+      // single linear list of steps, one per distinct base station name, in
+      // flow order.
       const hasIncoming = new Set(edges.map((e) => e.target))
       const entryNodes = nodes.filter((n) => !hasIncoming.has(n.id))
       const steps: ScenarioCreate['processflow_data'][string] = []
       const seenStations = new Set<string>()
       // The duration written into the process-flow step. A Conveyor's time is
-      // its transport time (the engine reads "Transport Time" but falls back
-      // to the step duration), and a Connector never takes any time at all.
+      // its transport time, Length / Speed (the engine computes the same but
+      // falls back to the step duration), and a Connector never takes any
+      // time at all.
       const stepDuration = (n: Node<StationNodeData>): number => {
         const t = inferStationType(n.data.label, n.data.stationType)
-        if (t === 'Connector' || t === 'Worker' || t === 'Worker Controller' || t === 'Workplace') return 0
-        if (t === 'Conveyor') return n.data.transportTime ?? n.data.cycleTime
+        // Source/Drain are entry/exit markers, not work — the backend
+        // already treats them as zero-time passthroughs (_is_passthrough in
+        // sim_core.py) regardless of what's stored here, so writing a
+        // nonzero duration only misleads whoever edits it later in
+        // ScenarioManager's Grid mode (an editable "Start (min)" column that
+        // silently does nothing).
+        if (t === 'Connector' || t === 'Worker' || t === 'Worker Controller' || t === 'Workplace' || t === 'Source' || t === 'Drain') return 0
+        if (t === 'Conveyor') return conveyorTransportTime(n.data) ?? n.data.cycleTime
         return n.data.cycleTime
       }
       // Edges into a Worker, Worker Controller, or Workplace exist ONLY for
@@ -3072,6 +4300,25 @@ export default function Canvas() {
         return t === 'Worker' || t === 'Worker Controller' || t === 'Workplace'
       }
 
+      // The stations of each split share a "branch" number on their steps —
+      // the engine then sends each job to only ONE of them (see
+      // _branch_slots in sim_core.py). They are pushed back to back below,
+      // since the walk reaches all of a split's stations in the same round.
+      // A parallel group's machines are one stop the same way (each job goes
+      // to one machine), so a group outside any split gets a number too.
+      const branchOf: Record<string, number> = {}
+      const splits = canvasSplits(nodes, edges)
+      splits.forEach((split, i) => {
+        for (const b of split.bases) branchOf[b] ??= i + 1
+      })
+      let nextBranch = splits.length + 1
+      for (const n of nodes) {
+        const g = n.data.parallelGroup
+        if (g && branchOf[g] === undefined && nodes.filter((o) => o.data.parallelGroup === g).length > 1) {
+          branchOf[g] = nextBranch++
+        }
+      }
+
       let frontier = entryNodes
       const visitedNodeIds = new Set<string>()
       while (frontier.length > 0) {
@@ -3079,7 +4326,7 @@ export default function Canvas() {
         for (const n of frontier) {
           if (visitedNodeIds.has(n.id)) continue
           visitedNodeIds.add(n.id)
-          const base = baseStationName(n.data.label)
+          const base = stationKey(n)
           if (seenStations.has(base)) continue
           seenStations.add(base)
 
@@ -3087,42 +4334,91 @@ export default function Canvas() {
           const destNodes = outgoing
             .map((e) => nodes.find((nn) => nn.id === e.target))
             .filter((nn): nn is Node<StationNodeData> => !!nn)
-          const destBases = Array.from(new Set(destNodes.map((d) => baseStationName(d.data.label))))
 
-          if (destBases.length > 1 && n.data.routingMode) {
-            // Routing step: resource becomes a dict, not a plain string.
-            const mode = n.data.routingMode
-            const weights = n.data.routingWeights ?? {}
-            const rules = n.data.routingRules ?? []
-            steps.push({
-              operation: `${base}_op`,
-              duration: stepDuration(n),
-              resource: {
-                mode,
-                options: destBases,
-                ...(mode === 'percentage' ? { weights: destBases.map((d) => weights[d] ?? 1) } : {}),
-                ...(mode === 'condition' ? {
-                  rules: rules.map((r) => ({ if: `variant_type=='${r.variantType}'`, resource: r.resource })),
-                  default: n.data.routingDefault ?? destBases[0],
-                } : {}),
-              },
-            })
-            // Continue the walk from only ONE branch (fan-out/reconverge —
-            // both paths are assumed to lead back to the same downstream
-            // stations, so following any single one is equivalent).
-            const oneDest = destNodes.find((d) => baseStationName(d.data.label) === destBases[0])
-            if (oneDest) next.push(oneDest)
-          } else {
-            steps.push({ operation: `${base}_op`, resource: base, duration: stepDuration(n) })
+          // Source/Drain are entry/exit markers, not a step in the job's
+          // route — a saved scenario with a "Start"/"End" step in
+          // processflow_data shows a misleading editable column in
+          // ScenarioManager's Process Flow tab even at duration 0 (the
+          // column itself implies it's a real station). Skip pushing a step
+          // for them, but still walk through to whatever they connect to —
+          // Source has no incoming edge (it's always an entryNode) and Drain
+          // has no outgoing edges, so neither skip affects the rest of the
+          // walk.
+          const nodeType = inferStationType(n.data.label, n.data.stationType)
+          if (nodeType === 'Source' || nodeType === 'Drain') {
             for (const d of destNodes) next.push(d)
+            continue
           }
+
+          steps.push({
+            operation: `${base}_op`, resource: base, duration: stepDuration(n),
+            ...(branchOf[groupKey(n)] !== undefined ? { branch: branchOf[groupKey(n)] } : {}),
+          })
+          for (const d of destNodes) next.push(d)
         }
         frontier = next
       }
 
-      const variant = entryNodes.length > 0
-        ? `product_${baseStationName(entryNodes[0].data.label)}`.toLowerCase()
-        : 'product'
+      // The canvas is ONE product's line: the product it was loaded from
+      // (picked in View/Build). A brand-new line gets a name from its first box.
+      const savedFlow = (savedScenario?.processflow_data ?? {}) as ScenarioCreate['processflow_data']
+      const variant = buildVariant && (buildVariant in savedFlow || !savedScenario)
+        ? buildVariant
+        : entryNodes.length > 0
+          ? `product_${baseStationName(entryNodes[0].data.label)}`.toLowerCase()
+          : 'product'
+      savedVariantRef.current = variant
+
+      // Editing the scenario that's already open updates it in place (same
+      // id, same row) instead of creating a second copy. Only this product's
+      // route changes — every other product keeps its route, quantity and
+      // interval, and the stations only they use stay in the station list.
+      if (activeScenario && savedScenario) {
+        // Stations renamed here (a box loaded as one name, saved as another;
+        // an older N-machine station saved as its N machines): the other
+        // products' routes follow the new name(s).
+        const renamed: Record<string, string[]> = {}
+        for (const n of nodes) {
+          const key = stationKey(n)
+          const old = n.data.savedName
+          if (old && old !== key && savedStations[old] && !(old in stationsData)) {
+            if (!(renamed[old] ??= []).includes(key)) renamed[old].push(key)
+          }
+        }
+        for (const [name, cfg] of Object.entries(savedStations)) {
+          if (!(name in stationsData) && !(name in renamed)) {
+            stationsData[name] = cfg as ScenarioCreate['stations_data'][string]
+          }
+        }
+        const followRenames = (otherSteps: ScenarioCreate['processflow_data'][string]) => {
+          let nextBranch = Math.max(0, ...otherSteps.map((s) => s.branch ?? 0)) + 1
+          return otherSteps.flatMap((s) => {
+            const res = typeof s.resource === 'string' ? s.resource : undefined
+            const to = res !== undefined ? renamed[res] : undefined
+            if (!res || !to) return [s]
+            const op = (name: string) => (s.operation === res ? name : s.operation === `${res}_op` ? `${name}_op` : to.length === 1 ? s.operation : `${name}_op`)
+            if (to.length === 1) return [{ ...s, resource: to[0], operation: op(to[0]) }]
+            // One station became a parallel group: its machines are one stop.
+            const branch = s.branch ?? nextBranch++
+            return to.map((name) => ({ ...s, resource: name, operation: op(name), branch }))
+          })
+        }
+        const processflow: ScenarioCreate['processflow_data'] = {}
+        for (const [v, otherSteps] of Object.entries(savedFlow)) {
+          processflow[v] = v === variant ? steps : followRenames(otherSteps)
+        }
+        processflow[variant] = steps
+        const variantQty: Record<string, number> = {
+          ...(savedScenario.variant_quantities ?? {}),
+          [variant]: savedScenario.variant_quantities?.[variant] ?? 200,
+        }
+        return scenariosApi.update(activeScenario.id, {
+          name: scenarioName, stations_data: stationsData, processflow_data: processflow,
+          variant_quantities: variantQty,
+          variant_intervals: savedScenario.variant_intervals ?? {},
+        })
+      }
+
       const processflow: ScenarioCreate['processflow_data'] = { [variant]: steps }
       const variantQty: Record<string, number> = { [variant]: 200 }
       return scenariosApi.create({
@@ -3130,7 +4426,7 @@ export default function Canvas() {
         variant_quantities: variantQty,
         operators_data: { Op1: { 'Skill Rating': 3, 'Availability (%)': 100 } },
         simulation_config: {
-          SIM_TIME: 480, SHIFT_DURATION: 480,
+          SIM_TIME: 10080, SHIFT_DURATION: 480,
           SHIFT_1_START: 6, SHIFT_1_END: 14, SHIFT_2_START: 14, SHIFT_2_END: 22,
           SHIFT_3_START: 22, SHIFT_3_END: 6, STATION_DOWNTIME: 0, ACTIVE_PROCESSING_TIME: 480,
         },
@@ -3140,14 +4436,31 @@ export default function Canvas() {
       queryClient.invalidateQueries({ queryKey: ['scenarios'] })
       setActiveScenario(scenario)
       setJustReset(false)
-      showToast(`"${scenario.name}" saved`)
-      navigate('/run')
+      // Each box is now saved under its own station name.
+      const savedNodes = nodes.map((n) => (
+        n.data.savedName === stationKey(n)
+          ? n
+          : { ...n, data: { ...n.data, savedName: stationKey(n) } }
+      ))
+      setNodes(savedNodes)
+      setSavedSignature(canvasSignatureOf(savedNodes, edges))
+      // The canvas now shows this saved product.
+      if (savedVariantRef.current) {
+        setBuildVariant(savedVariantRef.current)
+        setSelectedVariant(savedVariantRef.current)
+      }
     },
     onError: (err: Error) => showToast(err.message, 'error'),
   })
 
-  // Validate before saving so users get a clear, friendly message instead of a raw API error
-  const handleSave = () => {
+  // Validate before saving so users get a clear, friendly message instead of a
+  // raw API error. navigateAfter=true (the top-bar "Save Scenario" button)
+  // treats this as finishing the whole scenario and jumps to Run; false (the
+  // per-station panel's Save button) persists the same scenario but keeps
+  // the user in Canvas so they can keep editing other stations.
+  // onSaved: just save and then do this (switching product), instead of
+  // going to Run / running.
+  const handleSave = (navigateAfter: boolean, onSaved?: () => void) => {
     if (!scenarioName.trim()) {
       showToast('Please enter a scenario name before saving', 'error')
       return
@@ -3160,7 +4473,222 @@ export default function Canvas() {
       showToast('Connect your stations before saving (drag from one box to the next)', 'error')
       return
     }
-    saveMutation.mutate()
+    const badPriorities = nodes.find((n) => {
+      const successors = exitSuccessorLabels(n.id, nodes, edges)
+      return n.data.exitStrategy === 'successor' && successors.length > 1
+        && !exitPrioritiesAreValid(exitPriorityValues(n.data, successors))
+    })
+    if (badPriorities) {
+      showToast(`${badPriorities.data.label}: Exit Controller priorities must use each number from 1 to ${exitSuccessorLabels(badPriorities.id, nodes, edges).length} once`, 'error')
+      return
+    }
+    const emptyConveyor = nodes.find((n) =>
+      inferStationType(n.data.label, n.data.stationType) === 'Conveyor' && (n.data.conveyorCapacity ?? 1) < 1)
+    if (emptyConveyor) {
+      showToast(`${emptyConveyor.data.label}: Conveyor capacity must be 1 or more`, 'error')
+      return
+    }
+    const conveyors = nodes.filter((n) => inferStationType(n.data.label, n.data.stationType) === 'Conveyor')
+    const noLength = conveyors.find((n) => !((n.data.conveyorLength ?? 0) > 0))
+    if (noLength) {
+      showToast(`${noLength.data.label}: Conveyor length must be more than 0`, 'error')
+      return
+    }
+    const noSpeed = conveyors.find((n) => !((n.data.conveyorSpeed ?? 0) > 0))
+    if (noSpeed) {
+      showToast(`${noSpeed.data.label}: Conveyor speed must be more than 0`, 'error')
+      return
+    }
+    const badSplit = canvasSplits(nodes, edges).find((s) => s.problem)
+    if (badSplit) {
+      showToast(`${badSplit.sourceLabel}: ${badSplit.problem}`, 'error')
+      return
+    }
+    const groupProblem = parallelGroupProblem(nodes, edges)
+    if (groupProblem) {
+      showToast(groupProblem, 'error')
+      return
+    }
+    saveMutation.mutate(undefined, {
+      onSuccess: (scenario) => {
+        if (onSaved) {
+          showToast(`"${scenario.name}" saved`)
+          onSaved()
+          return
+        }
+        showToast(navigateAfter ? `"${scenario.name}" saved` : 'Station saved — running simulation…')
+        if (navigateAfter) navigate('/run')
+        else runAfterSave(scenario.id)
+      },
+    })
+  }
+
+  // Build: open another product's line. With unsaved changes on the canvas,
+  // ask first (Save / Discard / Cancel).
+  const openProduct = (v: string) => {
+    setNodes([])
+    setEdges([])
+    setSavedSignature(null)
+    setBuildVariant(null)
+    setSelectedVariant(v)
+    setReloadTick((t) => t + 1)
+  }
+  // The MU table's rows: the scenario's own products (variants), with their
+  // quantity and interval; Name from the Start's saved table. Products keep
+  // the saved table's order, then any others. A canvas not saved yet as a
+  // scenario only has the table on its Start box.
+  const muTableRows = (startNode: Node<StationNodeData>): MuDialogRow[] => {
+    const savedTable: MuRow[] = startNode.data.muTable
+      ?? activeScenario?.stations_data?.[stationKey(startNode)]?.['MU Table'] ?? []
+    if (!activeScenario) return savedTable.map((r, i) => ({ ...r, color: r.color ?? defaultVariantColor(i) }))
+    const products = Array.from(new Set([
+      ...savedTable.map((r) => r.mu),
+      ...Object.keys(activeScenario.processflow_data ?? {}),
+      ...Object.keys(activeScenario.variant_quantities ?? {}),
+    ])).filter((v) => v in (activeScenario.processflow_data ?? {}) || v in (activeScenario.variant_quantities ?? {}))
+    return products.map((v, i) => ({
+      mu: v,
+      orig: v,
+      color: savedTable.find((r) => r.mu === v)?.color ?? defaultVariantColor(i),
+      number: activeScenario.variant_quantities?.[v] ?? 0,
+      name: savedTable.find((r) => r.mu === v)?.name ?? '',
+      interval: activeScenario.variant_intervals?.[v] ?? null,
+    }))
+  }
+
+  // Each product's colour (Start's MU table, else the defaults) for the
+  // moving jobs. Kept stable while the colours don't change, so the replay
+  // doesn't re-read the run on every canvas edit.
+  const variantColorsNow = (() => {
+    const start = nodes.find((n) => inferStationType(n.data.label, n.data.stationType) === 'Source')
+    const rows = start
+      ? muTableRows(start)
+      : Object.keys(activeScenario?.processflow_data ?? {}).map((v, i) => ({ mu: v, color: defaultVariantColor(i) }))
+    return Object.fromEntries(rows.map((r) => [r.mu, r.color ?? '']))
+  })()
+  const variantColorsKey = JSON.stringify(variantColorsNow)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const variantColors = useMemo(() => variantColorsNow, [variantColorsKey])
+
+  // Apply on the MU table saves straight to the scenario: each row is a
+  // product — its quantity and interval; a renamed MU renames the product
+  // everywhere (route, quantity, interval, setup matrix); a new row gets a
+  // copy of the chosen product's route; a deleted row takes its route with
+  // it. Name is kept in the Start's own settings.
+  const applyMuTable = async (startNode: Node<StationNodeData>, rows: MuDialogRow[]) => {
+    const table: MuRow[] = rows.map(({ mu, number, name, interval, color }) => ({ mu, number, name, interval: interval ?? null, color }))
+    // The Start's Exit Controller entries follow renamed products; deleted
+    // ones go, new ones start unset.
+    const byProduct = (values?: Record<string, number>) => (values ? Object.fromEntries(
+      rows.filter((r) => r.orig !== undefined && r.orig in values).map((r) => [r.mu, values[r.orig!]]),
+    ) : undefined)
+    const muPriorities = byProduct(startNode.data.muPriorities)
+    const muPercentages = byProduct(startNode.data.muPercentages)
+    const setStartTable = () => setNodes((nds) => nds.map((n) => (
+      n.id === startNode.id ? { ...n, data: { ...n.data, muTable: table, muPriorities, muPercentages } } : n
+    )))
+    if (!activeScenario) {
+      setStartTable()
+      return
+    }
+    try {
+      const fresh = await scenariosApi.get(activeScenario.id)
+      const flow = fresh.processflow_data ?? {}
+      const renamed: Record<string, string> = {}
+      for (const r of rows) if (r.orig !== undefined) renamed[r.orig] = r.mu
+      const processflow: ScenarioCreate['processflow_data'] = {}
+      const quantities: Record<string, number> = {}
+      const intervals: Record<string, number> = {}
+      for (const r of rows) {
+        const source = r.orig !== undefined ? r.orig : r.copyFrom
+        processflow[r.mu] = JSON.parse(JSON.stringify(source !== undefined ? flow[source] ?? [] : []))
+        quantities[r.mu] = r.number
+        if (r.interval != null && r.interval > 0) intervals[r.mu] = r.interval
+      }
+      // Setup matrix pairs ("from|to") follow renames; pairs of a deleted product go.
+      const setupMatrix: Record<string, Record<string, number>> = {}
+      for (const [station, pairs] of Object.entries(fresh.setup_matrix ?? {})) {
+        const kept: Record<string, number> = {}
+        for (const [key, minutes] of Object.entries(pairs)) {
+          const [from, to] = key.split('|')
+          const f = from in renamed ? renamed[from] : from in processflow ? from : undefined
+          const t = to in renamed ? renamed[to] : to in processflow ? to : undefined
+          if (f !== undefined && t !== undefined) kept[`${f}|${t}`] = minutes
+        }
+        if (Object.keys(kept).length > 0) setupMatrix[station] = kept
+      }
+      // Name lives in the Start's settings (a Start, so the engine skips it).
+      const startKey = stationKey(startNode)
+      const stations = { ...(fresh.stations_data ?? {}) }
+      stations[startKey] = {
+        ...(stations[startKey] ?? { 'Station Type': 'Source', capacity: 1, shifts_per_day: 1, operator_per_station: 0 }),
+        'MU Table': table,
+        'MU Strategy': startNode.data.muStrategy ?? stations[startKey]?.['MU Strategy'] ?? 'cyclic',
+        ...(muPriorities ? { 'MU Priorities': muPriorities } : {}),
+        ...(muPercentages ? { 'MU Percentages': muPercentages } : {}),
+      } as StationConfig
+      const updated = await scenariosApi.update(activeScenario.id, {
+        processflow_data: processflow,
+        variant_quantities: quantities,
+        variant_intervals: intervals,
+        setup_matrix: setupMatrix,
+        stations_data: stations,
+      })
+      queryClient.invalidateQueries({ queryKey: ['scenarios'] })
+      setActiveScenario(updated)
+      setStartTable()
+      // The product on the canvas follows its rename; if it was deleted,
+      // open another one.
+      const shown = buildVariant ?? selectedVariant
+      if (shown && shown in renamed && renamed[shown] !== shown) {
+        setBuildVariant(renamed[shown])
+        setSelectedVariant(renamed[shown])
+      } else if (shown && !(shown in renamed)) {
+        const next = Object.keys(processflow)[0]
+        if (next) openProduct(next)
+      }
+      showToast('Products saved')
+    } catch (err) {
+      showToast((err as Error).message || 'Could not save the products', 'error')
+      throw err
+    }
+  }
+
+  const pickBuildProduct = (v: string) => {
+    if (v === (buildVariant ?? selectedVariant)) return
+    if (canvasDirty) {
+      setSwitchTarget(v)
+      return
+    }
+    openProduct(v)
+  }
+
+  // The station panel's Save also re-runs the simulation with the settings
+  // just saved (the scenario's own Simulation Config, same replications as
+  // the run being shown), so Play always replays what was saved — e.g. an
+  // Exit Controller switched to Random plays as Random, not the old run.
+  const runPollRef = useRef(0)
+  useEffect(() => () => { runPollRef.current++ }, [])
+  const runAfterSave = async (scenarioId: number) => {
+    const token = ++runPollRef.current
+    try {
+      const run = await simulationsApi.triggerRun(scenarioId, { num_replications: activeRun?.num_replications ?? 1 })
+      for (;;) {
+        const detail = await simulationsApi.getRun(run.id)
+        if (token !== runPollRef.current) return // a newer Save took over, or Canvas closed
+        setActiveRun(detail) // pending/running hides the player until it's done
+        if (detail.status !== 'pending' && detail.status !== 'running') {
+          showToast(
+            detail.status === 'completed' ? `Run #${run.id} ready — press Play` : `Run #${run.id} ${detail.status}`,
+            detail.status === 'completed' ? 'success' : 'error',
+          )
+          return
+        }
+        await new Promise((r) => setTimeout(r, 1000))
+      }
+    } catch (err) {
+      if (token === runPollRef.current) showToast((err as Error).message, 'error')
+    }
   }
 
   return (
@@ -3237,7 +4765,7 @@ export default function Canvas() {
                   <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">View</p>
                   <div className="flex rounded-xl border border-gray-200 overflow-hidden">
                     <button
-                      onClick={() => setViewMode('3d')}
+                      onClick={() => { setViewMode('3d'); setSelectedFlowNodeId(null) }}
                       className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-semibold transition-all ${
                         viewMode === '3d' ? 'bg-blue-600 text-white' : 'text-gray-500 hover:bg-gray-50'
                       }`}
@@ -3379,10 +4907,60 @@ export default function Canvas() {
                 placeholder="Enter scenario name…"
                 className="w-56 h-8 text-sm font-medium rounded-lg"
               />
+              {/* Product picker: the canvas shows (and Save writes) one
+                  product's line; the other products are kept as they are. */}
+              {activeScenario && variants.length > 0 && (
+                <div className="flex items-center gap-1 bg-gray-100 rounded-lg p-1">
+                  {variants.map((v) => (
+                    <button
+                      key={v}
+                      onClick={() => pickBuildProduct(v)}
+                      className={`px-3 py-1 text-xs font-semibold rounded-md transition-colors ${
+                        v === (buildVariant ?? selectedVariant) ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+                      }`}
+                    >
+                      {v}
+                    </button>
+                  ))}
+                </div>
+              )}
               <span className="text-xs text-gray-400">{nodes.length} stations · {edges.length} connections</span>
+              {muDialogNodeId && (() => {
+                const startNode = nodes.find((n) => n.id === muDialogNodeId)
+                if (!startNode) return null
+                return (
+                  <MuTableDialog
+                    startName={startNode.data.label}
+                    initial={muTableRows(startNode)}
+                    onApply={(rows) => applyMuTable(startNode, rows)}
+                    onClose={() => setMuDialogNodeId(null)}
+                  />
+                )
+              })()}
+              {pendingDelete && (
+                <ConfirmDeleteDialog
+                  stations={pendingDelete.nodeIds.length}
+                  lines={pendingDelete.edgeIds.length}
+                  onDelete={confirmDelete}
+                  onClose={() => setPendingDelete(null)}
+                />
+              )}
+              {switchTarget && (
+                <SwitchProductDialog
+                  from={buildVariant ?? selectedVariant}
+                  to={switchTarget}
+                  saving={saveMutation.isPending}
+                  onSave={() => {
+                    const target = switchTarget
+                    handleSave(false, () => { setSwitchTarget(null); openProduct(target) })
+                  }}
+                  onDiscard={() => { const target = switchTarget; setSwitchTarget(null); openProduct(target) }}
+                  onClose={() => setSwitchTarget(null)}
+                />
+              )}
               <Button
                 disabled={saveMutation.isPending}
-                onClick={handleSave}
+                onClick={() => handleSave(true)}
                 className="bg-blue-600 hover:bg-blue-700 rounded-full px-4 shadow-sm"
               >
                 <Save className="h-3.5 w-3.5 mr-1.5" />
@@ -3498,13 +5076,36 @@ export default function Canvas() {
                 // Shrinking the radius makes a drop only snap when the
                 // cursor is nearly on top of the intended dot.
                 connectionRadius={8}
-                onNodeClick={(_, node) => { setSelectedNode(node as Node<StationNodeData>); setSelectedEdgeId(null) }}
+                onNodeClick={(_, node) => {
+                  setSelectedNode(node as Node<StationNodeData>)
+                  setSelectedEdgeId(null)
+                  // Clicking Start opens its MU table.
+                  const data = (node as Node<StationNodeData>).data
+                  if (inferStationType(data.label, data.stationType) === 'Source') setMuDialogNodeId(node.id)
+                }}
                 onEdgeClick={(_, edge) => { setSelectedEdgeId(edge.id); setSelectedNode(null) }}
                 onPaneClick={() => { setSelectedNode(null); setSelectedEdgeId(null) }}
                 nodesDraggable
                 elementsSelectable
                 panOnDrag
                 selectionOnDrag={false}
+                // Shift + drag on empty space draws a selection box: the
+                // stations fully inside it, and the lines between them, are
+                // selected — move them together, Delete them (after a
+                // confirmation), or Ctrl+C / Ctrl+V them (see the keyboard
+                // handler). Plain drag still moves the canvas. No Ctrl/Cmd +
+                // click multi-select.
+                selectionKeyCode="Shift"
+                selectionMode={SelectionMode.Full}
+                multiSelectionKeyCode={null}
+                deleteKeyCode={null}
+                // Several things selected: the side panel shows none of them.
+                onSelectionChange={({ nodes: picked, edges: pickedEdges }) => {
+                  if (picked.length + pickedEdges.length > 1) {
+                    setSelectedNode(null)
+                    setSelectedEdgeId(null)
+                  }
+                }}
                 onInit={(instance) => { setBuildFlowInstance(instance); instance.fitView({ padding: 0.2 }) }}
               >
                 <Background color={isDark ? '#334155' : undefined} />
@@ -3517,6 +5118,15 @@ export default function Canvas() {
                   }}
                   maskColor={isDark ? 'rgba(15,23,42,0.7)' : 'rgba(240,244,255,0.7)'}
                 />
+                {activeRun?.status === 'completed' && completionLog && (
+                  <JobReplay
+                    completionLog={completionLog}
+                    releaseTimes={replayState?.job_release_times}
+                    finishTimes={replayState?.job_finish_times}
+                    targets={replayTargets}
+                    variantColors={variantColors}
+                  />
+                )}
               </ReactFlow>
               </div>
             )}
@@ -3602,6 +5212,9 @@ export default function Canvas() {
                       <p className="text-[9px] text-gray-500">Still waiting</p>
                     </div>
                   </div>
+                  {exitScrapped > 0 && (
+                    <p className="text-[11px] text-red-600 -mt-1 mb-3">{exitScrapped} scrapped (machine failed mid-operation)</p>
+                  )}
                   <div className="mb-3">
                     <div className="flex items-center justify-between mb-1">
                       <span className="text-[10px] text-gray-400">Completion rate</span>
@@ -3654,7 +5267,9 @@ export default function Canvas() {
           {mode === 'view' && selectedFlowNode && (
             <div className="w-72 border-l border-gray-200 bg-white p-4 overflow-y-auto">
               <div className="flex items-center justify-between mb-1">
-                <p className="text-xs font-bold text-indigo-700 uppercase tracking-widest">Station</p>
+                <p className="text-xs font-bold text-indigo-700 uppercase tracking-widest">
+                  {selectedFlowNodeType === 'Buffer' ? 'Buffer' : 'Station'}
+                </p>
                 <button
                   onClick={() => setSelectedFlowNodeId(null)}
                   className="w-6 h-6 flex items-center justify-center rounded-lg text-gray-400 hover:bg-gray-50 transition-colors"
@@ -3665,40 +5280,107 @@ export default function Canvas() {
               <p className="text-lg font-bold text-gray-900 truncate">{selectedFlowNode.data.label}</p>
               <p className="text-[11px] text-gray-500 mb-4">{selectedFlowNode.data.resource}</p>
 
-              <div className="grid grid-cols-2 gap-2 mb-3">
-                <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
-                  <p className="text-sm font-bold text-gray-800">{selectedFlowNode.data.duration} min</p>
-                  <p className="text-[9px] text-gray-500">Cycle time</p>
-                </div>
-                <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
-                  <p className="text-sm font-bold text-gray-800">{selectedFlowNode.data.machineCount ?? 1}</p>
-                  <p className="text-[9px] text-gray-500">Parallel machines</p>
-                </div>
-              </div>
+              {selectedFlowNodeType === 'Buffer' ? (
+                <>
+                  {/* A Buffer just holds jobs between stations — it has no cycle
+                      time, parallel machines, or shifts of its own, so it shows
+                      capacity/discipline/blocking instead of Station-only stats.
+                      A 3D rack buffer (rackLaneCount set) ignores the plain
+                      Buffer Capacity number entirely at run time (see backend's
+                      _init_rack_buffers), so showing that stale number here
+                      without saying so would be misleading — show the real
+                      lane count/occupancy and an explicit "3D" tag instead. */}
+                  {selectedFlowNode.data.rackLaneCount != null ? (
+                    <div className="grid grid-cols-2 gap-2 mb-3">
+                      <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
+                        <p className="text-sm font-bold text-gray-800">
+                          {selectedFlowNode.data.rackOccupied ?? 0} jobs
+                        </p>
+                        <p className="text-[9px] text-gray-500">in 3D rack at end · {selectedFlowNode.data.rackLaneCount} lanes</p>
+                      </div>
+                      <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
+                        <p className="text-sm font-bold text-gray-800">{selectedFlowNode.data.bufferDiscipline ?? 'FIFO'}</p>
+                        <p className="text-[9px] text-gray-500">Discipline</p>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-2 gap-2 mb-3">
+                      <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
+                        <p className="text-sm font-bold text-gray-800">{selectedFlowNode.data.bufferCapacity ?? '—'}</p>
+                        <p className="text-[9px] text-gray-500">Buffer capacity</p>
+                      </div>
+                      <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
+                        <p className="text-sm font-bold text-gray-800">{selectedFlowNode.data.bufferDiscipline ?? 'FIFO'}</p>
+                        <p className="text-[9px] text-gray-500">Discipline</p>
+                      </div>
+                    </div>
+                  )}
 
-              {/* A station dispatched by a Worker Controller pool looks
-                  identical to one using the plain static shift1/2/3
-                  assignment unless flagged — this is that flag. Not shown on
-                  the Controller's own panel (redundant with its Worker Pool
-                  stats section just below). */}
-              {selectedFlowNode.data.workerController && selectedFlowNode.data.stationType !== 'Worker Controller' && (
-                <div className="mb-3">
-                  <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-violet-50 text-violet-700 border border-violet-200">
-                    Staffed by {selectedFlowNode.data.workerController}
-                  </span>
-                </div>
+                  {selectedFlowNode.data.bufferBlockedRatio !== undefined ? (
+                    <div className="mb-4">
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="text-[10px] text-gray-400">Blocked (full) time</span>
+                        <span
+                          className="text-[10px] font-bold px-2 py-0.5 rounded-full"
+                          style={{ color: utilColor(selectedFlowNode.data.bufferBlockedRatio), background: utilColor(selectedFlowNode.data.bufferBlockedRatio) + '20' }}
+                        >
+                          {selectedFlowNode.data.bufferBlockedRatio.toFixed(0)}%
+                        </span>
+                      </div>
+                      <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
+                        <div
+                          className="h-full rounded-full"
+                          style={{ width: `${Math.min(selectedFlowNode.data.bufferBlockedRatio, 100)}%`, background: utilColor(selectedFlowNode.data.bufferBlockedRatio) }}
+                        />
+                      </div>
+                      {selectedFlowNode.data.bufferBlockedTime !== undefined && (
+                        <p className="text-[10px] text-gray-500 mt-1">
+                          Total blocked: <span className="font-semibold text-gray-700">{selectedFlowNode.data.bufferBlockedTime.toFixed(1)} min</span>
+                        </p>
+                      )}
+                    </div>
+                  ) : (
+                    <p className="text-[11px] text-gray-400 mb-4">Run a simulation to see blocking data.</p>
+                  )}
+                </>
+              ) : (
+                <>
+                  <div className="grid grid-cols-2 gap-2 mb-3">
+                    <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
+                      <p className="text-sm font-bold text-gray-800">{selectedFlowNode.data.duration} min</p>
+                      <p className="text-[9px] text-gray-500">Cycle time</p>
+                    </div>
+                    <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
+                      <p className="text-sm font-bold text-gray-800">{selectedFlowNode.data.machineCount ?? 1}</p>
+                      <p className="text-[9px] text-gray-500">Machines</p>
+                    </div>
+                  </div>
+
+                  {/* A station dispatched by a Worker Controller pool looks
+                      identical to one using the plain static shift1/2/3
+                      assignment unless flagged — this is that flag. Not shown on
+                      the Controller's own panel (redundant with its Worker Pool
+                      stats section just below). */}
+                  {selectedFlowNode.data.workerController && selectedFlowNode.data.stationType !== 'Worker Controller' && (
+                    <div className="mb-3">
+                      <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-violet-50 text-violet-700 border border-violet-200">
+                        Staffed by {selectedFlowNode.data.workerController}
+                      </span>
+                    </div>
+                  )}
+
+                  <div className="mb-3">
+                    <p className="text-[10px] text-gray-400 mb-1">Shifts available</p>
+                    {(selectedFlowNode.data.shiftsPerDay ?? []).length > 0 ? (
+                      <ShiftPillList shiftNums={selectedFlowNode.data.shiftsPerDay ?? []} shiftNames={shiftNames} />
+                    ) : (
+                      <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-50 text-amber-600 border border-amber-200">
+                        No shifts selected
+                      </span>
+                    )}
+                  </div>
+                </>
               )}
-
-              <div className="mb-3">
-                <p className="text-[10px] text-gray-400 mb-1">Shifts available</p>
-                {(selectedFlowNode.data.shiftsPerDay ?? []).length > 0 ? (
-                  <ShiftPillList shiftNums={selectedFlowNode.data.shiftsPerDay ?? []} shiftNames={shiftNames} />
-                ) : (
-                  <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-50 text-amber-600 border border-amber-200">
-                    No shifts selected
-                  </span>
-                )}
-              </div>
 
               {/* Worker Controller pool stats — from worker_pool.py's
                   WorkerPool.get_stats(), reached via activeRun.result.
@@ -3766,29 +5448,31 @@ export default function Canvas() {
                 </div>
               )}
 
-              {selectedFlowNode.data.utilization !== undefined ? (
-                <div className="mb-4">
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="text-[10px] text-gray-400">Utilization</span>
-                    <span
-                      className="text-[10px] font-bold px-2 py-0.5 rounded-full"
-                      style={{ color: utilColor(selectedFlowNode.data.utilization), background: utilColor(selectedFlowNode.data.utilization) + '20' }}
-                    >
-                      {selectedFlowNode.data.utilization.toFixed(0)}%
-                    </span>
+              {selectedFlowNodeType !== 'Buffer' && (
+                selectedFlowNode.data.utilization !== undefined ? (
+                  <div className="mb-4">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-[10px] text-gray-400">Utilization</span>
+                      <span
+                        className="text-[10px] font-bold px-2 py-0.5 rounded-full"
+                        style={{ color: utilColor(selectedFlowNode.data.utilization), background: utilColor(selectedFlowNode.data.utilization) + '20' }}
+                      >
+                        {selectedFlowNode.data.utilization.toFixed(0)}%
+                      </span>
+                    </div>
+                    <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
+                      <div
+                        className="h-full rounded-full"
+                        style={{ width: `${Math.min(selectedFlowNode.data.utilization, 100)}%`, background: utilColor(selectedFlowNode.data.utilization) }}
+                      />
+                    </div>
                   </div>
-                  <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
-                    <div
-                      className="h-full rounded-full"
-                      style={{ width: `${Math.min(selectedFlowNode.data.utilization, 100)}%`, background: utilColor(selectedFlowNode.data.utilization) }}
-                    />
-                  </div>
-                </div>
-              ) : (
-                <p className="text-[11px] text-gray-400 mb-4">Run a simulation to see utilization data.</p>
+                ) : (
+                  <p className="text-[11px] text-gray-400 mb-4">Run a simulation to see utilization data.</p>
+                )
               )}
 
-              {activeRun && selectedFlowNode.data.jobs !== undefined && (
+              {activeRun && selectedFlowNode.data.jobs !== undefined && selectedFlowNodeType !== 'Buffer' && (
                 <div className="bg-blue-50 border border-blue-100 rounded-lg p-2 text-center mb-4">
                   <p className="text-sm font-bold text-blue-700">{selectedFlowNode.data.jobs}</p>
                   <p className="text-[9px] text-blue-600">
@@ -3851,8 +5535,10 @@ export default function Canvas() {
                 edges={edges}
                 onChange={updateNode}
                 onDelete={deleteNode}
-                onSaveStation={() => { setSelectedNode(null); showToast('Station saved') }}
+                onSaveStation={() => { setSelectedNode(null); handleSave(false) }}
                 onAddParallel={addParallelMachine}
+                onOpenMuTable={setMuDialogNodeId}
+                startProducts={inferStationType(selectedNode.data.label, selectedNode.data.stationType) === 'Source' ? muTableRows(selectedNode).map((r) => r.mu) : []}
                 onAddWorkplace={addWorkplaceFor}
                 onRemoveWorkplace={removeWorkplaceFor}
                 onToggleWire={toggleWire}

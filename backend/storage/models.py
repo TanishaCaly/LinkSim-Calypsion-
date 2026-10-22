@@ -6,13 +6,35 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import (
-    JSON, Column, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, create_engine
+    JSON, Boolean, Column, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, create_engine
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
 
 
 class Base(DeclarativeBase):
     pass
+
+
+class User(Base):
+    """
+    A LinkSim account. Demo-scope: username/password only, no roles yet —
+    every user simply owns their own scenarios (see Scenario.user_id) and
+    cannot see anyone else's. Admin/role-based access is a later phase.
+
+    subscription_end_date is nullable: NULL means no expiry (unlimited access,
+    e.g. legacy users created before this field existed, or admin accounts).
+    is_active is a separate manual kill-switch (e.g. for banning an account)
+    independent of the subscription date.
+    """
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String(100), nullable=False, unique=True, index=True)
+    email = Column(String(255), nullable=True, unique=True, index=True)
+    password_hash = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    subscription_end_date = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True)
 
 
 class Scenario(Base):
@@ -23,6 +45,12 @@ class Scenario(Base):
     __tablename__ = "scenarios"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    # Nullable so scenarios created before multi-user support (or via any
+    # future admin/import path with no acting user) don't break — but every
+    # scenario created through the normal API from here on is always stamped
+    # with the creating user's id, and every list/get/update/delete query
+    # filters on it so users never see each other's scenarios.
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     name = Column(String(200), nullable=False)
     description = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -102,15 +130,33 @@ class StationStat(Base):
     buffer_blocked_time = Column(Float, default=0.0)
     buffer_capacity = Column(Integer, default=0)
     buffer_discipline = Column(String(10), default="FIFO")
+    # Only set for a Buffer node run in 3D mode (see sim_core.py's
+    # _init_rack_buffers) — NULL for every 2D/scalar station, meaning
+    # buffer_capacity above is the real, active number for that one instead.
+    rack_lane_count = Column(Integer, nullable=True)
+    rack_occupied = Column(Integer, nullable=True)
     completed_jobs = Column(Integer, default=0)
     throughput = Column(Float, default=0.0)
     busy_time = Column(Float, default=0.0)
     avg_block_time = Column(Float, default=0.0)
     failure_breakdowns = Column(Integer, default=0)
+    # Each sub-machine's own failure count (e.g. [29, 28] for capacity=2) —
+    # lets dashboard KPIs (MTBF, Availability) compute per-machine values
+    # instead of treating the pooled total as if one failure stopped the
+    # whole station, which is only true at capacity=1. NULL for runs
+    # recorded before this column existed.
+    failure_counts_per_machine = Column(JSON, nullable=True)
     pm_breakdowns = Column(Integer, default=0)
     operator_per_station = Column(Integer, default=1)
     capacity = Column(Integer, default=1)
+    # Conveyor only (m, m/min, min) — NULL for every other station.
+    conveyor_length = Column(Float, nullable=True)
+    conveyor_speed = Column(Float, nullable=True)
+    transport_time = Column(Float, nullable=True)
+    # Jobs that passed the conveyor's sensor — NULL when it has no sensor.
+    sensor_passed = Column(Integer, nullable=True)
     avg_cycle_time = Column(Float, default=0.0)
+    max_cycle_time = Column(Float, default=0.0)
 
     # Bottleneck summary (top issue type)
     top_bottleneck_type = Column(String(100), nullable=True)

@@ -10,14 +10,15 @@ Key changes from originals:
   - _perform_operation split into readable sub-methods
 """
 import logging
+import re
 import simpy
 import random
 import statistics as stats_lib
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .machine import Machine
+from .machine import MachineGroup, FailurePolicy, ROUTING_SEED
 from .timing_engine import TimingEngine
 from .worker_pool import WorkerPool, WorkerToken, PoolRejected
 from .formulas import (
@@ -47,9 +48,9 @@ MAX_SIM_TIME = 525_600.0
 #               zero delay: no capacity contention, no operator, no failure,
 #               no setup, no rework. Used only to shape the flow graph.
 #   Conveyor  — material transport. A job takes a transport time to traverse
-#               it, but a belt is not a single-server machine: many units ride
-#               it at once (so effectively unlimited concurrent capacity), it
-#               consumes no operator, and it has no changeover or rework.
+#               it, up to "Conveyor Capacity" jobs ride it at once (see
+#               ConveyorBelt), it consumes no operator, and it has no
+#               changeover or rework.
 #
 # Read from stations_data[name]["Station Type"], which the Canvas writes when
 # a scenario is saved. Absent (every Excel/YAML-imported scenario, and any
@@ -83,12 +84,6 @@ STATION_TYPE_SOURCE = "Source"
 STATION_TYPE_DRAIN = "Drain"
 STATION_TYPE_BUFFER = "Buffer"
 
-# Stand-in for "unbounded" concurrency on a conveyor. A real belt has no
-# meaningful server count, but SimPy resources need a finite capacity, so use
-# a number no realistic job count will reach. Deliberately not float('inf'):
-# SimPy requires an int capacity, and utilization maths multiplies by it.
-CONVEYOR_CAPACITY = 1_000_000
-
 
 def _station_type(station: Dict[str, Any]) -> str:
     """Normalised "Station Type" for a stations_data entry ("" when unset)."""
@@ -109,8 +104,15 @@ def _is_passthrough(station: Dict[str, Any]) -> bool:
     )
 
 
+def _is_buffer(station: Dict[str, Any]) -> bool:
+    """True for a Buffer node — a passthrough that still occupies space, so
+    its Buffer Capacity limits how many jobs can wait in it (see
+    _process_variant's hand-off)."""
+    return _station_type(station) == STATION_TYPE_BUFFER
+
+
 def _is_conveyor(station: Dict[str, Any]) -> bool:
-    """True for Conveyor — transport delay, no operator, unbounded capacity."""
+    """True for Conveyor — transport delay, no operator, Conveyor Capacity slots."""
     return _station_type(station) == STATION_TYPE_CONVEYOR
 
 
@@ -120,19 +122,145 @@ def _is_worker_controller(station: Dict[str, Any]) -> bool:
     return _station_type(station) == STATION_TYPE_WORKER_CONTROLLER
 
 
-def _transport_time(station: Dict[str, Any], fallback: float) -> float:
-    """
-    A conveyor's traverse time. Prefers the explicit "Transport Time" field
-    the Canvas writes for Conveyor stations; falls back to the process-flow
-    step's own duration when unset, so a conveyor added before that field
-    existed still moves jobs in a sensible amount of time rather than zero.
-    """
-    raw = station.get("Transport Time")
+def _positive_float(raw: Any) -> Optional[float]:
     try:
         value = float(raw)
     except (TypeError, ValueError):
-        return fallback
-    return value if value > 0 else fallback
+        return None
+    return value if value > 0 else None
+
+
+def _transport_time(station: Dict[str, Any], fallback: Any) -> Any:
+    """
+    A conveyor's traverse time = Length / Speed, the two values the user
+    gives. An older conveyor saved with Length + "Transport Time" (no Speed)
+    uses that Transport Time, so it rides exactly as before; failing both,
+    the process-flow step's own duration, so it still moves jobs in a
+    sensible time rather than zero.
+    """
+    length = _positive_float(station.get("Conveyor Length"))
+    speed = _positive_float(station.get("Conveyor Speed"))
+    if length is not None and speed is not None:
+        return length / speed
+    value = _positive_float(station.get("Transport Time"))
+    if value is not None:
+        return value
+    return fallback
+
+
+def _conveyor_speed(station: Dict[str, Any]) -> Optional[float]:
+    """Belt speed (m/min) = Length / transport time; None if either is unset."""
+    length = _positive_float(station.get("Conveyor Length"))
+    transport = _transport_time(station, None)
+    return length / transport if length is not None and transport else None
+
+
+def _sensor_position(station: Dict[str, Any]) -> Optional[float]:
+    """
+    Where a conveyor's sensor sits, in m from the start of the belt — the
+    user's "Conveyor Sensor Length" measured from the start ("Front") or from
+    the end ("Rear"). None when there is no sensor, or it isn't on the belt.
+    """
+    if not _is_conveyor(station):
+        return None
+    length = _positive_float(station.get("Conveyor Length"))
+    try:
+        sensor = float(station.get("Conveyor Sensor Length"))
+    except (TypeError, ValueError):
+        return None
+    if length is None or not 0 <= sensor <= length:
+        return None
+    rear = str(station.get("Conveyor Sensor Position", "Front")).strip().lower() == "rear"
+    return length - sensor if rear else sensor
+
+
+def _conveyor_capacity(station: Dict[str, Any]) -> int:
+    """
+    How many jobs a conveyor holds at once ("Conveyor Capacity"). Absent or
+    blank (a conveyor saved before this field existed) means 1. 0 means no
+    job can ever get on — the Canvas refuses to save that, but an imported
+    scenario could still carry it.
+    """
+    raw = station.get("Conveyor Capacity")
+    if raw in (None, ""):
+        return 1
+    try:
+        return max(0, int(float(raw)))
+    except (TypeError, ValueError):
+        return 1
+
+
+class ConveyorBelt:
+    """
+    The jobs on one Conveyor, front first. First on is first off: a job that
+    has finished its transport time still waits for the jobs ahead of it.
+
+    The whole belt stops while its front job has reached the end but cannot
+    leave yet (the next station hasn't taken it). Every job riding it pauses
+    and, once the front job leaves, only finishes its remaining transport
+    time. A new job can still get on a stopped belt if there is a free spot
+    (capacity is the conveyor's own resource slots); it just doesn't move.
+    """
+
+    def __init__(self, env: simpy.Environment):
+        self.env = env
+        self.jobs: List[Any] = []
+        self.stopped = False
+        self._stopped_by: Any = None
+        # Processes asleep mid-transport — interrupted when the belt stops so
+        # each can bank the time it actually travelled.
+        self._riding: set = set()
+        self._changed = env.event()
+
+    def get_on(self, token: Any) -> None:
+        self.jobs.append(token)
+
+    def get_off(self, token: Any) -> None:
+        if token in self.jobs:
+            self.jobs.remove(token)
+        if token is self._stopped_by:
+            self.stopped = False
+            self._stopped_by = None
+        self._notify()
+
+    def stop(self, token: Any) -> None:
+        """The front job (token) is stuck at the end — stop every rider."""
+        self.stopped = True
+        self._stopped_by = token
+        for proc in list(self._riding):
+            if proc.is_alive:
+                proc.interrupt("conveyor stopped")
+        self._riding.clear()
+
+    def ride_start(self, proc: Any) -> None:
+        self._riding.add(proc)
+
+    def ride_end(self, proc: Any) -> None:
+        self._riding.discard(proc)
+
+    def changed(self) -> simpy.Event:
+        """Fires the next time a job gets off (the belt may restart, or a
+        new job may now be at the front)."""
+        return self._changed
+
+    def _notify(self) -> None:
+        event, self._changed = self._changed, self.env.event()
+        event.succeed()
+
+
+class _BeltSlot:
+    """A conveyor slot held by its finished front job until the next station
+    takes it (hold_slot) — releasing it also takes the job off the belt, which
+    restarts the belt."""
+
+    def __init__(self, req_ctx: Any, belt: ConveyorBelt, token: Any):
+        self._req_ctx = req_ctx
+        self._belt = belt
+        self._token = token
+
+    def __exit__(self, *exc):
+        self._req_ctx.__exit__(*exc)
+        self._belt.get_off(self._token)
 
 
 def _format_job_id(variant_type: str, variant_id: int) -> str:
@@ -153,6 +281,7 @@ def _determine_delay_reason(
     setup_time: float,
     material_unavailable: float,
     rework_time: float,
+    pause_time: float = 0.0,
 ) -> str:
     """
     Attribute a single, dominant delay reason to one job's visit to one
@@ -166,6 +295,12 @@ def _determine_delay_reason(
     signal cost this job the most time at this station is reported, since
     that's the one an engineer would actually want to act on. A tie falls
     through to the earlier-listed (higher-priority) reason.
+
+    pause_time (off-shift waiting for the next shift to start) defaults to
+    0.0 so existing call sites that don't pass it keep behaving exactly as
+    before — but a job that pauses hundreds of minutes overnight/over a
+    weekend needs this counted, otherwise it falls through to "No delay"
+    despite genuinely losing most of its Cycle Time to a shift gap.
     """
     candidates = [
         (station_downtime, "Machine breakdown"),
@@ -174,6 +309,7 @@ def _determine_delay_reason(
         (setup_time, "Changeover in progress"),
         (rework_time, "Rework"),
         (blocked_time, "Waiting in queue — station busy"),
+        (pause_time, "Waiting for next shift"),
     ]
     duration, reason = max(candidates, key=lambda c: c[0])
     return reason if duration > 0 else "No delay"
@@ -181,22 +317,31 @@ def _determine_delay_reason(
 
 class RackBuffer:
     """
-    Physical X/Y/Z buffer: Width * Height lanes, each a Depth-deep stack —
-    like a real gravity-flow pallet rack. Unlike a plain scalar Buffer
-    Capacity (a single count with no internal structure), a job placed
-    behind another one in the same lane is physically stuck: it cannot be
-    picked until everything in front of it in that lane is removed, even if
-    OTHER lanes have free slots or ready-to-pick items. This is the one
-    behaviour a scalar buffer structurally cannot express.
+    Physical X/Y/Z buffer: X * Z lanes, each a Y-deep stack — like a real
+    gravity-flow pallet rack. Unlike a plain scalar Buffer Capacity (a
+    single count with no internal structure), a job placed behind another
+    one in the same lane is physically stuck: it cannot be picked until
+    everything in front of it in that lane is removed, even if OTHER lanes
+    have free slots or ready-to-pick items. This is the one behaviour a
+    scalar buffer structurally cannot express. Only active for a Buffer
+    node whose "Buffer Config Mode" is "3D" (see _init_buffer_boxes) — a 2D
+    Buffer keeps using the plain scalar Buffer Capacity path untouched.
 
-    Placement: round-robin across lanes — a new job goes into whichever
-    lane currently has the most free depth remaining (ties broken by lane
-    index), so lanes fill evenly rather than one lane filling completely
-    before the next is used.
+    Placement: fills across X (and Z) FIRST, one job per lane, before going
+    deeper into Y — i.e. every lane gets its 1st slot filled before any
+    lane's 2nd slot is used, then every lane's 2nd slot before any 3rd, and
+    so on. A new job always goes into whichever lane currently holds the
+    FEWEST jobs (ties broken by lowest lane index), which produces exactly
+    that fill pattern.
 
-    Retrieval: only the front (oldest) item of each lane is ever pickable.
-    "get" scans all lanes and returns the one with the longest-waiting front
-    item, so multiple ready lanes are still served oldest-first overall.
+    Retrieval mirrors the fill order: whichever occupied slot was filled
+    FIRST overall (across the whole rack, not just within one lane) is the
+    next one picked — same as "first in, first out" but applied to the
+    whole rack's fill order rather than per-lane. A job can only ever be
+    picked once it's at the front of its own lane, so one stuck behind
+    another in the same lane still waits its turn regardless of other
+    lanes' state. Which lane front leaves next (FIFO/LIFO) is decided by
+    BufferBox, which owns the rack.
     """
 
     def __init__(self, width: int, depth: int, height: int):
@@ -207,6 +352,12 @@ class RackBuffer:
         # Each lane is a list acting as a physical stack: index 0 = front
         # (pickable), last index = back (most recently placed).
         self.lanes: List[List[Any]] = [[] for _ in range(self.lane_count)]
+        # Monotonically increasing fill counter — stamped onto every token's
+        # lane position at put() time via _fill_order, so retrieval can tell
+        # which of several ready (front-of-lane) tokens was placed earliest
+        # across the WHOLE rack, not just within its own lane.
+        self._next_fill_seq = 0
+        self._fill_order: List[List[int]] = [[] for _ in range(self.lane_count)]
 
     @property
     def total_capacity(self) -> int:
@@ -220,32 +371,291 @@ class RackBuffer:
         return any(len(lane) < self.depth for lane in self.lanes)
 
     def put(self, token: Any) -> int:
-        """Place into whichever lane has the most free depth (round-robin fill). Returns the lane index used."""
+        """Place into whichever lane currently holds the fewest jobs (ties
+        broken by lowest lane index) — fills every lane's 1st slot before
+        any lane's 2nd slot, every 2nd before any 3rd, and so on. Returns
+        the lane index used."""
         candidates = [i for i in range(self.lane_count) if len(self.lanes[i]) < self.depth]
         if not candidates:
             raise RuntimeError("RackBuffer.put() called with no room — caller must check has_room() first")
-        best = max(candidates, key=lambda i: self.depth - len(self.lanes[i]))
+        best = min(candidates, key=lambda i: (len(self.lanes[i]), i))
         self.lanes[best].append(token)
+        self._fill_order[best].append(self._next_fill_seq)
+        self._next_fill_seq += 1
         return best
 
     def ready_lane(self) -> Optional[int]:
-        """Index of a lane whose front slot is occupied (has something pickable), or None."""
+        """Index of whichever lane's front slot (a) is occupied and (b) was
+        filled earliest across the whole rack — not just the first lane
+        found, so retrieval empties the rack in the same X-then-Y order it
+        was filled in, mirroring put()'s fill order."""
+        best_idx: Optional[int] = None
+        best_seq: Optional[int] = None
         for i, lane in enumerate(self.lanes):
-            if lane:
-                return i
-        return None
+            if not lane:
+                continue
+            seq = self._fill_order[i][0]
+            if best_seq is None or seq < best_seq:
+                best_idx, best_seq = i, seq
+        return best_idx
 
     def get(self) -> Any:
-        """Remove and return the front item of a ready lane (physical pick)."""
+        """Remove and return the front item of whichever ready lane was
+        filled earliest overall (physical pick)."""
         i = self.ready_lane()
         if i is None:
             raise RuntimeError("RackBuffer.get() called with nothing ready — caller must check ready_lane() first")
-        return self.lanes[i].pop(0)
+        return self.get_from_lane(i)
 
     def get_from_lane(self, lane_idx: int) -> Any:
         """Remove and return the front item of a specific lane (used once a
         caller has confirmed its own token is that lane's front item)."""
+        self._fill_order[lane_idx].pop(0)
         return self.lanes[lane_idx].pop(0)
+
+
+def _branch_slots(steps: List[Dict[str, Any]]) -> List[List[int]]:
+    """
+    Group a variant's steps into slots — the stops a job makes in order. A
+    plain step is a slot of its own. Consecutive steps sharing a "branch"
+    value are one split: a job visits only ONE of them, picked by the
+    previous station's Exit Controller (see BranchRouter). Steps without
+    "branch" (every scenario saved before splits existed) stay one per slot.
+    """
+    slots: List[List[int]] = []
+    for i, step in enumerate(steps):
+        branch = step.get("branch")
+        if branch is not None and slots and steps[slots[-1][0]].get("branch") == branch:
+            slots[-1].append(i)
+        else:
+            slots.append([i])
+    return slots
+
+
+class BranchRouter:
+    """
+    Exit Controller for a split: a station whose next step is one of several
+    different stations (Station 1 -> Station 2 / 3 / 4). Every machine of
+    those stations is one choice — a parallel station's #1, #2 count
+    separately — in step order. Same rules as a parallel station's own
+    dispatch (MachineGroup._dispatch):
+      cyclic    — in turn; a busy machine is skipped, the turn carries on
+                  after whichever machine got the job.
+      random    — a random free machine (own fixed seed, so runs repeat).
+      successor — the best-priority free machine ("Exit Priorities").
+    Busy = working on a job, or down for failure/PM. A station's own buffer
+    is not used here: a job only goes to a free machine, and waits on the
+    sending station while every choice is busy.
+    """
+
+    def __init__(
+        self,
+        options: List[Tuple[int, str, MachineGroup]],
+        strategy: str,
+        priority_order: Optional[List[int]] = None,
+        line: Optional["ParallelLine"] = None,
+    ):
+        # One choice per machine: (step index, station, group, machine index).
+        self.choices: List[Tuple[int, str, MachineGroup, int]] = [
+            (step_idx, station, group, m)
+            for step_idx, station, group in options
+            for m in range(len(group.sub_machines))
+        ]
+        self.groups = [group for _, _, group in options]
+        self.strategy = strategy
+        self.order = priority_order or list(range(len(self.choices)))
+        self._rng = random.Random(ROUTING_SEED)
+        self._next_turn = 0
+        # Set when every choice is a machine of one parallel group: jobs
+        # wait in the group's shared line instead of on the sending station.
+        self.line = line
+
+    def pick(self) -> Optional[Tuple[int, str, MachineGroup, int]]:
+        """The choice a job leaving now gets, or None while every one is busy."""
+        n = len(self.choices)
+        free = [k for k in range(n) if self.choices[k][2].machine_is_free(self.choices[k][3])]
+        if not free:
+            return None
+        if self.strategy == "random":
+            k = self._rng.choice(free)
+        elif self.strategy == "successor":
+            k = next(k for k in self.order if k in free)
+        else:
+            k = next((self._next_turn + j) % n for j in range(n) if (self._next_turn + j) % n in free)
+        self._next_turn = (k + 1) % n
+        return self.choices[k]
+
+
+class ParallelLine:
+    """
+    The one waiting line shared by the machines of a parallel group
+    (stations with the same "Parallel Group": Station 2 #1, #2, #3 — each a
+    station of its own, with its own settings). A job that finds every
+    machine busy waits here — freeing the station it came from — and goes to
+    the first machine that frees up. Room = the machines' Buffer Capacity
+    added together (None = unlimited, if any machine's buffer is); with 0
+    the job waits on the station it came from instead, like a split.
+    First in, first out.
+    """
+
+    def __init__(self, env: simpy.Environment, capacity: Optional[int]):
+        self.env = env
+        self.capacity = capacity
+        self.jobs: List[Any] = []
+        self._changed = env.event()
+
+    def has_room(self) -> bool:
+        return self.capacity is None or len(self.jobs) < self.capacity
+
+    def head(self) -> Any:
+        return self.jobs[0] if self.jobs else None
+
+    def join(self, token: Any) -> None:
+        self.jobs.append(token)
+        self._notify()
+
+    def leave(self, token: Any) -> None:
+        self.jobs.remove(token)
+        self._notify()
+
+    def changed(self) -> simpy.Event:
+        """Fires the next time a job joins or leaves."""
+        return self._changed
+
+    def _notify(self) -> None:
+        event, self._changed = self._changed, self.env.event()
+        event.succeed()
+
+
+class BufferBox:
+    """
+    A Buffer node on the Canvas: holds finished jobs between two stations and
+    takes no time.
+
+    2D: `capacity` jobs (None = unlimited). 0 = no waiting room at all — a job
+        never sits in the box; the station before keeps it until the station
+        after takes it, as if the box weren't there.
+    3D: a RackBuffer (X*Z lanes, Y deep). Capacity is X*Y*Z, and only the job
+        at the front of its lane can leave.
+
+    Entering: a job gets a place as soon as there is room, else waits
+    (first come, first placed) — the station it came from stays blocked.
+    Leaving: of the jobs allowed to leave (every job in 2D, lane fronts in
+    3D), FIFO sends the earliest-entered, LIFO the latest-entered.
+    """
+
+    def __init__(self, env: simpy.Environment, capacity: Optional[int], discipline: str,
+                 rack: Optional[RackBuffer] = None):
+        self.env = env
+        self.rack = rack
+        self.capacity = rack.total_capacity if rack is not None else capacity
+        self.lifo = str(discipline or "FIFO").strip().upper() == "LIFO"
+        self.items: List[Any] = []
+        self._seq = 0
+        self.seq: Dict[Any, int] = {}
+        self.entered_at: Dict[Any, float] = {}
+        self.lane: Dict[Any, int] = {}
+        self._room_waiters: deque = deque()  # (event, token), first come first placed
+        self._changed = env.event()
+        self.full_time = 0.0
+        self._full_since: Optional[float] = None
+
+    @property
+    def passes_through(self) -> bool:
+        """Capacity 0: no job ever waits inside."""
+        return self.capacity == 0
+
+    def has_room(self) -> bool:
+        if self.rack is not None:
+            return self.rack.has_room()
+        return self.capacity is None or len(self.items) < self.capacity
+
+    def enter(self, token: Any):
+        """Generator: place `token` as soon as there is room."""
+        if self.has_room() and not self._room_waiters:
+            self._place(token)
+            return
+        event = self.env.event()
+        self._room_waiters.append((event, token))
+        yield event  # _place()d by leave() before this fires
+
+    def may_leave(self, token: Any) -> bool:
+        """It's this job's turn to leave: chosen by FIFO/LIFO among the jobs
+        that can physically leave (lane fronts in 3D)."""
+        return self.next_out() is token
+
+    def next_out(self) -> Any:
+        candidates = self.items if self.rack is None else [
+            lane[0] for lane in self.rack.lanes if lane
+        ]
+        if not candidates:
+            return None
+        pick = max if self.lifo else min
+        return pick(candidates, key=lambda t: self.seq[t])
+
+    def priority(self, token: Any) -> float:
+        """Request priority on the next station: lower is served first. In
+        minutes, like a station's own FIFO (0) / LIFO (-arrival time), so jobs
+        from this box and from other feeders of that station compare fairly.
+        The tiny seq term orders jobs that entered in the same minute."""
+        if self.lifo:
+            return -(self.entered_at[token] + self.seq[token] * 1e-9)
+        if self.rack is None:
+            # 2D: every job queues the moment it enters, so plain request
+            # order is already FIFO.
+            return 0
+        # 3D: a job only queues once it reaches its lane front, which can be
+        # after a later-entered job in another lane — order by entry instead.
+        return self.entered_at[token] + self.seq[token] * 1e-9
+
+    def is_front(self, token: Any) -> bool:
+        return self.rack is None or self.rack.lanes[self.lane[token]][0] is token
+
+    def leave(self, token: Any) -> None:
+        if self.rack is not None:
+            lane = self.lane.pop(token)
+            assert self.rack.lanes[lane][0] is token
+            self.rack.get_from_lane(lane)
+        self.items.remove(token)
+        self.seq.pop(token, None)
+        self.entered_at.pop(token, None)
+        # A freed place goes to the longest-waiting arrival first.
+        while self._room_waiters and self.has_room():
+            event, waiting = self._room_waiters.popleft()
+            self._place(waiting)
+            event.succeed()
+        self._track_full()
+        self._notify()
+
+    def changed(self) -> simpy.Event:
+        """Fires the next time a job enters or leaves."""
+        return self._changed
+
+    def _place(self, token: Any) -> None:
+        self.items.append(token)
+        self.entered_at[token] = self.env.now
+        self.seq[token] = self._seq
+        self._seq += 1
+        if self.rack is not None:
+            self.lane[token] = self.rack.put(token)
+        self._track_full()
+        self._notify()
+
+    def _track_full(self) -> None:
+        full = not self.has_room()
+        if full and self._full_since is None:
+            self._full_since = self.env.now
+        elif not full and self._full_since is not None:
+            self.full_time += self.env.now - self._full_since
+            self._full_since = None
+
+    def full_time_until(self, now: float) -> float:
+        """Minutes the box was full, counting a still-open full spell."""
+        return self.full_time + (now - self._full_since if self._full_since is not None else 0.0)
+
+    def _notify(self) -> None:
+        event, self._changed = self._changed, self.env.event()
+        event.succeed()
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +731,7 @@ class ManufacturingSimulation:
 
         # Runtime state (reset on each run)
         self.env: Optional[simpy.Environment] = None
-        self.resources: Dict[str, Machine] = {}
+        self.resources: Dict[str, MachineGroup] = {}
         self.worker_pools: Dict[str, WorkerPool] = {}
         self.job_log: Dict[str, List] = {}
         self.completion_log: Dict[str, List] = {}
@@ -336,6 +746,19 @@ class ManufacturingSimulation:
 
     def run(self) -> Dict[str, Any]:
         """Execute the simulation and return results."""
+        # Random Seed — PDF section 13's reliability panel: "Auto" (the
+        # default — RANDOM_SEED absent/None/blank) leaves every run's
+        # failure/repair timing genuinely random, same as today's existing
+        # behavior. Setting an explicit integer here makes a run's random
+        # draws (failure timing, repair timing, routing ties, etc.)
+        # reproducible across repeated runs of the same scenario — useful
+        # for comparing two configs apples-to-apples, or for reliably
+        # reproducing a specific failure pattern for testing (the same need
+        # test_failure_policy_manual.py's run_until_hit() works around by
+        # trying a list of seeds).
+        seed = self.sim_config.get("RANDOM_SEED")
+        if seed not in (None, "", "auto", "Auto"):
+            random.seed(int(seed))
         self._validate_config()
         self._reset_state()
         self._run_simpy()
@@ -511,10 +934,16 @@ class ManufacturingSimulation:
             "completed_jobs": 0,
             "in_progress_jobs": 0,
             "rejected_jobs": 0,
+            "scrapped_jobs": 0,
             "job_count": 0,
             "current_jobs": {},
             "running_jobs": [],
             "job_exit_times": {},
+            # job_id -> when it entered the line / finished its whole route
+            # (finished only if it did) — the Canvas job replay shows a job at
+            # Start before its first station and at End once it's done.
+            "job_release_times": {},
+            "job_finish_times": {},
         }
 
         # Reset per-station tracking
@@ -534,17 +963,29 @@ class ManufacturingSimulation:
                 "operator_downtime_events": 0,
                 "failure_breakdowns": 0,
                 "pm_breakdowns": 0,
+                "sensor_passed": 0,
                 "job_counts": {"waiting": 0, "processing": 0, "completed": 0},
             })
 
         self.cycle_times = self._compute_cycle_times()
         self.resources = self._init_resources()
-        self.rack_buffers = self._init_rack_buffers()
+        self.conveyor_belts: Dict[str, ConveyorBelt] = {
+            name: ConveyorBelt(self.env)
+            for name, station in self.stations_data.items() if _is_conveyor(station)
+        }
+        self.buffer_boxes = self._init_buffer_boxes()
+        # Exit Controller routers for splits, made on first use — see
+        # _branch_target. Fresh each run so every replication starts its
+        # turn order / random choices from the beginning.
+        self.branch_routers: Dict[Tuple[Optional[str], Tuple[str, ...]], BranchRouter] = {}
+        # Shared waiting line per parallel group, made on first use.
+        self.parallel_lines: Dict[str, ParallelLine] = {}
         self.worker_pools = self._init_worker_pools()
         # Build case-insensitive/stripped lookup: normalized_key → original station key
         self._resource_key_map: Dict[str, str] = {
             k.lower().strip(): k for k in self.stations_data
         }
+        self._apply_exit_strategies()
         # Per-station effective shift config: each station's own shift1/2/3
         # time-windows override the global SHIFT_n_START/END (falls back to
         # global when a station doesn't define a window).
@@ -563,77 +1004,156 @@ class ManufacturingSimulation:
     def _resolve_step_resource(self, step: Dict[str, Any], variant_type: str) -> Optional[str]:
         """
         Resolve a process-flow step's destination station. `step["resource"]`
-        is either:
-          - a plain string (today's behaviour, unchanged — single destination), or
-          - a routing dict: {"mode": ..., "options": [...], ...} — "Exit
-            controller type", used when a station's finished jobs can go to
-            more than one possible next station.
-
-        Modes (the standard set used by AnyLogic/FlexSim/Simul8/Arena):
-          - "round_robin":     cycle through `options` in order (state is a
-                                counter stored ON THE STEP DICT itself, which
-                                is the same shared list object for every job
-                                of this variant — so it persists correctly
-                                across jobs, not reset per job).
-          - "percentage":      weighted random pick via `weights` (parallel
-                                to `options`) — converges to the target split
-                                over many jobs; each pick is independent.
-          - "condition":       ordered `rules` list of {"if": "<attr>==<val>",
-                                "resource": "<name>"}, first match wins,
-                                falling back to `default`. Only supports
-                                simple `variant_type == "X"` equality checks.
-          - "shortest_queue":  picks whichever candidate in `options`
-                                currently has the fewest jobs waiting for its
-                                machine — the one mode that needs live
-                                simulation state at decision time rather than
-                                a counter or fixed weights.
+        is a plain station name. Scenarios saved while the Exit Controller
+        existed may still hold a {"mode", "options", ...} dict — those run on
+        their first resolvable option only.
         """
         raw = step.get("resource")
         if isinstance(raw, str):
             return self._resolve_resource(raw)
         if not isinstance(raw, dict):
             return None
+        for option in raw.get("options", []):
+            resolved = self._resolve_resource(option)
+            if resolved is not None:
+                return resolved
+        return None
 
-        mode = str(raw.get("mode", "round_robin")).strip().lower()
-        options = [o for o in raw.get("options", []) if self._resolve_resource(o) is not None]
-        if not options:
+    def _apply_exit_strategies(self) -> None:
+        """
+        Exit Controller: the station BEFORE a parallel station decides how
+        jobs are spread over its machines. "random" there makes the next
+        station's MachineGroup pick a random free machine; "successor" makes
+        it pick the best-priority free machine ("Exit Priorities"); anything
+        else (incl. not set) keeps the default cyclic order. Only parallel
+        stations (2+ machines) are affected. A split (next step is one of
+        several stations) is routed by BranchRouter instead.
+        """
+        for steps in self.processflow_data.values():
+            slots = _branch_slots(steps)
+            for prev_slot, nxt_slot in zip(slots, slots[1:]):
+                if len(prev_slot) != 1 or len(nxt_slot) != 1:
+                    continue
+                prev = self._resolve_step_resource(steps[prev_slot[0]], "")
+                nxt = self._resolve_step_resource(steps[nxt_slot[0]], "")
+                if prev is None or nxt is None:
+                    continue
+                strategy = str(self.stations_data[prev].get("Exit Strategy") or "").strip().lower()
+                group = self.resources[nxt]
+                if len(group.sub_machines) < 2:
+                    continue
+                if strategy == "random":
+                    group.strategy = "random"
+                elif strategy == "successor":
+                    group.strategy = "successor"
+                    order = self._exit_priority_order(self.stations_data[prev].get("Exit Priorities"), nxt, len(group.sub_machines))
+                    if order is not None:
+                        group.priority_order = order
+
+    def _exit_priority_order(self, priorities: Any, station: str, n: int) -> Optional[List[int]]:
+        """
+        Turn the Canvas's {"Station 2 #1": 2, "Station 2 #2": 1, ...} into
+        machine indexes best-first ([1, 0, ...]). Boxes are matched to
+        machines in "#" number order (#1 -> first machine, ...). None (keep
+        the default #1, #2, ... order) when not set or not exactly one
+        priority per machine using each of 1..n once — the Canvas blocks
+        saving that, so it only covers hand-edited data.
+        """
+        if not isinstance(priorities, dict):
             return None
+        boxes = []
+        for label, prio in priorities.items():
+            m = re.match(r"^(.*?)(?:\s+#(\d+))?$", str(label).strip())
+            if self._resolve_resource(m.group(1)) == station:
+                boxes.append((int(m.group(2) or 0), prio))
+        boxes.sort()
+        prios = [p for _, p in boxes]
+        if len(prios) != n or sorted(prios) != list(range(1, n + 1)):
+            return None
+        return sorted(range(n), key=lambda i: prios[i])
 
-        if mode == "round_robin":
-            idx = raw.get("_rr_index", 0) % len(options)
-            raw["_rr_index"] = (idx + 1) % len(options)
-            chosen = options[idx]
-        elif mode == "percentage":
-            weights = raw.get("weights") or [1] * len(options)
-            chosen = random.choices(options, weights=weights, k=1)[0]
-        elif mode == "condition":
-            chosen = None
-            for rule in raw.get("rules", []):
-                cond = str(rule.get("if", ""))
-                if "==" in cond:
-                    lhs, _, rhs = cond.partition("==")
-                    lhs, rhs = lhs.strip(), rhs.strip().strip("'\"")
-                    if lhs == "variant_type" and variant_type == rhs:
-                        chosen = rule.get("resource")
-                        break
-            if chosen is None:
-                chosen = raw.get("default", options[0])
-        elif mode == "shortest_queue":
-            def _load(name: str) -> float:
-                # Total load = jobs actively holding the machine (.count) +
-                # jobs waiting for it (.queue) — checking .queue alone misses
-                # a station that's busy-but-nobody-waiting-yet, which made
-                # every job pick the same "empty queue" destination.
-                resolved_name = self._resolve_resource(name)
-                if resolved_name not in self.resources:
-                    return float("inf")
-                res = self.resources[resolved_name]
-                return res.count + len(res.queue)
-            chosen = min(options, key=_load)
-        else:
-            chosen = options[0]
+    def _branch_target(
+        self, src: Optional[str], steps: List[Dict[str, Any]], slot: List[int],
+        resolve: Callable[[int], Optional[str]],
+    ) -> Optional[BranchRouter]:
+        """
+        The router for the split `slot` (2+ steps) entered from station `src`
+        (None when the split is reached without one, e.g. as the first step).
+        One per (src, stations) for the whole run, so the turn order is
+        shared by every job and variant leaving src. None when fewer than two
+        of the split's stations exist — the caller then runs it as a plain
+        step.
+        """
+        options = [(i, resolve(i)) for i in slot]
+        options = [(i, name) for i, name in options if name is not None]
+        if len(options) < 2:
+            return None
+        key = (src, tuple(name for _, name in options))
+        router = self.branch_routers.get(key)
+        if router is None:
+            cfg = self.stations_data.get(src, {}) if src is not None else {}
+            strategy = str(cfg.get("Exit Strategy") or "").strip().lower()
+            groups = [(i, name, self.resources[name]) for i, name in options]
+            order = None
+            if strategy == "successor":
+                order = self._branch_priority_order(cfg.get("Exit Priorities"), groups)
+            router = BranchRouter(groups, strategy, order, self._parallel_line([name for _, name in options]))
+            self.branch_routers[key] = router
+        return router
 
-        return self._resolve_resource(chosen)
+    def _parallel_line(self, stations: List[str]) -> Optional[ParallelLine]:
+        """
+        The shared waiting line when `stations` are all machines of one
+        parallel group; None otherwise (a split between different stations,
+        where the job waits on the station it came from).
+        """
+        groups = {str(self.stations_data[s].get("Parallel Group") or "").strip() for s in stations}
+        if len(groups) != 1 or "" in groups:
+            return None
+        group = groups.pop()
+        line = self.parallel_lines.get(group)
+        if line is None:
+            members = [self.stations_data[s] for s in stations]
+            if any(m.get("Buffer Unlimited", False) for m in members):
+                capacity = None
+            else:
+                capacity = sum(max(0, int(float(m.get("Buffer Capacity", 0) or 0))) for m in members)
+            line = ParallelLine(self.env, capacity)
+            self.parallel_lines[group] = line
+        return line
+
+    def _branch_priority_order(
+        self, priorities: Any, groups: List[Tuple[int, str, MachineGroup]],
+    ) -> Optional[List[int]]:
+        """
+        Turn the Canvas's {"Station 2": 2, "Station 3 #1": 1, ...} into
+        BranchRouter choice indexes, best first. Choices are each station's
+        machines in step order ("#" number order within a parallel station).
+        None (keep that order) unless there is exactly one priority per
+        choice using each of 1..n once — the Canvas blocks saving otherwise.
+        """
+        if not isinstance(priorities, dict):
+            return None
+        by_box: Dict[Tuple[str, int], Any] = {}
+        for label, prio in priorities.items():
+            # A machine of a parallel group is a station of its own, named
+            # exactly like its box ("Station 2 #1", or whatever it was renamed to).
+            station = self._resolve_resource(str(label).strip())
+            if station is not None:
+                by_box[(station, 0)] = prio
+                continue
+            m = re.match(r"^(.*?)(?:\s+#(\d+))?$", str(label).strip())
+            station = self._resolve_resource(m.group(1))
+            if station is not None:
+                by_box[(station, int(m.group(2) or 0))] = prio
+        prios = []
+        for _, name, group in groups:
+            n = len(group.sub_machines)
+            for k in range(n):
+                prios.append(by_box.get((name, k + 1 if n > 1 else 0)))
+        if sorted(p for p in prios if isinstance(p, (int, float))) != list(range(1, len(prios) + 1)):
+            return None
+        return sorted(range(len(prios)), key=lambda k: prios[k])
 
     def _compute_cycle_times(self) -> Dict[str, float]:
         """Average duration per operation across all variants."""
@@ -647,46 +1167,97 @@ class ManufacturingSimulation:
             if durs
         }
 
-    def _init_resources(self) -> Dict[str, Machine]:
+    def _init_resources(self) -> Dict[str, MachineGroup]:
         resources = {}
         for name, station in self.stations_data.items():
             # Conveyors and Connectors are not machines: they never break down
             # and have no preventive maintenance. Passing simulation_time=None
-            # suppresses Machine's failure/PM background processes entirely
-            # (see machine.py) instead of relying on a 0 failure rate, which
+            # suppresses failure/PM background processes entirely (see
+            # machine.py) instead of relying on a 0 failure rate, which
             # would still spawn and run both processes for the whole horizon.
             is_transport = _is_conveyor(station) or _is_passthrough(station)
-            # A belt carries many units at once, so it must not serialise jobs
-            # the way a single-server machine does.
-            capacity = CONVEYOR_CAPACITY if _is_conveyor(station) else station.get("capacity", 1)
-            resources[name] = Machine(
+            # A belt carries up to its Conveyor Capacity jobs at once (one
+            # spot per job); see ConveyorBelt for how they move along it.
+            capacity = max(1, _conveyor_capacity(station)) if _is_conveyor(station) else station.get("capacity", 1)
+            # Failure Policy — PDF section 7/8: what happens to a part's
+            # remaining processing time when this station's machine fails
+            # mid-operation. Not a field the UI/parsers write today, so an
+            # absent/unrecognized value falls back to RESUME, the PDF's own
+            # stated default ("most useful default for a manufacturing
+            # simulation").
+            policy_raw = str(station.get("Failure Policy", "resume") or "resume").strip().lower()
+            try:
+                failure_policy = FailurePolicy(policy_raw)
+            except ValueError:
+                failure_policy = FailurePolicy.RESUME
+
+            # MTBF (minutes, uncapped) — the primary reliability input when
+            # present, written by the Process Flow tab's Availability%+MTTR
+            # fields (see ScenarioManager.tsx). Falls back to the legacy
+            # "Failure rate" (0-1 daily probability) path inside machine.py
+            # for scenarios saved before this field existed.
+            mtbf_raw = station.get("MTBF")
+            mtbf = None if is_transport or mtbf_raw in (None, "") else float(mtbf_raw)
+
+            # Enable Failures — PDF section 13's reliability panel: an
+            # explicit per-station on/off switch, so disabling failures
+            # doesn't require contorting Availability to exactly 100 (which
+            # also only approximately means "never fails" once MTBF is a
+            # plain float rather than a 0-1 probability with a hard ceiling
+            # — see availabilityPctToMtbf's clamp). Defaults to True/absent
+            # for every existing scenario (unchanged behavior) — only an
+            # explicit False here disables it. Reuses the exact same
+            # simulation_time=None mechanism transport stations already use
+            # to fully suppress the failure/PM background processes (see
+            # machine.py), rather than a separate code path.
+            failures_enabled = station.get("Enable Failures", True)
+            no_failures = is_transport or failures_enabled is False
+
+            resources[name] = MachineGroup(
                 env=self.env,
                 name=name,
-                failure_rate=0 if is_transport else station.get("Failure rate", 0),
+                failure_rate=0 if no_failures else station.get("Failure rate", 0),
                 repair_time=station.get("Repair Time", 10),
-                pm_schedule=None if is_transport else station.get("PM Schedule"),
+                pm_schedule=None if no_failures else station.get("PM Schedule"),
                 capacity=capacity,
                 job_log=self.job_log,
-                simulation_time=None if is_transport else self.sim_config["SIM_TIME"],
+                simulation_time=None if no_failures else self.sim_config["SIM_TIME"],
+                failure_policy=failure_policy,
+                mtbf=None if no_failures else mtbf,
+                # Only a belt/passthrough is one shared pool. A station with
+                # failures off still has `capacity` separate machines, so the
+                # Exit Controller (cyclic/random/successor) picks between them.
+                pooled=is_transport,
             )
+            if _is_conveyor(station) and _conveyor_capacity(station) == 0:
+                # Capacity 0: SimPy needs at least 1 slot, so take that one
+                # slot for good — no job can ever get on this belt.
+                resources[name].sub_machines[0].request()
         return resources
 
-    def _init_rack_buffers(self) -> Dict[str, RackBuffer]:
+    def _init_buffer_boxes(self) -> Dict[str, BufferBox]:
         """
-        One RackBuffer per station that has Buffer Width/Depth/Height
-        configured — takes precedence over the plain scalar Buffer Capacity
-        for that station (see _process_variant's buffer hand-off). Stations
-        without any of the three dimensions set simply have no entry here
-        and fall back to the existing scalar/unlimited behaviour untouched.
+        One BufferBox per Buffer node. "Buffer Config Mode": "3D" gives it an
+        X/Y/Z RackBuffer (Canvas-only fields, each defaulting to 1); 2D (the
+        default) uses Buffer Capacity, or no limit when Buffer Unlimited.
         """
-        buffers = {}
+        boxes = {}
         for name, station in self.stations_data.items():
-            width = station.get("Buffer Width", 0) or 0
-            depth = station.get("Buffer Depth", 0) or 0
-            height = station.get("Buffer Height", 0) or 0
-            if width > 0 and depth > 0 and height > 0:
-                buffers[name] = RackBuffer(int(width), int(depth), int(height))
-        return buffers
+            if not _is_buffer(station):
+                continue
+            discipline = station.get("Buffer Discipline", "FIFO")
+            if station.get("Buffer Config Mode") == "3D":
+                x = int(station.get("Buffer X", 1) or 1)
+                y = int(station.get("Buffer Y", 1) or 1)
+                z = int(station.get("Buffer Z", 1) or 1)
+                rack = RackBuffer(max(1, x), max(1, y), max(1, z))
+                boxes[name] = BufferBox(self.env, None, discipline, rack)
+            elif station.get("Buffer Unlimited", False):
+                boxes[name] = BufferBox(self.env, None, discipline)
+            else:
+                cap = max(0, int(station.get("Buffer Capacity", 0) or 0))
+                boxes[name] = BufferBox(self.env, cap, discipline)
+        return boxes
 
     def _init_worker_pools(self) -> Dict[str, WorkerPool]:
         """
@@ -752,7 +1323,18 @@ class ManufacturingSimulation:
         spawnable_jobs = max(1, spawnable_jobs)
 
         spawned = 0
-        for variant, qty in self.variant_quantities.items():
+        # Start's Exit Controller: products released one batch after another.
+        schedule = self._release_schedule()
+        if schedule is not None:
+            arrivals = [(v, i, t) for v, i, t in schedule if t <= sim_time]
+            total = max(1, len(arrivals))
+            report_every = max(1, total // 50)
+            for variant, i, arrival in arrivals:
+                self.env.process(self._delayed_spawn(i, variant, arrival))
+                spawned += 1
+                if spawned % report_every == 0 or spawned == total:
+                    self.progress_cb(spawned / total * 0.5, f"Scheduling {variant} #{i}")
+        for variant, qty in (self.variant_quantities.items() if schedule is None else ()):
             interval = self.variant_intervals.get(variant, 0) or 0
             for i in range(1, qty + 1):
                 if interval > 0:
@@ -816,6 +1398,11 @@ class ManufacturingSimulation:
         for name, machine in self.resources.items():
             self.stations_data[name]["failure_breakdowns"] = machine.failure_count
             self.stations_data[name]["pm_breakdowns"] = machine.pm_count
+            # Per-sub-machine breakdown — must be captured here, not later:
+            # self.resources is rebuilt fresh by _reset_state() at the start
+            # of every run()/replication, so this is the only point where
+            # this replication's own MachineGroups are still valid.
+            self.stations_data[name]["failure_counts_per_machine"] = machine.failure_counts_per_machine
             if machine.wait_start_time is not None:
                 wait_end = self.env.now
                 wait_dur = wait_end - machine.wait_start_time
@@ -829,22 +1416,79 @@ class ManufacturingSimulation:
     # Variant process
     # ------------------------------------------------------------------
 
+    def _release_order(self) -> Optional[List[str]]:
+        """
+        The Start's Exit Controller ("MU Strategy" on the Start, set in its
+        panel): the order its products are released in, each product as one
+        whole batch. None = not set (or Percentage, UI only for now) — every
+        product then arrives on its own, as before.
+          cyclic    — the MU table's order (tshirt, pant, shirt, ...)
+          random    — a random order (fixed seed, so runs repeat)
+          successor — by "MU Priorities" (1 first); the table's order unless
+                      every product has a different priority 1..n
+        Products with no quantity (or no route) are left out.
+        """
+        start = next(
+            (s for s in self.stations_data.values()
+             if _station_type(s) == STATION_TYPE_SOURCE and s.get("MU Strategy")),
+            None,
+        )
+        if start is None:
+            return None
+        strategy = str(start.get("MU Strategy") or "").strip().lower()
+        if strategy not in ("cyclic", "random", "successor"):
+            return None
+        table = [str(r.get("mu", "")) for r in (start.get("MU Table") or []) if isinstance(r, dict)]
+        products = [v for v in table if v in self.variant_quantities]
+        products += [v for v in self.variant_quantities if v not in products]
+        products = [v for v in products if self.variant_quantities.get(v, 0) > 0 and v in self.processflow_data]
+        if strategy == "random":
+            random.Random(ROUTING_SEED).shuffle(products)
+        elif strategy == "successor":
+            prios = start.get("MU Priorities") or {}
+            values = [prios.get(v) for v in products] if isinstance(prios, dict) else []
+            if sorted(p for p in values if isinstance(p, (int, float))) == list(range(1, len(products) + 1)):
+                products = [v for _, v in sorted(zip(values, products))]
+        return products
+
+    def _release_schedule(self) -> Optional[List[Tuple[str, int, float]]]:
+        """
+        (product, job number, arrival minute) for every job, when the Start's
+        Exit Controller releases products batch by batch (see _release_order).
+        Each job arrives its own product's Interval after the job before it —
+        tshirts every 5 min, then pants every 8 min, ... — the very first at
+        0; no Interval = no gap.
+        """
+        order = self._release_order()
+        if order is None:
+            return None
+        schedule: List[Tuple[str, int, float]] = []
+        t = 0.0
+        for variant in order:
+            gap = float(self.variant_intervals.get(variant, 0) or 0)
+            for i in range(1, self.variant_quantities[variant] + 1):
+                if schedule:
+                    t += gap
+                schedule.append((variant, i, t))
+        return schedule
+
     def _delayed_spawn(self, variant_id: int, variant_type: str, delay: float):
         """Wait `delay` minutes (fixed inter-arrival spacing), then start the job."""
         if delay > 0:
             yield self.env.timeout(delay)
         yield from self._process_variant(variant_id, variant_type)
 
+    def _real_stamp(self) -> str:
+        """Now as a real date-time, in the completion_log's own format."""
+        now_real = self.simulation_state["start_date"] + timedelta(minutes=self.env.now)
+        return now_real.strftime("%Y-%m-%d %H:%M:%S")
+
     def _process_variant(self, variant_id: int, variant_type: str):
         steps = self.processflow_data.get(variant_type, [])
-        # Resolve each step's destination LAZILY, the first time it's needed
-        # (either when the loop reaches it, or earlier via the buffer
-        # look-ahead one step below) — cached in `resolved` so it's decided
-        # exactly ONCE per job, not re-rolled. This must NOT happen all
-        # upfront at job-spawn time: "shortest_queue" mode needs to see the
-        # REAL simulation state at the moment the job actually reaches that
-        # decision point, not at t=0 before any job has even started (every
-        # candidate would tie at 0 load and always pick the first one).
+        self.simulation_state["job_release_times"][_format_job_id(variant_type, variant_id)] = self._real_stamp()
+        # Resolve each step's destination the first time it's needed (either
+        # when the loop reaches it, or earlier via the buffer look-ahead one
+        # step below) — cached in `resolved` so it's looked up once per job.
         resolved: List[Optional[str]] = [None] * len(steps)
 
         def resolve(i: int) -> Optional[str]:
@@ -852,15 +1496,49 @@ class ManufacturingSimulation:
                 resolved[i] = self._resolve_step_resource(steps[i], variant_type)
             return resolved[i]
 
-        # Set by the PREVIOUS step's buffer hand-off when the next station has
-        # a rack buffer — released only once this step's _perform_operation
-        # actually secures the machine (see on_machine_acquired), so a rack
-        # slot stays physically occupied for the job's whole wait, not just
-        # the instant it became front-of-lane.
-        pending_rack_release = None
+        # Set by the PREVIOUS step's zero-buffer (Buffer Capacity 0) hand-off:
+        # the slot on THIS step's station that the job already queued for and
+        # won before leaving the previous station. Consumed by the
+        # _perform_operation call below so the job doesn't request twice.
+        pending_zero_buffer = None
+        # (Buffer name, token): the place this job already holds in the Buffer
+        # box that is its NEXT step — won by the previous step's hand-off.
+        box_place: Optional[Tuple[str, Any]] = None
+        # A Buffer box with capacity 0 holds nothing, so the job stays where
+        # it was (station slot or earlier Buffer place) until the step after
+        # that box takes it: (release, in_box) carried across the box's step.
+        carried: Optional[Tuple[Callable[[], None], Any]] = None
+        # Hand-off channel for a slot _perform_operation kept open (hold_slot).
+        self._held_slot = None
+        # The stops the job makes, in order: a split (Station 2 / 3 / 4) is
+        # one stop where it visits only one of the stations — see
+        # _branch_slots / BranchRouter.
+        slots = _branch_slots(steps)
+        # Step of the NEXT stop (a split) the previous hand-off picked.
+        chosen: Optional[int] = None
+        # Last station the job was at — its Exit Controller routes a split
+        # reached without a hand-off (e.g. after a Connector).
+        last_resource: Optional[str] = None
 
-        for idx, step in enumerate(steps):
+        for si, slot in enumerate(slots):
+            if len(slot) > 1 and chosen is None:
+                # A split reached without a hand-off (first step, or right
+                # after a Connector): pick and take a free machine now.
+                router = self._branch_target(last_resource, steps, slot, resolve)
+                if router is None:
+                    idx = slot[0]
+                else:
+                    pending_zero_buffer, _, _, idx = yield from self._hand_off_branch(
+                        None, router, lambda: None, None)
+            elif len(slot) > 1:
+                idx = chosen
+            else:
+                idx = slot[0]
+            chosen = None
+            step = steps[idx]
             resource_name = resolve(idx)
+            if resource_name is not None:
+                last_resource = resource_name
             if resource_name is None:
                 logger.warning(
                     "Resource for step '%s' not found in stations_data — skipping for %s#%s",
@@ -868,8 +1546,47 @@ class ManufacturingSimulation:
                 )
                 continue
             durations = step.get("durations")
-            release_cb = pending_rack_release
-            pending_rack_release = None
+            preacquired = pending_zero_buffer
+            pending_zero_buffer = None
+            # Where the job goes next: a station name, or a BranchRouter when
+            # the next stop is a split.
+            nxt: Any = None
+            if si + 1 < len(slots):
+                next_slot = slots[si + 1]
+                if len(next_slot) > 1:
+                    nxt = self._branch_target(resource_name, steps, next_slot, resolve)
+                if nxt is None:
+                    nxt = resolve(next_slot[0])
+            station_cfg = self.stations_data[resource_name]
+
+            # --- Buffer box: holds the job, takes no time.
+            if _is_buffer(station_cfg):
+                if preacquired is not None:
+                    preacquired[0].__exit__(None, None, None)
+                box = self.buffer_boxes[resource_name]
+                if box_place is None and carried is None and not box.passes_through:
+                    # Reached without a hand-off (e.g. straight from Start or
+                    # a Connector): take a place now.
+                    token = object()
+                    yield from box.enter(token)
+                    box_place = (resource_name, token)
+                trace_start = self.env.now
+                trace = self._log_passthrough(resource_name, variant_id, variant_type, step.get("operation", ""))
+                if box_place is not None:
+                    in_box = (box, box_place[1])
+                    release = (lambda b=box, t=box_place[1]: b.leave(t))
+                elif carried is not None:
+                    release, in_box = carried
+                else:
+                    release, in_box = (lambda: None), None
+                box_place, carried = None, None
+                if nxt is None:
+                    release()
+                else:
+                    pending_zero_buffer, box_place, carried, chosen = yield from self._hand_off_next(
+                        resource_name, nxt, release, in_box)
+                self._close_passthrough(trace, trace_start)
+                continue
 
             # A Connector is a routing junction, not a work station: the job
             # passes straight through with no delay, no machine contention and
@@ -877,13 +1594,30 @@ class ManufacturingSimulation:
             # so none of that function's machine machinery (capacity request,
             # setup, downtime, rework, busy_time accounting) runs at all. The
             # job still gets a trace entry so it doesn't look like a dropped
-            # step in the Job Trace, and any rack slot held for this step is
-            # released immediately since nothing is ever waiting here.
-            if _is_passthrough(self.stations_data[resource_name]):
-                if release_cb is not None:
-                    release_cb()
+            # step in the Job Trace.
+            if _is_passthrough(station_cfg):
+                # Nothing is processed here, so a zero-buffer slot won for this
+                # step would otherwise be held for the rest of the run.
+                if preacquired is not None:
+                    preacquired[0].__exit__(None, None, None)
                 self._log_passthrough(resource_name, variant_id, variant_type, step.get("operation", ""))
                 continue
+
+            # The finished job stays on this station (keeps its slot) until
+            # the next step takes it — unless that is a station with an
+            # unlimited queue or a zero-time junction, which always take it
+            # at once. Decided before processing so _perform_operation keeps
+            # the slot instead of releasing it on the way out.
+            hold_slot = False
+            if isinstance(nxt, BranchRouter):
+                # A split only takes the job onto a free machine.
+                hold_slot = True
+            elif nxt is not None:
+                nxt_station = self.stations_data[nxt]
+                if _is_buffer(nxt_station):
+                    hold_slot = True
+                elif not _is_passthrough(nxt_station) and not nxt_station.get("Buffer Unlimited", False):
+                    hold_slot = True
 
             outcome = None
             try:
@@ -892,21 +1626,23 @@ class ManufacturingSimulation:
                         outcome = yield from self._perform_operation(
                             resource_name, variant_id, variant_type,
                             step["operation"],
-                            self.stations_data[resource_name].get("operator_per_station", 1),
-                            self.stations_data[resource_name].get("shifts_per_day", 1),
+                            station_cfg.get("operator_per_station", 1),
+                            station_cfg.get("shifts_per_day", 1),
                             duration,
-                            on_machine_acquired=release_cb if i == 0 else None,
+                            preacquired=preacquired if i == 0 else None,
+                            hold_slot=hold_slot and i == len(durations) - 1,
                         )
-                        if outcome == "rejected":
+                        if outcome in ("rejected", "in_progress", "scrapped"):
                             break
                 else:
                     outcome = yield from self._perform_operation(
                         resource_name, variant_id, variant_type,
                         step["operation"],
-                        self.stations_data[resource_name].get("operator_per_station", 1),
-                        self.stations_data[resource_name].get("shifts_per_day", 1),
+                        station_cfg.get("operator_per_station", 1),
+                        station_cfg.get("shifts_per_day", 1),
                         step["duration"],
-                        on_machine_acquired=release_cb,
+                        preacquired=preacquired,
+                        hold_slot=hold_slot,
                     )
             except Exception as exc:
                 logger.error(
@@ -917,72 +1653,35 @@ class ManufacturingSimulation:
                 # Continue to next step so job can still complete
                 continue
 
+            # Slot this station is still holding because the job is finished
+            # but has nowhere to go yet (hold_slot above). Released only once
+            # the next step has actually taken the job.
+            held_slot = self._held_slot
+            self._held_slot = None
+
             # A Worker Controller rejected this job outright (Queue Policy =
-            # reject, queue full) — the job leaves the line here entirely,
-            # same as reaching the simulation horizon mid-cycle: it must NOT
-            # continue to the next step or be counted as completed below.
-            if outcome == "rejected":
+            # reject, queue full), the simulation horizon ran out mid-step
+            # (its trace_entry is already "In Progress" with partial credit),
+            # or FailurePolicy.SCRAP discarded the part — the job leaves the
+            # line here: it must NOT continue or be counted as completed.
+            if outcome in ("rejected", "in_progress", "scrapped"):
+                if held_slot is not None:
+                    held_slot.__exit__(None, None, None)
                 return
 
-            # --- Buffer hand-off: hold this job at resource_name until the
-            # NEXT station has room to accept it. The job has already
-            # finished processing here, so every minute spent waiting below
-            # counts as this station being blocked (it can't start its next
-            # job because it's still holding this finished one). Neither a
-            # rack buffer nor a scalar Buffer Capacity configured on the next
-            # station → unlimited, identical to behaviour before either
-            # feature existed.
-            if idx + 1 < len(steps):
-                next_resource = resolve(idx + 1)
-                if next_resource is not None:
-                    rack = self.rack_buffers.get(next_resource)
-                    if rack is not None:
-                        # Physical X/Y/Z rack: enter a lane once one has room,
-                        # then wait to become THAT SPECIFIC lane's front
-                        # (pickable) item — a job stuck behind others in its
-                        # own lane must wait them out even if other lanes are
-                        # already free/ready, which is the whole point of the
-                        # physical model over a plain scalar count. The slot
-                        # itself is only released later, once the job actually
-                        # secures the next station's machine (on_machine_acquired).
-                        block_start = self.env.now
-                        while not rack.has_room():
-                            yield self.env.timeout(1)
-                        token = object()
-                        lane_idx = rack.put(token)
-                        while rack.lanes[lane_idx][0] is not token:
-                            yield self.env.timeout(1)
-                        buffer_block = self.env.now - block_start
-                        if buffer_block > 0:
-                            self.stations_data[resource_name]["total_block_time"] = (
-                                self.stations_data[resource_name].get("total_block_time", 0) + buffer_block
-                            )
-                            self.stations_data[resource_name]["buffer_blocked_time"] = (
-                                self.stations_data[resource_name].get("buffer_blocked_time", 0) + buffer_block
-                            )
+            if nxt is not None:
+                release = (lambda s=held_slot: s.__exit__(None, None, None)) if held_slot is not None else (lambda: None)
+                held_slot = None
+                pending_zero_buffer, box_place, carried, chosen = yield from self._hand_off_next(
+                    resource_name, nxt, release, None)
 
-                        def _make_release(r=rack, li=lane_idx):
-                            def _release():
-                                r.get_from_lane(li)
-                            return _release
-                        pending_rack_release = _make_release()
-                    else:
-                        cap = self.stations_data[next_resource].get("Buffer Capacity", 0) or 0
-                        if cap > 0:
-                            block_start = self.env.now
-                            next_queue = self.resources[next_resource].queue
-                            while len(next_queue) >= cap:
-                                yield self.env.timeout(1)
-                            buffer_block = self.env.now - block_start
-                            if buffer_block > 0:
-                                self.stations_data[resource_name]["total_block_time"] = (
-                                    self.stations_data[resource_name].get("total_block_time", 0) + buffer_block
-                                )
-                                self.stations_data[resource_name]["buffer_blocked_time"] = (
-                                    self.stations_data[resource_name].get("buffer_blocked_time", 0) + buffer_block
-                                )
+            # Last step: nothing after it, so free the slot now.
+            if held_slot is not None:
+                held_slot.__exit__(None, None, None)
+                held_slot = None
 
         self.simulation_state["total_simulated_time"] = self.env.now
+        self.simulation_state["job_finish_times"][_format_job_id(variant_type, variant_id)] = self._real_stamp()
         # Excluded from the headline "Completed Jobs" KPI during warm-up, same
         # as the per-station counters above — see _validate_config.
         if self.env.now >= self.sim_config.get("WARMUP_TIME", 0):
@@ -992,9 +1691,189 @@ class ManufacturingSimulation:
         )
         self.simulation_state["job_count"] = self.simulation_state["completed_jobs"]
 
+    def _hand_off_next(
+        self,
+        src: str,
+        nxt: Any,
+        release_src: Callable[[], None],
+        in_box: Optional[Tuple["BufferBox", Any]],
+    ):
+        """
+        _hand_off for whatever comes next: a station name, or a BranchRouter
+        (a split). Returns _hand_off's three values plus the split's step
+        index the job was sent to (None when nxt is a plain station).
+        """
+        if isinstance(nxt, BranchRouter):
+            return (yield from self._hand_off_branch(src, nxt, release_src, in_box))
+        pending, box_place, carried = yield from self._hand_off(src, nxt, release_src, in_box)
+        return pending, box_place, carried, None
+
+    def _hand_off_branch(
+        self,
+        src: Optional[str],
+        router: BranchRouter,
+        release_src: Callable[[], None],
+        in_box: Optional[Tuple["BufferBox", Any]],
+    ):
+        """
+        Hand the job from `src` (None: reached without a station to leave)
+        into a split. It waits — still on src, which stays blocked — until
+        one of the split's machines is free, then the router (src's Exit
+        Controller) picks one and the job goes straight onto it. Returns
+        (that machine's slot, None, None, the chosen step index).
+
+        A parallel group (router.line set): while every machine is busy the
+        job moves into the group's shared line, as soon as it has room —
+        src is freed then — and the first in line goes to the next machine
+        that frees up. The slot then also carries when the job joined the
+        line, so its wait there counts at the machine it gets.
+        """
+        box, token = in_box if in_box is not None else (None, None)
+        line = router.line
+        me = object()
+        joined_at: Optional[float] = None
+        block_start = self.env.now
+        while True:
+            box_turn = box is None or box.may_leave(token)
+            if joined_at is not None:
+                may_pick = line.head() is me
+            else:
+                may_pick = box_turn and (line is None or not line.jobs)
+            if may_pick:
+                pick = router.pick()
+                if pick is not None:
+                    break
+            if joined_at is None and line is not None and box_turn and line.has_room():
+                # Every machine busy: wait in the shared line, not on src.
+                line.join(me)
+                joined_at = self.env.now
+                if src is not None:
+                    self._add_buffer_block(src, block_start)
+                release_src()
+                continue
+            waits = [group.freed() for group in router.groups]
+            if line is not None:
+                waits.append(line.changed())
+            if box is not None and joined_at is None:
+                waits.append(box.changed())
+            yield self.env.any_of(waits)
+        step_idx, _, group, machine = pick
+        if joined_at is not None:
+            line.leave(me)
+            priority = 0
+        else:
+            priority = box.priority(token) if box is not None else 0
+        req_ctx = group.request_machine(machine, priority=priority)
+        req, _ = req_ctx.__enter__()
+        yield req
+        if joined_at is None:
+            if src is not None:
+                self._add_buffer_block(src, block_start)
+            release_src()
+            return (req_ctx, req, req_ctx.sub_machine), None, None, step_idx
+        return (req_ctx, req, req_ctx.sub_machine, joined_at), None, None, step_idx
+
+    def _hand_off(
+        self,
+        src: str,
+        nxt: str,
+        release_src: Callable[[], None],
+        in_box: Optional[Tuple["BufferBox", Any]],
+    ):
+        """
+        Wait until step `nxt` takes this job from `src`, then release_src()
+        (frees the station slot or Buffer place the job was sitting in).
+        in_box is (box, token) when the job sits in a Buffer box: it may then
+        only leave on its turn — FIFO/LIFO, and front of its lane in 3D.
+
+        Returns (pending_zero_buffer, box_place, carried):
+          pending_zero_buffer: the next station's slot, already won (that
+              station has Buffer Capacity 0, so the job goes straight in).
+          box_place: (Buffer name, token) — the job now sits in that box.
+          carried: (release_src, in_box), not released yet — the next Buffer
+              box has capacity 0, so the job stays where it is until the step
+              after that box takes it.
+        Every wait is event-driven: the job moves the instant there is room.
+        """
+        nxt_station = self.stations_data[nxt]
+        box, token = in_box if in_box is not None else (None, None)
+        block_start = self.env.now
+
+        def my_turn() -> bool:
+            return box is None or box.may_leave(token)
+
+        # Into a Buffer box.
+        if _is_buffer(nxt_station):
+            next_box = self.buffer_boxes[nxt]
+            while not my_turn():
+                yield box.changed()
+            if next_box.passes_through:
+                # Still blocked here until the step after the box takes it.
+                def release_later(release=release_src, start=block_start):
+                    self._add_buffer_block(src, start)
+                    release()
+                return None, None, (release_later, in_box)
+            new_token = object()
+            yield from next_box.enter(new_token)
+            self._add_buffer_block(src, block_start)
+            release_src()
+            return None, (nxt, new_token), None
+
+        # Into a zero-time junction (Connector, End, ...): always takes it.
+        if _is_passthrough(nxt_station):
+            while not my_turn():
+                yield box.changed()
+            release_src()
+            return None, None, None
+
+        resource = self.resources[nxt]
+        unlimited = nxt_station.get("Buffer Unlimited", False)
+        cap = nxt_station.get("Buffer Capacity", 0) or 0
+
+        # Into a station with no waiting room (Buffer Capacity 0): queue for
+        # its machine and go straight onto it. Jobs leaving a Buffer box queue
+        # with that box's FIFO/LIFO priority, so the right one wins.
+        if not unlimited and cap == 0:
+            if box is not None:
+                while not box.is_front(token):
+                    yield box.changed()
+            req_ctx = resource.request(priority=box.priority(token) if box is not None else 0)
+            req, _ = req_ctx.__enter__()
+            yield req
+            self._add_buffer_block(src, block_start)
+            release_src()
+            # Read after the grant: a parallel station only picks the machine
+            # (cyclic/random/successor) at that point.
+            return (req_ctx, req, req_ctx.sub_machine), None, None
+
+        # Into a station's own queue (Buffer Capacity N, or unlimited): move
+        # on your turn, as soon as that queue has fewer than N waiting.
+        while not (my_turn() and (unlimited or len(resource.queue) < cap)):
+            waits = [resource.queue_changed()]
+            if box is not None:
+                waits.append(box.changed())
+            yield self.env.any_of(waits)
+        self._add_buffer_block(src, block_start)
+        release_src()
+        return None, None, None
+
+    def _add_buffer_block(self, station_name: str, start: float) -> None:
+        """Count the minutes station_name was blocked holding a finished job
+        the next step couldn't take yet. Wall-clock: overlapping waits (e.g.
+        two parallel machines blocked at once) are counted once."""
+        station = self.stations_data[station_name]
+        if self.env.now <= start or _is_passthrough(station):
+            return
+        blocked_until = station.get("_blocked_until", 0.0)
+        new_block = max(0.0, self.env.now - max(start, blocked_until))
+        station["_blocked_until"] = max(blocked_until, self.env.now)
+        if new_block > 0:
+            station["total_block_time"] = station.get("total_block_time", 0) + new_block
+            station["buffer_blocked_time"] = station.get("buffer_blocked_time", 0) + new_block
+
     def _log_passthrough(
         self, resource_name: str, variant_id: int, variant_type: str, operation: str
-    ) -> None:
+    ) -> Dict[str, Any]:
         """
         Record a job's instant traversal of a Connector.
 
@@ -1017,7 +1896,7 @@ class ManufacturingSimulation:
                 station.get("completed_jobs_per_station", 0) + 1
             )
 
-        self.completion_log.setdefault(resource_name, []).append({
+        entry = {
             "job_id": _format_job_id(variant_type, variant_id),
             "station_name": resource_name,
             "status": "Completed",
@@ -1034,7 +1913,8 @@ class ManufacturingSimulation:
             "total_setup_time": 0.0,
             "material_unavailability": 0.0,
             "delay_reason": "No delay",
-        })
+        }
+        self.completion_log.setdefault(resource_name, []).append(entry)
 
         variant_name = f"{variant_type} {variant_id}"
         self.simulation_state["current_jobs"][variant_name] = f"Completed at {resource_name}"
@@ -1043,6 +1923,15 @@ class ManufacturingSimulation:
             "Connector '%s': %s#%s passed through instantly (op '%s')",
             resource_name, variant_type, variant_id, operation,
         )
+        return entry
+
+    def _close_passthrough(self, entry: Dict[str, Any], start: float) -> None:
+        """A job leaves a Buffer box: its trace entry ends now, so the Job
+        Trace and Canvas replay show it sitting in the box for that long."""
+        entry["process_end_time_real"] = self._real_stamp()
+        waited = self.env.now - start
+        if waited > 0:
+            entry["delay_reason"] = f"Waited {round(waited, 2)} min in buffer"
 
     def _reject_job(
         self,
@@ -1098,7 +1987,8 @@ class ManufacturingSimulation:
         num_operators: int,
         shifts_per_day: Any,
         duration: float,
-        on_machine_acquired: Optional[Callable[[], None]] = None,
+        preacquired: Optional[tuple] = None,
+        hold_slot: bool = False,
     ):
         resource = self.resources[resource_name]
         station_cfg = self.stations_data[resource_name]
@@ -1113,8 +2003,21 @@ class ManufacturingSimulation:
         # A Conveyor transports rather than processes: the job rides it for a
         # transport time, but no operator is consumed (a belt runs itself) and
         # there is no changeover or rework, since nothing is being worked on.
-        # Its unbounded capacity is set up in _init_resources.
+        # Its capacity is set up in _init_resources; the belt itself (stop /
+        # restart, first on first off) is the ConveyorBelt below.
         is_conveyor = _is_conveyor(station_cfg)
+        belt = self.conveyor_belts.get(resource_name) if is_conveyor else None
+        belt_token = object()
+        at_belt_end = False
+        sensor_at: Optional[float] = None
+        sensor_passed = False
+
+        def _check_sensor(moved: float) -> None:
+            nonlocal sensor_passed
+            if sensor_at is not None and not sensor_passed and moved >= sensor_at - 1e-9:
+                sensor_passed = True
+                cfg = self.stations_data[resource_name]
+                cfg["sensor_passed"] = cfg.get("sensor_passed", 0) + 1
         # A station with 0 assigned operators is machine-only / a queue-buffer:
         # it must NOT gate on operator availability (#7). Keep the raw count so
         # we can branch on it, but use >=1 for the cycle-time division.
@@ -1125,6 +2028,14 @@ class ManufacturingSimulation:
             # from Process Time (see TimingEngine.get_process_time).
             adjusted_ct = _transport_time(station_cfg, duration)
             num_operators = 1
+            # Sensor (record only): the job passes it once it has moved
+            # position / speed minutes — belt stops don't count as moving.
+            sensor_pos = _sensor_position(station_cfg)
+            sensor_length = _positive_float(station_cfg.get("Conveyor Length"))
+            sensor_at = (
+                adjusted_ct * sensor_pos / sensor_length
+                if sensor_pos is not None and sensor_length and adjusted_ct else None
+            )
         else:
             # Process Time per the CT/PT/ST spec: the station's configured
             # operation duration, unmodified — see TimingEngine.
@@ -1193,15 +2104,45 @@ class ManufacturingSimulation:
         # most recently queued job outranks jobs that have been waiting longer.
         discipline = str(self.stations_data[resource_name].get("Buffer Discipline", "FIFO") or "FIFO").strip().upper()
         priority = -self.env.now if discipline == "LIFO" else 0
-        with resource.request(priority=priority) as req:
+        # A zero-buffer hand-off (Buffer Capacity 0) already queued for and won
+        # this station's slot before the job left the previous station — see
+        # _process_variant's pending_zero_buffer. Reuse that slot instead of
+        # requesting a second one, which would deadlock against itself on a
+        # capacity-1 station. Absent, this is an ordinary request, unchanged.
+        if preacquired is not None:
+            req_ctx, req, sub_machine = preacquired[:3]
+            # Came from a parallel group's shared line: the job arrived here
+            # when it joined that line, so its wait there counts here.
+            if len(preacquired) > 3:
+                block_start = preacquired[3]
+        else:
+            req_ctx = resource.request(priority=priority)
+            req, sub_machine = req_ctx.__enter__()
+        # PDF section 7/9 FailurePolicy bookkeeping only applies to a
+        # SubMachine that actually runs _run_failure_cycle (simulation_time
+        # is not None) — a conveyor/passthrough's shared, high-capacity
+        # SubMachine (simulation_time=None) must never have
+        # begin_processing()/end_processing() called on it, since multiple
+        # jobs can hold it at once and would stomp each other's
+        # current_process_start/remaining_process_time on that one shared
+        # object. Computed before the try/finally below (not inside it) so
+        # it's always bound even if an exception occurs before the normal
+        # begin_processing() call point.
+        tracks_failures = getattr(sub_machine, "simulation_time", None) is not None
+        try:
             yield req
-            # This job has just secured the machine slot — if it arrived here
-            # via a rack buffer, release its physical rack slot NOW (not
-            # earlier), so the rack genuinely holds the job occupying space
-            # for as long as it's waiting for this machine, not just for the
-            # instant it became front-of-lane.
-            if on_machine_acquired is not None:
-                on_machine_acquired()
+            # A parallel station only picks the machine (cyclic) once the
+            # request is granted, so re-read it now. Single-machine stations
+            # already knew it — unchanged for them.
+            sub_machine = req_ctx.sub_machine
+            tracks_failures = getattr(sub_machine, "simulation_time", None) is not None
+            # Which parallel machine (1-based, matching the Canvas's "#1",
+            # "#2", ... boxes) took this job — lets the Canvas replay show it
+            # at the right box. Single-machine stations leave it out.
+            if len(resource.sub_machines) > 1 and sub_machine in resource.sub_machines:
+                trace_entry["machine"] = resource.sub_machines.index(sub_machine) + 1
+            if belt is not None:
+                belt.get_on(belt_token)
             blocked_time = self.env.now - block_start
             total_blocked += blocked_time
 
@@ -1278,6 +2219,19 @@ class ManufacturingSimulation:
                         # with no intermediate is_active_shift check.
                         until_break = SimulationUtils.minutes_until_next_break(shift_cfg, real_time, shifts_per_day)
                         chunk = min(chunk, until_break)
+                        # Same horizon cap as the processing loop below — a
+                        # chunk scheduled to land EXACTLY on SIM_TIME never
+                        # fires (SimPy's env.run(until=X) only processes
+                        # events strictly before X), so this partial setup
+                        # progress would silently vanish instead of being
+                        # credited to total_setup_time. Epsilon keeps it
+                        # strictly inside the horizon so the timeout resolves.
+                        horizon_remaining = self.sim_config["SIM_TIME"] - self.env.now
+                        if horizon_remaining <= 0:
+                            break
+                        chunk = min(chunk, horizon_remaining - 1e-6 if horizon_remaining > 1e-6 else horizon_remaining)
+                        if chunk <= 0:
+                            break
                         yield self.env.timeout(chunk)
                         setup_time_remaining -= chunk
                         setup_time_remaining = max(0.0, setup_time_remaining)
@@ -1308,6 +2262,14 @@ class ManufacturingSimulation:
             processing_time = 0.0
             horizon_cutoff = False
 
+            # PDF section 7/9: register this job's full process_time with the
+            # machine so a mid-operation failure can compute "elapsed vs.
+            # remaining" (fail()) and apply RESUME/RESTART/SCRAP (repair()).
+            # tracks_failures (computed above, before the try block) is False
+            # for a conveyor/passthrough's shared SubMachine — see its comment.
+            if tracks_failures:
+                sub_machine.begin_processing(process_time)
+
             # --- Worker pool acquire (Workplace wired to a Worker Controller) ---
             # Held for the job's WHOLE stay at this station (not re-acquired
             # per chunk, unlike the static operator check below) — a pooled
@@ -1330,6 +2292,9 @@ class ManufacturingSimulation:
                     yield self.env.timeout(travel_time)
                     total_operator_dt += self.env.now - travel_start
 
+            # A sensor at the very start of the belt is passed on getting on.
+            _check_sensor(0.0)
+
             # --- Main processing loop (shift-aware) ---
             while process_time > 0:
                 real_time = start_date + timedelta(minutes=self.env.now)
@@ -1342,12 +2307,63 @@ class ManufacturingSimulation:
                     available = max(0.0, self.sim_config.get("ACTIVE_PROCESSING_TIME", 480) - used)
 
                     while available > 0:
-                        # Machine downtime
-                        available, dt_added = yield from self._handle_machine_downtime(
-                            resource, variant_name, resource_name, shifts_per_day, available, start_date
+                        # Machine downtime — checked against the specific
+                        # sub-machine this job is on, so a failure on a
+                        # different parallel unit at this station never
+                        # blocks this job (see MachineGroup in machine.py).
+                        available, dt_added, failure_outcome = yield from self._handle_machine_downtime(
+                            sub_machine, variant_name, resource_name, shifts_per_day, available, start_date
                         )
                         total_station_dt += dt_added
                         station_downtime_budget -= dt_added
+
+                        # PDF section 7/8 FailurePolicy, applied to THIS job's
+                        # remaining work after a failure/repair cycle that
+                        # happened while it sat here:
+                        #   RESUME  — remaining_process_time already equals
+                        #             process_time minus elapsed (no change
+                        #             here; this is today's existing behavior).
+                        #   RESTART — the whole operation starts over.
+                        #   SCRAP   — the in-progress part is discarded; this
+                        #             job ends now rather than completing.
+                        if failure_outcome == "restart":
+                            process_time = sub_machine.remaining_process_time
+                            # The chunk(s) already credited to processing_time
+                            # before this failure were discarded by the
+                            # restart (not kept, redone from scratch) — zero
+                            # them back out so busy_time/utilization only
+                            # ever reflects the eventually-kept work, same
+                            # convention this engine already uses for rework
+                            # (tracked separately, never folded into
+                            # processing_time/busy_time).
+                            processing_time = 0.0
+                            self._log_event(variant_name, resource_name, shifts_per_day,
+                                            "failure_policy_restart", self.env.now, self.env.now,
+                                            process_time=process_time, start_date=start_date)
+                        elif failure_outcome == "scrap":
+                            self._log_event(variant_name, resource_name, shifts_per_day,
+                                            "failure_policy_scrap", self.env.now, self.env.now,
+                                            start_date=start_date)
+                            trace_entry.update({
+                                "status": "Scrapped",
+                                "process_start_time_real": (start_date + timedelta(minutes=process_start)).strftime("%Y-%m-%d %H:%M:%S"),
+                                "process_end_time_real": (start_date + timedelta(minutes=self.env.now)).strftime("%Y-%m-%d %H:%M:%S"),
+                                "delay_reason": "Part scrapped — machine failed mid-operation (Failure Policy: Scrap)",
+                            })
+                            self.stations_data[resource_name]["job_counts"]["processing"] -= 1
+                            # A scrapped job has left the line for good —
+                            # same terminal bookkeeping as _reject_job, so it
+                            # isn't still reported as "in progress".
+                            self.simulation_state["scrapped_jobs"] += 1
+                            self.simulation_state["in_progress_jobs"] = max(
+                                0, self.simulation_state["in_progress_jobs"] - 1
+                            )
+                            # Worker pool release — mirrors the ordinary
+                            # completion/horizon-cutoff paths below, which
+                            # this early return skips past.
+                            if pool is not None and pool_worker is not None:
+                                yield from pool.release(pool_worker, resource_name)
+                            return "scrapped"
 
                         # Operator availability — the older static shift1/2/3
                         # assignment. Skipped entirely once a Worker Controller
@@ -1388,6 +2404,15 @@ class ManufacturingSimulation:
                         # Process chunk
                         if process_time <= 0:
                             break
+                        # Conveyor stopped (its front job can't leave yet):
+                        # this job doesn't move until it restarts, then
+                        # re-checks the shift from the top.
+                        if belt is not None and belt.stopped:
+                            stop_start = self.env.now
+                            while belt.stopped:
+                                yield belt.changed()
+                            total_blocked += self.env.now - stop_start
+                            break
                         chunk = min(process_time, available)
                         # Cap at the next break so a break shorter than this
                         # chunk still actually pauses processing — otherwise
@@ -1396,14 +2421,83 @@ class ManufacturingSimulation:
                         chunk_real_time = start_date + timedelta(minutes=self.env.now)
                         until_break = SimulationUtils.minutes_until_next_break(shift_cfg, chunk_real_time, shifts_per_day)
                         chunk = min(chunk, until_break)
+                        # Cap at the remaining simulation horizon too — a chunk
+                        # scheduled to land EXACTLY on SIM_TIME never fires:
+                        # SimPy's env.run(until=X) only processes events
+                        # strictly before X, so yield env.timeout(chunk) would
+                        # sit unresolved forever once the stepped run loop
+                        # stops advancing, and processing_time would never
+                        # accumulate for the real (partial) work that DID
+                        # happen — the job just shows as still "Waiting" with
+                        # zero credit. Subtracting a tiny epsilon keeps the
+                        # scheduled time strictly inside the horizon so the
+                        # timeout actually resolves and this partial progress
+                        # gets credited to busy_time instead of silently lost.
+                        horizon_remaining = self.sim_config["SIM_TIME"] - self.env.now
+                        if horizon_remaining <= 1e-6:
+                            # No usable horizon left to schedule another
+                            # timeout in — same terminal condition as running
+                            # out of horizon in the "outside shift" branch
+                            # below, so it needs the same horizon_cutoff flag
+                            # to make the partial-progress credit-back (see
+                            # "Job was cut short by the simulation horizon"
+                            # below) actually fire for THIS branch too.
+                            horizon_cutoff = True
+                            break
+                        chunk = min(chunk, horizon_remaining - 1e-6)
                         if chunk <= 0:
                             break
-                        yield self.env.timeout(chunk)
-                        processing_time += chunk
-                        available -= chunk
-                        process_time -= chunk
+                        # Arm the machine to interrupt THIS sleep the instant
+                        # a failure starts, instead of sleeping through the
+                        # whole chunk oblivious to a failure that starts and
+                        # ends entirely within it (see SubMachine.begin_chunk_
+                        # sleep's docstring — this was a real, confirmed gap:
+                        # a failure fully inside one chunk's sleep window
+                        # never reached _handle_machine_downtime at all,
+                        # so that job recorded zero downtime and finished
+                        # exactly on its original schedule despite the
+                        # machine genuinely being down for part of it).
+                        chunk_start = self.env.now
+                        if tracks_failures:
+                            sub_machine.begin_chunk_sleep(self.env.active_process)
+                        # A conveyor stopping mid-chunk interrupts this sleep
+                        # the same way a failure does (see ConveyorBelt.stop).
+                        if belt is not None:
+                            belt.ride_start(self.env.active_process)
+                        try:
+                            yield self.env.timeout(chunk)
+                            elapsed = chunk
+                        except simpy.Interrupt:
+                            # Failure fired mid-sleep — credit only the
+                            # partial chunk that genuinely elapsed before
+                            # the interrupt, then loop back to the top of
+                            # `while available > 0:`, where
+                            # _handle_machine_downtime will now correctly
+                            # observe sub_machine.working == False (it was
+                            # just set, before this interrupt was raised)
+                            # and wait out the repair / apply the
+                            # FailurePolicy exactly as it already does for
+                            # a failure that starts between chunks.
+                            elapsed = self.env.now - chunk_start
+                        finally:
+                            if tracks_failures:
+                                sub_machine.end_chunk_sleep()
+                            if belt is not None:
+                                belt.ride_end(self.env.active_process)
+                        processing_time += elapsed
+                        available -= elapsed
+                        process_time -= elapsed
                         available = max(0.0, available)
                         process_time = max(0.0, process_time)
+                        _check_sensor(adjusted_ct - process_time)
+
+                    if horizon_cutoff:
+                        # Set just above when the inner loop ran out of
+                        # horizon to schedule another chunk in — stop the
+                        # OUTER loop too, otherwise it would just re-enter
+                        # with the same exhausted env.now and loop forever
+                        # (no further yield ever advances simulated time).
+                        break
 
                     remaining_dt = max(0.0, station_downtime_budget)
                     total_station_dt += remaining_dt
@@ -1422,6 +2516,15 @@ class ManufacturingSimulation:
                     total_pause += wait
                     self._log_event(variant_name, resource_name, shifts_per_day, "pause_time",
                                     pause_start, self.env.now, pause_time=wait, start_date=start_date)
+
+            # First on, first off: a job that finished its transport time
+            # still waits behind the jobs that got on the belt before it.
+            if belt is not None and not horizon_cutoff:
+                front_start = self.env.now
+                while belt.jobs and belt.jobs[0] is not belt_token:
+                    yield belt.changed()
+                total_blocked += self.env.now - front_start
+                at_belt_end = True
 
             total_processing += processing_time
             # Process Time itself was only ever visible indirectly (inferred
@@ -1452,17 +2555,32 @@ class ManufacturingSimulation:
                 self.stations_data[resource_name]["busy_time"] = (
                     self.stations_data[resource_name].get("busy_time", 0) + processing_time
                 )
+                # _determine_delay_reason falls back to "No delay" when none
+                # of its seven signals (breakdown/operator/material/setup/
+                # rework/queue/pause) has a nonzero duration — correct for a
+                # job that finished cleanly, but WRONG here: this job never
+                # finished at all, it just happened to start processing
+                # immediately with nothing blocking it before the horizon
+                # cut it off mid-chunk. Compute the seven-signal reason
+                # first, then only use it if it found a REAL cause;
+                # otherwise label this cutoff explicitly so "still running
+                # out of time" is never confused with "completed with zero
+                # friction."
+                six_signal_reason = _determine_delay_reason(
+                    total_blocked, total_station_dt, total_operator_dt,
+                    total_setup, material_unavail, total_rework, total_pause,
+                )
                 trace_entry.update({
                     "status": "In Progress",
                     "Processing Time": processing_time,
                     "process_start_time_real": (start_date + timedelta(minutes=process_start)).strftime("%Y-%m-%d %H:%M:%S"),
                     "process_end_time_real": None,
-                    "delay_reason": _determine_delay_reason(
-                        total_blocked, total_station_dt, total_operator_dt,
-                        total_setup, material_unavail, total_rework,
+                    "delay_reason": (
+                        six_signal_reason if six_signal_reason != "No delay"
+                        else "Still processing — simulation ended before this job finished"
                     ),
                 })
-                return
+                return "in_progress"
 
             # --- Rework ---
             # Nothing is machined on a conveyor, so there is no defect to
@@ -1520,6 +2638,40 @@ class ManufacturingSimulation:
                 )
                 self._log_event(variant_name, resource_name, shifts_per_day, "rework completed",
                                 rw_start, self.env.now, rework_time=rw_dur, start_date=start_date)
+        finally:
+            # PDF section 7/9: this job no longer has processing in flight on
+            # sub_machine — clears current_process_start/remaining_process_time
+            # so a LATER job on this same machine doesn't inherit stale state.
+            # Same tracks_failures gate as begin_processing() above — a
+            # conveyor's shared, high-capacity SubMachine never had
+            # begin_processing() called on it either, so nothing to clear.
+            if tracks_failures:
+                sub_machine.end_processing()
+
+            # Releases the slot at exactly the point the previous `with
+            # resource.request(...)` block did, for both the ordinary and the
+            # pre-acquired (zero-buffer) cases.
+            #
+            # hold_slot defers that release to the caller: under zero-buffer
+            # rules the station stays OCCUPIED by the finished job until the
+            # next station physically takes it, so the station cannot start
+            # another job in the meantime. Releasing here instead let the next
+            # queued job seize the machine immediately, which is a hidden
+            # one-slot buffer — the station then ran several jobs ahead of its
+            # downstream neighbour instead of at most one.
+            #
+            # On a conveyor, a front job held here is stuck at the end of the
+            # belt, so the whole belt stops until the next station takes it.
+            if hold_slot and belt is not None:
+                if at_belt_end:
+                    belt.stop(belt_token)
+                self._held_slot = _BeltSlot(req_ctx, belt, belt_token)
+            elif hold_slot:
+                self._held_slot = req_ctx
+            else:
+                req_ctx.__exit__(None, None, None)
+                if belt is not None:
+                    belt.get_off(belt_token)
 
         # --- Completion ---
         process_end = self.env.now
@@ -1584,7 +2736,7 @@ class ManufacturingSimulation:
             "material_unavailability": material_unavail,
             "delay_reason": _determine_delay_reason(
                 total_blocked, total_station_dt, total_operator_dt,
-                total_setup, material_unavail, total_rework,
+                total_setup, material_unavail, total_rework, total_pause,
             ),
             **pcts,
         })
@@ -1597,14 +2749,28 @@ class ManufacturingSimulation:
     # Sub-operation helpers (keeps _perform_operation readable)
     # ------------------------------------------------------------------
 
-    def _handle_machine_downtime(self, resource, variant_name, resource_name, shifts_per_day, available, start_date):
-        """Wait out any machine downtime; return updated (available, downtime_added)."""
+    def _handle_machine_downtime(self, sub_machine, variant_name, resource_name, shifts_per_day, available, start_date):
+        """Wait out any machine downtime; return updated (available, downtime_added, failure_outcome).
+
+        Checks the specific SubMachine this job is on, not the station's
+        whole MachineGroup, so a failure on a different parallel unit at
+        this station never blocks this job.
+
+        failure_outcome is the sub_machine's FailurePolicy applied to THIS
+        job's in-flight work (PDF section 7/9: "resume" / "restart" / "scrap"),
+        or None if no failure happened while this job was waiting here."""
         dt_added = 0.0
         downtime_start = None
-        while hasattr(resource, "working") and not resource.working:
+        failure_outcome = None
+        while hasattr(sub_machine, "working") and not sub_machine.working:
             if downtime_start is None:
                 downtime_start = self.env.now
-            yield self.env.timeout(10)
+            # Wake at the exact instant repair/PM finishes (machine.py fires
+            # working_event right after setting working=True), not on a fixed
+            # poll tick — polling every 10 min rounded every repair up to the
+            # next multiple of 10 and left the station idle after repair.
+            # Loop re-checks in case another failure/PM starts the same instant.
+            yield sub_machine.working_event
         if downtime_start is not None:
             dt_end = self.env.now
             dt = dt_end - downtime_start
@@ -1615,7 +2781,8 @@ class ManufacturingSimulation:
             )
             self._log_event(variant_name, resource_name, shifts_per_day, "station_downtime",
                             downtime_start, dt_end, station_downtime=dt, start_date=start_date)
-        return max(0.0, available), dt_added
+            failure_outcome = getattr(sub_machine, "last_failure_outcome", None)
+        return max(0.0, available), dt_added, failure_outcome
 
     def _handle_operator(self, operator, resource_name, variant_name, shifts_per_day,
                           available, process_time, start_date):
@@ -1672,6 +2839,14 @@ class ManufacturingSimulation:
             station["rework_time_ratio"] = self._calc_rework_time_ratio(station)
             station["setup_time_ratio"] = self._calc_setup_time_ratio(station)
             station["buffer_blocked_ratio"] = calc_buffer_blocked_ratio(station)
+            box = self.buffer_boxes.get(name)
+            if box is not None:
+                # A Buffer box does no work, so its "Blocked (full) time" is
+                # simply how long it sat full, as a share of the run.
+                full = box.full_time_until(self.env.now)
+                sim_time = self.sim_config.get("SIM_TIME", 0) or 0
+                station["buffer_blocked_time"] = round(full, 2)
+                station["buffer_blocked_ratio"] = round(full / sim_time * 100, 2) if sim_time > 0 else 0.0
 
         self.progress_cb(0.95, "Analysing bottlenecks…")
         for name, station in self.stations_data.items():
@@ -1715,6 +2890,13 @@ class ManufacturingSimulation:
         cts = [e["Cycle Time"] for e in entries if e.get("status") == "Completed" and "Cycle Time" in e]
         return round(sum(cts) / len(cts), 2) if cts else 0.0
 
+    def _calc_max_cycle_time(self, station_name: str) -> float:
+        """Worst-case (highest) Cycle Time across this station's completed
+        jobs — surfaces an outlier job that an average would hide."""
+        entries = self.completion_log.get(station_name, [])
+        cts = [e["Cycle Time"] for e in entries if e.get("status") == "Completed" and "Cycle Time" in e]
+        return round(max(cts), 2) if cts else 0.0
+
     def _collect_results(self) -> Dict[str, Any]:
         sim_time = self.sim_config.get("SIM_TIME", 1) or 1
         station_stats = {
@@ -1729,16 +2911,36 @@ class ManufacturingSimulation:
                 "buffer_blocked_time": s.get("buffer_blocked_time", 0),
                 "buffer_capacity": s.get("Buffer Capacity", 0) or 0,
                 "buffer_discipline": str(s.get("Buffer Discipline", "FIFO") or "FIFO").strip().upper(),
+                # Only set for a "Buffer Config Mode": "3D" Buffer (see
+                # _init_buffer_boxes) — None for every 2D/scalar station,
+                # same "absent means not applicable" convention as
+                # failure_counts_per_machine above.
+                "rack_lane_count": (
+                    self.buffer_boxes[name].rack.lane_count
+                    if name in self.buffer_boxes and self.buffer_boxes[name].rack is not None else None
+                ),
+                "rack_occupied": (
+                    len(self.buffer_boxes[name].items)
+                    if name in self.buffer_boxes and self.buffer_boxes[name].rack is not None else None
+                ),
                 "completed_jobs": s.get("completed_jobs_per_station", 0),
                 "throughput": calc_station_throughput(s.get("completed_jobs_per_station", 0), sim_time),
                 "busy_time": s.get("busy_time", 0),
                 "total_waiting_time": s.get("total_waiting_time", 0),
                 "avg_block_time": s.get("avg_block_time", 0),
                 "failure_breakdowns": s.get("failure_breakdowns", 0),
+                "failure_counts_per_machine": s.get("failure_counts_per_machine", []),
                 "pm_breakdowns": s.get("pm_breakdowns", 0),
                 "operator_per_station": s.get("operator_per_station", 1),
                 "capacity": s.get("capacity", 1),
+                # Conveyor only — None for every other station.
+                "conveyor_length": _positive_float(s.get("Conveyor Length")) if _is_conveyor(s) else None,
+                "conveyor_speed": _conveyor_speed(s) if _is_conveyor(s) else None,
+                "transport_time": _transport_time(s, None) if _is_conveyor(s) else None,
+                # Conveyor with a sensor only — None otherwise.
+                "sensor_passed": s.get("sensor_passed", 0) if _sensor_position(s) is not None else None,
                 "avg_cycle_time": self._calc_avg_cycle_time(name),
+                "max_cycle_time": self._calc_max_cycle_time(name),
             }
             for name, s in self.stations_data.items()
         }
@@ -1770,6 +2972,23 @@ class ManufacturingSimulation:
         def _avg(key, default=0.0):
             return lambda samples: stats_lib.mean(samples) if samples else default
 
+        def _avg_per_machine(name):
+            """Elementwise mean of each sub-machine's failure count across
+            replications. Sub-machine count is fixed per scenario (=
+            station capacity) for the whole run, so lists should always be
+            the same length — padding with 0 is just a defensive guard,
+            not an expected path. Note: sum(result) may not exactly equal
+            the separately-rounded "failure_breakdowns" mean above, since
+            sum-of-rounded-means isn't always rounded-mean-of-sums."""
+            lists = [r["station_stats"][name].get("failure_counts_per_machine", []) for r in results]
+            if not lists or not any(lists):
+                return []
+            width = max(len(l) for l in lists)
+            return [
+                round(stats_lib.mean([l[i] if i < len(l) else 0 for l in lists]))
+                for i in range(width)
+            ]
+
         for name in station_names:
             def _s(key):
                 return [r["station_stats"][name].get(key, 0) for r in results]
@@ -1793,10 +3012,22 @@ class ManufacturingSimulation:
                 "busy_time":              stats_lib.mean(_s("busy_time")),
                 "avg_block_time":         stats_lib.mean(_s("avg_block_time")),
                 "failure_breakdowns":     round(stats_lib.mean(_s("failure_breakdowns"))),
+                "failure_counts_per_machine": _avg_per_machine(name),
                 "pm_breakdowns":          round(stats_lib.mean(_s("pm_breakdowns"))),
                 "operator_per_station":   results[0]["station_stats"][name].get("operator_per_station", 1),
                 "capacity":               results[0]["station_stats"][name].get("capacity", 1),
+                "conveyor_length":        results[0]["station_stats"][name].get("conveyor_length"),
+                "conveyor_speed":         results[0]["station_stats"][name].get("conveyor_speed"),
+                "transport_time":         results[0]["station_stats"][name].get("transport_time"),
+                "sensor_passed": (
+                    round(stats_lib.mean(_s("sensor_passed")))
+                    if results[0]["station_stats"][name].get("sensor_passed") is not None else None
+                ),
                 "avg_cycle_time":         round(stats_lib.mean(_s("avg_cycle_time")), 2),
+                # Worst case across replications too, not averaged — a
+                # replication with one bad outlier job shouldn't get
+                # smoothed away by the others.
+                "max_cycle_time":         round(max(_s("max_cycle_time")), 2) if _s("max_cycle_time") else 0.0,
             }
 
         # Aggregate simulation_state (avg completed_jobs across reps, avg sim time)
@@ -1816,6 +3047,9 @@ class ManufacturingSimulation:
         # correctly reported it.
         avg_rejected = round(stats_lib.mean(
             [r.get("simulation_state", {}).get("rejected_jobs", 0) for r in results]
+        ))
+        avg_scrapped = round(stats_lib.mean(
+            [r.get("simulation_state", {}).get("scrapped_jobs", 0) for r in results]
         ))
 
         # Average each Worker Controller's pool stats across replications —
@@ -1873,6 +3107,7 @@ class ManufacturingSimulation:
                 "completed_jobs": total_jobs,
                 "in_progress_jobs": avg_in_progress,
                 "rejected_jobs": avg_rejected,
+                "scrapped_jobs": avg_scrapped,
                 "total_simulated_time": avg_sim_time,
                 "summary": agg_summary,
                 # True if ANY replication was cut short by a Stop request —
@@ -1881,6 +3116,9 @@ class ManufacturingSimulation:
                 "stopped_early": any(
                     r.get("simulation_state", {}).get("stopped_early") for r in results
                 ),
+                # Same replication as completion_log, for the Canvas job replay.
+                "job_release_times": results[-1].get("simulation_state", {}).get("job_release_times", {}),
+                "job_finish_times": results[-1].get("simulation_state", {}).get("job_finish_times", {}),
             },
             "completion_log": last_log,
             "bottleneck_store": aggregated_bottlenecks,

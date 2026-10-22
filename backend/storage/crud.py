@@ -25,8 +25,9 @@ from .models import Scenario, SimulationRun, StationStat
 # Scenario
 # ---------------------------------------------------------------------------
 
-def create_scenario(db: Session, payload: Dict[str, Any]) -> Scenario:
+def create_scenario(db: Session, payload: Dict[str, Any], user_id: Optional[int] = None) -> Scenario:
     scenario = Scenario(
+        user_id=user_id,
         name=payload["name"],
         description=payload.get("description"),
         stations_data=payload.get("stations_data", {}),
@@ -45,16 +46,29 @@ def create_scenario(db: Session, payload: Dict[str, Any]) -> Scenario:
     return scenario
 
 
-def get_scenario(db: Session, scenario_id: int) -> Optional[Scenario]:
-    return db.query(Scenario).filter(Scenario.id == scenario_id).first()
+def get_scenario(db: Session, scenario_id: int, user_id: Optional[int] = None) -> Optional[Scenario]:
+    q = db.query(Scenario).filter(Scenario.id == scenario_id)
+    if user_id is not None:
+        q = q.filter(Scenario.user_id == user_id)
+    return q.first()
 
 
-def list_scenarios(db: Session, skip: int = 0, limit: int = 50) -> List[Scenario]:
-    return db.query(Scenario).order_by(Scenario.created_at.desc()).offset(skip).limit(limit).all()
+def list_scenarios(db: Session, skip: int = 0, limit: int = 50, user_id: Optional[int] = None) -> List[Scenario]:
+    q = db.query(Scenario)
+    if user_id is not None:
+        q = q.filter(Scenario.user_id == user_id)
+    return q.order_by(Scenario.created_at.desc()).offset(skip).limit(limit).all()
 
 
-def update_scenario(db: Session, scenario_id: int, payload: Dict[str, Any]) -> Optional[Scenario]:
-    scenario = get_scenario(db, scenario_id)
+def count_scenarios(db: Session, user_id: Optional[int] = None) -> int:
+    q = db.query(Scenario)
+    if user_id is not None:
+        q = q.filter(Scenario.user_id == user_id)
+    return q.count()
+
+
+def update_scenario(db: Session, scenario_id: int, payload: Dict[str, Any], user_id: Optional[int] = None) -> Optional[Scenario]:
+    scenario = get_scenario(db, scenario_id, user_id=user_id)
     if not scenario:
         return None
     for key, val in payload.items():
@@ -66,8 +80,8 @@ def update_scenario(db: Session, scenario_id: int, payload: Dict[str, Any]) -> O
     return scenario
 
 
-def delete_scenario(db: Session, scenario_id: int) -> bool:
-    scenario = get_scenario(db, scenario_id)
+def delete_scenario(db: Session, scenario_id: int, user_id: Optional[int] = None) -> bool:
+    scenario = get_scenario(db, scenario_id, user_id=user_id)
     if not scenario:
         return False
     db.delete(scenario)
@@ -150,17 +164,25 @@ def complete_run(db: Session, run_id: int, result: Dict[str, Any], status: str =
             buffer_blocked_time=stats.get("buffer_blocked_time", 0.0),
             buffer_capacity=stats.get("buffer_capacity", 0),
             buffer_discipline=stats.get("buffer_discipline", "FIFO"),
+            rack_lane_count=stats.get("rack_lane_count"),
+            rack_occupied=stats.get("rack_occupied"),
             completed_jobs=stats.get("completed_jobs", 0),
             throughput=stats.get("throughput", 0.0),
             busy_time=stats.get("busy_time", 0),
             avg_block_time=stats.get("avg_block_time", 0),
             failure_breakdowns=stats.get("failure_breakdowns", 0),
+            failure_counts_per_machine=stats.get("failure_counts_per_machine"),
             pm_breakdowns=stats.get("pm_breakdowns", 0),
             operator_per_station=stats.get("operator_per_station", 1),
             capacity=stats.get("capacity", 1),
+            conveyor_length=stats.get("conveyor_length"),
+            conveyor_speed=stats.get("conveyor_speed"),
+            transport_time=stats.get("transport_time"),
+            sensor_passed=stats.get("sensor_passed"),
             top_bottleneck_type=top_bn.get("type"),
             top_bottleneck_metric=top_bn.get("metric"),
             avg_cycle_time=stats.get("avg_cycle_time", 0.0),
+            max_cycle_time=stats.get("max_cycle_time", 0.0),
         ))
 
     db.commit()

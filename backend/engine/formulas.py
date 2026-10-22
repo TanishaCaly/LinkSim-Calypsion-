@@ -69,6 +69,53 @@ def daily_failure_rate_to_per_minute(daily_failure_prob: float) -> float:
     return lambda_daily / MINUTES_PER_DAY
 
 
+# ── MTBF / Availability (per Availability_MTTR_Details.pdf) ──────────────────
+#
+# The reference doc's core relationship for a repairable machine:
+#
+#     Availability = MTBF / (MTBF + MTTR)
+#
+# solved for MTBF given Availability (A, 0-100) and MTTR:
+#
+#     MTBF = (A / (1 - A)) * MTTR      where A is the decimal availability
+#
+# Station config stores "Failure rate" (daily failure probability) and
+# "Repair Time" (MTTR, minutes), not Availability % directly — so
+# failure_rate_to_availability_pct below derives the same Availability %
+# ScenarioManager.tsx's estimateAvailabilityPct already shows in the UI
+# (MTBF = 1440 / failure_rate, then Availability = MTBF/(MTBF+MTTR)), and
+# calculate_mtbf then runs that Availability back through the PDF's own
+# formula to get MTBF — i.e. the PDF's exact A/(1-A)*MTTR formula, fed by
+# the Availability % this codebase already derives from Failure Rate.
+
+def failure_rate_to_availability_pct(daily_failure_prob: float, mttr: float) -> float:
+    """Decimal daily failure probability + MTTR (minutes) -> Availability %,
+    via MTBF = 1440/failure_rate then Availability = MTBF/(MTBF+MTTR) —
+    matching ScenarioManager.tsx's estimateAvailabilityPct exactly."""
+    rate = daily_failure_prob or 0
+    if rate <= 0:
+        return 100.0
+    mtbf = MINUTES_PER_DAY / rate
+    if mttr <= 0:
+        return 100.0
+    return (mtbf / (mtbf + mttr)) * 100.0
+
+
+def calculate_mtbf(availability_pct: float, mttr: float) -> float:
+    """PDF section 1 / section 4: MTBF = (A/(1-A)) * MTTR, A = availability_pct/100.
+
+    Boundary handling per the PDF's own calculate_mtbf (section 4/9):
+    Availability >= 100 -> infinite MTBF (never fails);
+    Availability <= 0   -> MTBF of 0.
+    """
+    if availability_pct >= 100:
+        return float("inf")
+    if availability_pct <= 0:
+        return 0.0
+    a = availability_pct / 100.0
+    return (a / (1.0 - a)) * mttr
+
+
 # ── Per-station utilization ───────────────────────────────────────────────────
 
 def _working_days(sim_time: float, shifts_per_day: int, start_offset: float = 0.0, working_days: Optional[List[int]] = None) -> float:
@@ -104,6 +151,38 @@ def _working_days(sim_time: float, shifts_per_day: int, start_offset: float = 0.
     return matched_days
 
 
+def _available_working_minutes(
+    sim_time: float,
+    shifts_per_day: int,
+    shift_duration: float,
+    start_offset: float = 0.0,
+    working_days: Optional[List[int]] = None,
+) -> float:
+    """
+    Minutes a station could have worked across the whole simulated window.
+
+    _working_days counts CALENDAR days, so a window shorter than a full day
+    yields a fraction of one (480 min = 0.333 days). Multiplying that straight
+    into a per-day shift allowance charged only a fraction of the shift that
+    actually elapsed — a 480-minute single-shift run was credited 480 * 0.333
+    = 160 available minutes despite running a complete 8-hour shift. Every
+    station then exceeded 100% utilization, got clamped to exactly 100.0, and
+    the resulting dead heat made calc_bottleneck_station's max() fall back to
+    whichever station came first, hiding the real bottleneck.
+
+    A sub-day window therefore counts the shift minutes that genuinely
+    elapsed, capped by both the window itself and one day's allowance. Windows
+    of a full day or longer are unchanged (their whole-day arithmetic was
+    already correct), as are 0/3 shifts-per-day (24/7) windows of any length,
+    where per-day already equals a full calendar day.
+    """
+    per_day = _available_minutes_per_day(shifts_per_day, shift_duration)
+    available = per_day * _working_days(sim_time, shifts_per_day, start_offset, working_days)
+    if 0 < sim_time < MINUTES_PER_DAY:
+        return max(available, min(sim_time, per_day))
+    return available
+
+
 def _available_minutes_per_day(shifts_per_day: int, shift_duration: float) -> float:
     """
     Minutes per day a station is actually active, matching
@@ -128,8 +207,9 @@ def calc_station_utilization(station: dict, sim_config: dict) -> float:
     shifts = station.get("shifts_per_day", 1)
     shift_duration = sim_config.get("SHIFT_DURATION", 480)
     warmup_time = sim_config.get("WARMUP_TIME", 0) or 0
-    per_day = _available_minutes_per_day(shifts, shift_duration)
-    available = per_day * _working_days(sim_time, shifts, warmup_time, sim_config.get(f"WORKING_DAYS_{shifts}")) * capacity
+    available = _available_working_minutes(
+        sim_time, shifts, shift_duration, warmup_time, sim_config.get(f"WORKING_DAYS_{shifts}")
+    ) * capacity
     # A utilization % above 100 is only ever a modeling/measurement edge case
     # (e.g. busy_time accrued outside the "available" window this divides
     # by) — never a real "used more than 100% of the time" result, so it's
@@ -153,8 +233,9 @@ def calc_operator_utilization(station: dict, sim_config: dict) -> float:
     shift_duration = sim_config.get("SHIFT_DURATION", 480)
     operators = station.get("operator_per_station", 1) or 1
     warmup_time = sim_config.get("WARMUP_TIME", 0) or 0
-    per_day = _available_minutes_per_day(shifts, shift_duration)
-    available = per_day * _working_days(sim_time, shifts, warmup_time, sim_config.get(f"WORKING_DAYS_{shifts}")) * operators * capacity
+    available = _available_working_minutes(
+        sim_time, shifts, shift_duration, warmup_time, sim_config.get(f"WORKING_DAYS_{shifts}")
+    ) * operators * capacity
     # See calc_station_utilization's comment — same clamp, same reasoning.
     pct = (busy / available * 100) if available > 0 else 0.0
     return round(min(pct, 100.0), 2)
