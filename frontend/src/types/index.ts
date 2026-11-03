@@ -29,6 +29,9 @@ export interface StationConfig {
   'Exit Strategy'?: 'cyclic' | 'random' | 'successor' | 'percentage'
   'Exit Percentages'?: Record<string, number>
   'Exit Priorities'?: Record<string, number>
+  // Route by product: product -> the next stations it may go to.
+  'Route By Product'?: boolean
+  'Product Routes'?: Record<string, string[]>
   // Conveyor only. Length (with Speed) sets the transport time and Capacity
   // the jobs on the belt at once; Width/Height are display only.
   'Conveyor Length'?: number
@@ -39,8 +42,10 @@ export interface StationConfig {
   // end ('Rear'). Absent = no sensor.
   'Conveyor Sensor Length'?: number
   'Conveyor Sensor Position'?: 'Front' | 'Rear'
-  'Assembly Count'?: number
-  'Assembly Inputs'?: Record<string, number>
+  // Assembly station's settings pop-up (UI only for now).
+  'Assembly'?: AssemblyConfig
+  // Dismantle station settings (see DismantleConfig).
+  'Dismantle'?: DismantleConfig
   'Failure rate': number
   'Repair Time': number
   // What happens to a part already in progress when this station's machine
@@ -147,6 +152,40 @@ export interface Scenario {
   setup_matrix: Record<string, Record<string, number>>
   operators_data: Record<string, OperatorConfig>
   simulation_config: SimConfig
+  // The Build canvas drawing as last saved; null/absent until a scenario is
+  // saved from the Canvas.
+  canvas_layout?: CanvasLayout | null
+}
+
+// The Build canvas drawing: every box with a fixed id (SRC-1, STN-3, ...),
+// its name, type and position, and every line with the products whose
+// route uses it. One drawing for the whole scenario; Canvas-only — the
+// engine reads stations_data / processflow_data.
+export interface CanvasLayoutBox {
+  id: string
+  name: string
+  type: string
+  x: number
+  y: number
+  // The box's Canvas settings; for a real station, stations_data wins.
+  data?: Partial<StationNodeData>
+}
+
+export interface CanvasLayoutLine {
+  from: string
+  to: string
+  // Flow lines only (Worker wiring has none).
+  products?: string[]
+  label?: string
+}
+
+export interface CanvasLayout {
+  version: 1
+  boxes: CanvasLayoutBox[]
+  lines: CanvasLayoutLine[]
+  // Each product's route (its shape) when this drawing was saved — a route
+  // changed on the Scenario page since then gets its lines drawn again.
+  routes?: Record<string, string>
 }
 
 export interface ScenarioListItem {
@@ -167,6 +206,7 @@ export interface ScenarioCreate {
   setup_matrix?: Record<string, Record<string, number>>
   operators_data: Record<string, OperatorConfig>
   simulation_config?: Partial<SimConfig> | Record<string, unknown>
+  canvas_layout?: CanvasLayout
 }
 
 // ─── Simulation Runs ─────────────────────────────────────────────────────────
@@ -221,7 +261,61 @@ export interface StationStat {
 // Per Worker Controller, from worker_pool.py's WorkerPool.get_stats() —
 // reaches the frontend via RunDetail.result.worker_pool_stats (run.result is
 // persisted and returned wholesale, so this needed no backend API change).
+// One Worker of a Worker Controller's pool: the time it worked (minutes,
+// from starting a job — walking left out — until released), jobs done, the
+// share of the run it worked, and the same per station.
+export interface WorkerStat {
+  name: string
+  worked_time: number
+  jobs: number
+  utilization: number
+  workplaces: { station: string; worked_time: number; jobs: number }[]
+  // Working / Free % of its available time (the Worker Controller's shift
+  // minus the time it was away, after the warm-up); absent on older runs.
+  working_pct?: number
+  free_pct?: number
+  available_time?: number
+}
+
+// A working station's statistical analysis (run.result.station_states):
+// % of its operating time (shift time minus breaks and PM) in each state —
+// the five add up to 100.
+export interface StationStateStat {
+  working: number
+  free: number
+  setup: number
+  blocked: number
+  failed: number
+  operating_time: number
+  // Parts on the machine(s) at the end of the run; completed (good) and
+  // scrapped after the warm-up; Dismantle only: its output components.
+  // Absent on runs made before these were recorded.
+  current_parts?: number
+  completed_parts?: number
+  scrapped_parts?: number
+  output_components?: number | null
+}
+
+// A Buffer's statistical analysis (run.result.buffer_states): % of its
+// operating time it was Empty, Occupied (parts, room for more) or Full — 100.
+export interface BufferStateStat {
+  empty: number
+  occupied: number
+  full: number
+  operating_time: number
+}
+
+// Parts delivered by each Start (Start -> product -> count) and collected at
+// the line's end (last station before the End -> the route's product -> the
+// part's name, e.g. Car -> count), after the warm-up (run.result.parts_flow).
+export interface PartsFlow {
+  delivered: Record<string, Record<string, number>>
+  collected: Record<string, Record<string, Record<string, number>>>
+}
+
 export interface WorkerPoolStat {
+  // Absent on runs made before worked time was recorded.
+  workers?: WorkerStat[]
   workers_busy: number
   workers_idle: number
   queue_length: number
@@ -297,6 +391,86 @@ export interface UploadResponse {
 
 // One row of a Start's MU table: product (MU), how many (Number), display
 // name, minutes between its jobs (Interval; empty = all at once), colour.
+// Dismantle station settings, as in Tecnomatix's DismantleStation
+// Attributes tab. Saved with the scenario (as 'Dismantle'). The simulation
+// uses Sequence and Exiting FE; Dismantle Mode and Main FE to Successor make
+// no difference yet.
+export interface DismantleConfig {
+  // Where the dismantled FEs go: to all successors, or as the Dismantle
+  // input configuration says.
+  sequence: 'all_successors' | 'input_config'
+  mode: 'create_fe' | 'detach_fe'
+  // The successor (1, 2, ...) the main FE goes to.
+  mainFeToSuccessor: number
+  // The pieces' name: the part's own (Main FE), or the New FE name.
+  exitingFe: 'main_fe' | 'new_fe'
+  // New FE only: its name (empty: the part's name + " A").
+  newFeName?: string
+  // Sequence = Dismantle input configuration: the Dismantle table, one row
+  // per line leaving the Dismantle (absent: the defaults).
+  table?: DismantleRow[]
+  // Written on Save for the simulation: the stations its lines go to, in
+  // the order connected (successor 1, 2, ...).
+  successors?: string[]
+}
+
+// One row of the Dismantle table: how many pieces go to its station, and its
+// Successor: the order the rows' pieces leave in (1 first). Their name comes
+// from Exiting FE.
+export interface DismantleRow {
+  to: string        // the station the row's line goes to
+  number: number
+  successor: number
+}
+
+// Assembly station settings, as in Tecnomatix's AssemblyStation Attributes
+// tab. Only the options seen so far are listed; more come later.
+// 'mu_types' is shown as "Flow Entity(FE)". The last two are no longer
+// offered (an older saved one opens as None).
+export type AssemblyTableKind = 'none' | 'predecessors' | 'mu_types' | 'depends_on_main_mu' | 'fillup_main_mu'
+
+// One row of the Assembly Table: Predecessors mode fills `predecessor`,
+// Flow Entity(FE) mode fills `mu`. Assembly Time in minutes; Sequence Number optional.
+export interface AssemblyTableRow {
+  predecessor?: number
+  mu?: string
+  amount: number
+  // Flow Entity(FE) rows only.
+  assemblyTime?: number
+  sequenceNumber?: number | null
+}
+
+// One line coming into an Assembly: its No. ("Main FE from predecessor"
+// points at one) and how many of its parts make one assembly.
+export interface AssemblyNeed {
+  from: string      // the station the line comes from
+  // Set by the user (Assembly needs); absent: the order the line was
+  // connected. Always set in lines.
+  no?: number
+  amount: number
+}
+
+export interface AssemblyConfig {
+  table: AssemblyTableKind
+  mainMuFromPredecessor: number
+  // Ticked = the default, predecessor 1 (absent: ticked when it is 1).
+  mainMuDefault?: boolean
+  mode: 'delete_mus' | 'attach_mus'
+  // What leaves the assembly ("Assembled FE"): the main part, or a new one.
+  exitingMu: 'main_mu' | 'new_fe'
+  // New FE only: the name of the new product made by joining the parts.
+  newFeName?: string
+  // Assembly needs: one entry per incoming line (absent: No. in the order connected, amount 1).
+  needs?: AssemblyNeed[]
+  // Written on Save for the simulation: every line coming in, with its No.
+  // (Predecessors: as set in Assembly needs; otherwise the order connected) and
+  // amount (Predecessors only; otherwise 1).
+  lines?: AssemblyNeed[]
+  // Kept apart so switching between the two doesn't lose either table.
+  predecessorRows: AssemblyTableRow[]
+  muTypeRows: AssemblyTableRow[]
+}
+
 export interface MuRow {
   mu: string
   number: number
@@ -356,7 +530,15 @@ export interface StationNodeData {
   // Which of the day's shifts (1, 2, 3) this station runs on — any
   // combination, not just a contiguous count (e.g. [2, 3] to skip shift 1).
   shiftsPerDay?: number[]
-  assemblyCount?: number
+  // The box's fixed id in the saved drawing (canvas_layout), e.g. "STN-3".
+  // Given on its first save; never changes, even when the box is renamed.
+  boxId?: string
+  // Assembly only — its settings pop-up (Tecnomatix's Attributes tab).
+  // UI only for now; the simulation doesn't read it yet. Saved as 'Assembly'.
+  assembly?: AssemblyConfig
+  // Dismantle only — its settings (Tecnomatix's Attributes tab). Saved as
+  // 'Dismantle'; see DismantleConfig for what the simulation uses.
+  dismantle?: DismantleConfig
   // Conveyor belt speed (m/min). Its transport time is conveyorLength /
   // conveyorSpeed, used instead of cycleTime for Conveyor stations.
   conveyorSpeed?: number
@@ -373,9 +555,11 @@ export interface StationNodeData {
   exitStrategy?: 'cyclic' | 'random' | 'successor' | 'percentage'
   exitPercentages?: Record<string, number>  // keyed by next station's base name
   exitPriorities?: Record<string, number>   // Successor mode: next box label -> priority (1 = first)
-  // "Assembly type/table" — quantity of each upstream station's output needed
-  // to produce one assembled unit here, keyed by the upstream station's base name.
-  assemblyInputs?: Record<string, number>
+  // Route by product: when on, each product may only go to
+  // the next stations ticked for it (product -> next box labels); the Exit
+  // Controller then picks among those.
+  routeByProduct?: boolean
+  productRoutes?: Record<string, string[]>
   // Worker only — which named operator (a key in the scenario's
   // operators_data) this node represents. Contributes that operator's
   // Availability into the Worker Controller's pool it's wired to (Canvas.tsx's

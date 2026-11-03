@@ -17,7 +17,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Progress } from '@/components/ui/progress'
-import type { RunDetail, StationStat, SimConfig } from '@/types'
+import type { RunDetail, StationStat, SimConfig, WorkerPoolStat, StationStateStat, BufferStateStat, PartsFlow } from '@/types'
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -254,6 +254,218 @@ function AvgUtilCard({ avgUtil, stats }: { avgUtil: number; stats: StationStat[]
                   </div>
                 )
               })}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Statistical analysis card ────────────────────────────────────────────────
+
+// One stacked bar for a set of percentages (adding up to 100).
+function StateBar({ parts }: { parts: { value: number; color: string; label: string }[] }) {
+  return (
+    <div className="flex h-2 w-full overflow-hidden rounded-full bg-gray-100">
+      {parts.map((p) => p.value > 0 && (
+        <div key={p.label} style={{ width: `${p.value}%`, background: p.color }} title={`${p.label} ${p.value.toFixed(2)}%`} />
+      ))}
+    </div>
+  )
+}
+
+// The Stations table: the five percentages only.
+const STATION_COLUMNS = [
+  { key: 'working', label: 'Working' },
+  { key: 'setup', label: 'Setup' },
+  { key: 'free', label: 'Free' },
+  { key: 'blocked', label: 'Blocked' },
+  { key: 'failed', label: 'Failed' },
+] as const
+const BUFFER_STATES = [
+  { key: 'empty', label: 'Empty', color: '#cbd5e1' },
+  { key: 'occupied', label: 'Occupied', color: '#3b82f6' },
+  { key: 'full', label: 'Full', color: '#ef4444' },
+] as const
+const WORKER_STATES = [
+  { key: 'working_pct', label: 'Working', color: '#22c55e' },
+  { key: 'free_pct', label: 'Free', color: '#cbd5e1' },
+] as const
+
+const count = (n: number | null | undefined) => (n == null ? '—' : Number.isInteger(n) ? String(n) : n.toFixed(1))
+
+// The run's statistical analysis in one place — the same numbers the Canvas
+// panels show: every working station (Working / Free / Setup / Blocked /
+// Failed, parts), Buffer (Empty / Occupied / Full), Worker (Working / Free)
+// and the parts the Starts delivered and the line's ends collected.
+function StatisticalAnalysisCard({ result }: { result: RunDetail['result'] }) {
+  const [open, setOpen] = useState(false)
+  const stations = Object.entries((result?.station_states ?? {}) as Record<string, StationStateStat>)
+  const buffers = Object.entries((result?.buffer_states ?? {}) as Record<string, BufferStateStat>)
+  const workers = Object.entries(result?.worker_pool_stats ?? {})
+    .flatMap(([controller, p]) => (p.workers ?? []).map((w) => ({ controller, w })))
+  const flow = result?.parts_flow as PartsFlow | undefined
+  const avgWorking = stations.length > 0 ? stations.reduce((a, [, s]) => a + s.working, 0) / stations.length : null
+
+  const delivered = Object.entries(flow?.delivered ?? {}).map(([start, byProduct]) => ({ name: start || 'Start', byProduct }))
+  const collected: Record<string, number> = {}
+  for (const byRoute of Object.values(flow?.collected ?? {})) {
+    for (const names of Object.values(byRoute)) {
+      for (const [name, n] of Object.entries(names)) collected[name] = (collected[name] ?? 0) + n
+    }
+  }
+  const sum = (o: Record<string, number>) => Object.values(o).reduce((a, b) => a + b, 0)
+  const perProduct = (o: Record<string, number>) =>
+    Object.entries(o).sort(([a], [b]) => a.localeCompare(b)).map(([p, n]) => `${p} ${count(n)}`).join(' · ')
+
+  const th = 'text-[10px] font-bold text-gray-400 uppercase tracking-wider py-2 px-3 text-right whitespace-nowrap'
+  const thLeft = 'text-[10px] font-bold text-gray-400 uppercase tracking-wider py-2 px-3 text-left whitespace-nowrap'
+  const td = 'py-2.5 px-3 text-right tabular-nums text-sm text-gray-700 whitespace-nowrap'
+  const section = (title: string, sub: string) => (
+    <div className="px-6 pt-5 pb-2">
+      <h3 className="text-sm font-bold text-gray-900">{title}</h3>
+      <p className="text-[11px] text-gray-400 mt-0.5">{sub}</p>
+    </div>
+  )
+
+  return (
+    <div className="relative h-full">
+      <Card className="border border-gray-200 cursor-pointer hover:border-blue-300 transition-colors h-full" onClick={() => setOpen(true)}>
+        <CardContent className="pt-5 pb-4 h-full">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Statistical Analysis</p>
+              <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{avgWorking == null ? '—' : `${avgWorking.toFixed(1)}%`}</p>
+              <p className="text-xs text-gray-400 mt-1">{avgWorking == null ? 'run again to see it' : 'avg working, across stations'}</p>
+            </div>
+            <div className="p-2 rounded-lg bg-emerald-50"><BarChart2 className="h-4 w-4 text-emerald-500" /></div>
+          </div>
+        </CardContent>
+      </Card>
+      {open && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => setOpen(false)} />
+          <div className="relative bg-white rounded-2xl shadow-2xl w-[1040px] max-w-[95vw] max-h-[85vh] flex flex-col overflow-hidden">
+            <div className="flex items-center justify-between px-6 py-5 border-b border-gray-100 bg-gradient-to-r from-emerald-50 to-teal-50">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-emerald-100 flex items-center justify-center"><BarChart2 className="h-5 w-5 text-emerald-600" /></div>
+                <div>
+                  <h2 className="text-base font-bold text-gray-900">Statistical Analysis</h2>
+                  <p className="text-xs text-gray-400 mt-0.5">Stations, Buffers, Workers, Start and End · after the warm-up</p>
+                </div>
+              </div>
+              <button onClick={() => setOpen(false)} className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors"><X className="h-4 w-4" /></button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto pb-5 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-emerald-200 [&::-webkit-scrollbar-thumb]:rounded-full">
+              {stations.length === 0 && buffers.length === 0 && workers.length === 0 && !flow && (
+                <p className="px-6 py-8 text-sm text-gray-400">This run was made before the statistical analysis existed — run the simulation again to see it.</p>
+              )}
+
+              {stations.length > 0 && (
+                <>
+                  {section('Stations', '% of the operating time (shift time minus breaks and PM)')}
+                  <div className="mx-6 overflow-x-auto rounded-xl border border-gray-100">
+                    <table className="w-full">
+                      <thead><tr className="bg-gray-50 border-b border-gray-100">
+                        <th className={thLeft}>Station</th>
+                        {STATION_COLUMNS.map((st) => <th key={st.key} className={th}>{st.label}</th>)}
+                      </tr></thead>
+                      <tbody className="divide-y divide-gray-50">
+                        {stations.map(([name, s]) => (
+                          <tr key={name} className="hover:bg-gray-50">
+                            <td className="py-2.5 px-3 text-sm font-semibold text-gray-800 whitespace-nowrap">{name}</td>
+                            {STATION_COLUMNS.map((st) => <td key={st.key} className={td}>{s[st.key].toFixed(1)}%</td>)}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+
+              {buffers.length > 0 && (
+                <>
+                  {section('Buffers', '% of the operating time (shift time minus breaks)')}
+                  <div className="mx-6 overflow-x-auto rounded-xl border border-gray-100">
+                    <table className="w-full">
+                      <thead><tr className="bg-gray-50 border-b border-gray-100">
+                        <th className={thLeft}>Buffer</th>
+                        <th className={`${thLeft} w-40`} />
+                        {BUFFER_STATES.map((st) => <th key={st.key} className={th}>{st.label}</th>)}
+                      </tr></thead>
+                      <tbody className="divide-y divide-gray-50">
+                        {buffers.map(([name, s]) => (
+                          <tr key={name} className="hover:bg-gray-50">
+                            <td className="py-2.5 px-3 text-sm font-semibold text-gray-800 whitespace-nowrap">{name}</td>
+                            <td className="py-2.5 px-3"><StateBar parts={BUFFER_STATES.map((st) => ({ value: s[st.key], color: st.color, label: st.label }))} /></td>
+                            {BUFFER_STATES.map((st) => <td key={st.key} className={td}>{s[st.key].toFixed(1)}%</td>)}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+
+              {workers.length > 0 && (
+                <>
+                  {section('Workers', "% of the available time (the Worker Controller's shift, minus time away) · walking counts as Free")}
+                  <div className="mx-6 overflow-x-auto rounded-xl border border-gray-100">
+                    <table className="w-full">
+                      <thead><tr className="bg-gray-50 border-b border-gray-100">
+                        <th className={thLeft}>Worker</th>
+                        <th className={thLeft}>Worker Controller</th>
+                        <th className={`${thLeft} w-40`} />
+                        {WORKER_STATES.map((st) => <th key={st.key} className={th}>{st.label}</th>)}
+                        <th className={th}>Worked</th><th className={th}>Jobs</th>
+                      </tr></thead>
+                      <tbody className="divide-y divide-gray-50">
+                        {workers.map(({ controller, w }) => (
+                          <tr key={`${controller}|${w.name}`} className="hover:bg-gray-50">
+                            <td className="py-2.5 px-3 text-sm font-semibold text-gray-800 whitespace-nowrap">{w.name}</td>
+                            <td className="py-2.5 px-3 text-sm text-gray-600 whitespace-nowrap">{controller}</td>
+                            <td className="py-2.5 px-3"><StateBar parts={WORKER_STATES.map((st) => ({ value: w[st.key] ?? 0, color: st.color, label: st.label }))} /></td>
+                            {WORKER_STATES.map((st) => <td key={st.key} className={td}>{w[st.key] == null ? '—' : `${(w[st.key] ?? 0).toFixed(1)}%`}</td>)}
+                            <td className={td}>{w.worked_time.toFixed(1)} min</td>
+                            <td className={td}>{w.jobs}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+
+              {flow && (
+                <>
+                  {section('Start and End', 'Parts delivered by each Start · parts collected at the end of the line (every End together; each Dismantle piece counts)')}
+                  <div className="mx-6 overflow-x-auto rounded-xl border border-gray-100">
+                    <table className="w-full">
+                      <thead><tr className="bg-gray-50 border-b border-gray-100">
+                        <th className={thLeft}>Box</th>
+                        <th className={thLeft}>Per product</th>
+                        <th className={th}>Parts</th>
+                      </tr></thead>
+                      <tbody className="divide-y divide-gray-50">
+                        {delivered.map((d) => (
+                          <tr key={`start|${d.name}`} className="hover:bg-gray-50">
+                            <td className="py-2.5 px-3 text-sm font-semibold text-gray-800 whitespace-nowrap">{d.name} · delivered</td>
+                            <td className="py-2.5 px-3 text-xs text-gray-600">{perProduct(d.byProduct)}</td>
+                            <td className={td}>{count(sum(d.byProduct))}</td>
+                          </tr>
+                        ))}
+                        <tr className="hover:bg-gray-50">
+                          <td className="py-2.5 px-3 text-sm font-semibold text-gray-800 whitespace-nowrap">End · collected</td>
+                          <td className="py-2.5 px-3 text-xs text-gray-600">{perProduct(collected) || '—'}</td>
+                          <td className={td}>{count(sum(collected))}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -3389,6 +3601,61 @@ function StationTable({ stats }: { stats: StationStat[] }) {
   )
 }
 
+// ─── Workers (Worker Controller pools) ────────────────────────────────────────
+
+// Each pooled Worker's worked time (from starting a job until released),
+// jobs done and share of the run, and where it worked.
+function WorkerTable({ pools }: { pools: Record<string, WorkerPoolStat> }) {
+  const th = (label: string) => (
+    <th className="text-left text-xs font-semibold text-gray-400 uppercase tracking-wider py-3 px-4 whitespace-nowrap">
+      {label}
+    </th>
+  )
+  const rows = Object.entries(pools).flatMap(([controller, p]) => (p.workers ?? []).map((w) => ({ controller, w })))
+  return (
+    <div className="overflow-x-auto rounded-xl border border-gray-100">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="bg-gray-50 border-b border-gray-100">
+            {th('Worker')}
+            {th('Worker Controller')}
+            {th('Worked Time')}
+            {th('Jobs')}
+            {th('Utilization')}
+            {th('Worked At')}
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-gray-50">
+          {rows.map(({ controller, w }, idx) => (
+            <tr
+              key={`${controller}|${w.name}`}
+              className={`hover:bg-blue-50/40 transition-colors duration-100 ${idx % 2 === 0 ? 'bg-white' : 'bg-gray-50/40'}`}
+            >
+              <td className="py-3 px-4">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-2 h-2 rounded-full shrink-0" style={{ background: utilColor(w.utilization) }} />
+                  <span className="font-semibold text-gray-800 text-sm">{w.name}</span>
+                </div>
+              </td>
+              <td className="py-3 px-4"><span className="text-sm text-gray-600">{controller}</span></td>
+              <td className="py-3 px-4"><span className="text-sm font-semibold text-gray-700 tabular-nums">{w.worked_time.toFixed(1)} min</span></td>
+              <td className="py-3 px-4"><span className="text-sm font-semibold text-gray-700 tabular-nums">{w.jobs}</span></td>
+              <td className="py-3 px-4">
+                <span className={`text-sm font-bold tabular-nums ${utilTextColor(w.utilization)}`}>{w.utilization.toFixed(1)}%</span>
+              </td>
+              <td className="py-3 px-4">
+                <span className="text-xs text-gray-600">
+                  {w.workplaces.length === 0 ? '—' : w.workplaces.map((p) => `${p.station}: ${p.worked_time.toFixed(1)} min (${p.jobs} job${p.jobs === 1 ? '' : 's'})`).join(' · ')}
+                </span>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
 // ─── Run history sidebar ──────────────────────────────────────────────────────
 
 function RunHistory({
@@ -3713,6 +3980,9 @@ export default function RunDashboard() {
   const completedJobs = displayRun?.completed_jobs ?? 0
   const inProgressJobs = displayRun?.in_progress_jobs ?? 0
   const scrappedJobs = Number((displayRun?.result?.simulation_state as { scrapped_jobs?: number } | undefined)?.scrapped_jobs ?? 0)
+  // Problems found before the run that didn't stop it (e.g. an Assembly
+  // whose part quantities can't all be used).
+  const runWarnings = ((displayRun?.result?.simulation_state as { warnings?: string[] } | undefined)?.warnings ?? [])
   const throughput = displayRun?.kpi_throughput != null ? displayRun.kpi_throughput.toFixed(4) : '0.0000'
   const avgUtil = displayRun?.kpi_avg_utilization ?? 0
   const peakUtil = displayRun?.kpi_peak_utilization ?? 0
@@ -3966,6 +4236,12 @@ export default function RunDashboard() {
               `tab`, rather than a blank area with nothing in it. */}
           {(!displayRun || tab === 'kpis') && (
             <>
+              {runWarnings.length > 0 && (
+                <div className="mb-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3">
+                  <p className="text-xs font-bold text-amber-800 mb-1">Warning{runWarnings.length > 1 ? 's' : ''}</p>
+                  {runWarnings.map((w) => <p key={w} className="text-xs text-amber-700">{w}</p>)}
+                </div>
+              )}
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3 auto-rows-fr">
                 <CompletedJobsCard completed={completedJobs} inProgress={inProgressJobs} scrapped={scrappedJobs} stats={stats} />
                 <ThroughputCard value={`${throughput} /hr`} sub="jobs per hour" stats={stats} />
@@ -3986,6 +4262,7 @@ export default function RunDashboard() {
               </div>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6 auto-rows-fr">
                 <AvailabilityCard simTime={simTime} stats={stats} stationsData={activeScenario.stations_data} />
+                <StatisticalAnalysisCard result={displayRun?.result ?? null} />
               </div>
             </>
           )}
@@ -4090,6 +4367,21 @@ export default function RunDashboard() {
                               <StationTable stats={stats} />
                             </CardContent>
                           </Card>
+
+                          {/* Workers: only when the run had Worker Controller pools. */}
+                          {Object.values(displayRun?.result?.worker_pool_stats ?? {}).some((p) => (p.workers ?? []).length > 0) && (
+                            <Card className="mt-5">
+                              <CardHeader className="pb-2">
+                                <div className="flex items-center justify-between">
+                                  <CardTitle className="text-sm font-semibold text-gray-700">Workers</CardTitle>
+                                  <span className="text-xs text-gray-400">Worked time: from starting a job until released · Utilization: share of the run</span>
+                                </div>
+                              </CardHeader>
+                              <CardContent>
+                                <WorkerTable pools={displayRun!.result!.worker_pool_stats!} />
+                              </CardContent>
+                            </Card>
+                          )}
                         </>
                       )}
                     </>

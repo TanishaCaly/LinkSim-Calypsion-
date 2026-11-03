@@ -68,6 +68,11 @@ class Scenario(Base):
     setup_matrix = Column(JSON, nullable=False, default=dict)
     operators_data = Column(JSON, nullable=False, default=dict)
     simulation_config = Column(JSON, nullable=False, default=dict)
+    # The Build canvas drawing exactly as the user left it — boxes (fixed
+    # id, name, type, position) and lines (with the products using each).
+    # Canvas-only: the engine reads stations_data / processflow_data.
+    # NULL for scenarios never saved from the Canvas since this existed.
+    canvas_layout = Column(JSON, nullable=True)
 
     runs = relationship("SimulationRun", back_populates="scenario", cascade="all, delete-orphan")
 

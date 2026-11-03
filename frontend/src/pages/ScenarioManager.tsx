@@ -861,9 +861,18 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
         if (!r.name.trim()) continue
         data[r.name.trim()] = r.cfg
       }
-      return scenariosApi.update(scenario.id, { stations_data: data })
+      // The Canvas drawing follows renamed stations.
+      const renames = pendingRenames.current
+      const layout = scenario.canvas_layout && Object.keys(renames).length > 0
+        ? {
+            ...scenario.canvas_layout,
+            boxes: scenario.canvas_layout.boxes.map((b) => (renames[b.name] ? { ...b, name: renames[b.name] } : b)),
+          }
+        : undefined
+      return scenariosApi.update(scenario.id, { stations_data: data, ...(layout ? { canvas_layout: layout } : {}) })
     },
     onSuccess: () => {
+      pendingRenames.current = {}
       queryClient.invalidateQueries({ queryKey: ['scenarios'] })
       setStationsDirty(false)
       setStationsSaved(true)
@@ -933,7 +942,14 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
   // finds it: Process Flow rows, the Grid route, other stations' Exit
   // Controller entries and Worker Controller link, and the Setup Matrix.
   const nameAtFocus = useRef<string | null>(null)
+  // Renames not saved yet (first name -> current), so the saved Canvas
+  // drawing's box keeps its place and id under the new name.
+  const pendingRenames = useRef<Record<string, string>>({})
   const renameStationEverywhere = (oldName: string, newName: string) => {
+    for (const [from, to] of Object.entries(pendingRenames.current)) {
+      if (to === oldName) pendingRenames.current[from] = newName
+    }
+    if (!Object.values(pendingRenames.current).includes(newName)) pendingRenames.current[oldName] = newName
     setFlowRows((rows) => rows.map((r) => (r.resource !== oldName ? r : {
       ...r,
       resource: newName,

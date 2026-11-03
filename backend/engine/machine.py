@@ -12,6 +12,7 @@ from .formulas import (
     calculate_mtbf,
     PM_INTERVALS,
 )
+from .state_stats import new_state_log
 
 # Fixed seed for Exit Controller "Random" machine choice (see MachineGroup).
 ROUTING_SEED = 42
@@ -108,6 +109,11 @@ class SubMachine(simpy.PriorityResource):
         self.on_freed = None
         self.failure_count = 0
         self.pm_count = 0
+        # Working / Setup / Blocked / STATION_DOWNTIME intervals, recorded by
+        # the job code for the station's statistical analysis (state_stats).
+        self.state_log = new_state_log()
+        # Set while a PM is in progress (its start), like failure_start_time.
+        self.pm_start_time: Optional[float] = None
         self.downtime_log: list = []
         self.total_downtime: float = 0.0
         self.last_event_type: Optional[str] = None
@@ -264,6 +270,7 @@ class SubMachine(simpy.PriorityResource):
                 with self.mutex.request() as req:
                     yield req
                     pm_start = self.env.now
+                    self.pm_start_time = pm_start
                     self.working = False
                     self.last_event_type = "maintenance"
                     self.working_event = self.env.event()
@@ -275,6 +282,7 @@ class SubMachine(simpy.PriorityResource):
                     self.downtime_log.append(("Maintenance", pm_start, pm_end, downtime))
                     self.total_downtime += downtime
                     self.pm_count += 1
+                    self.pm_start_time = None
                     self.working = True
                     self.working_event.succeed()
                     self.working_event = self.env.event()
@@ -482,17 +490,19 @@ class MachineGroup:
     # Acquisition
     # ------------------------------------------------------------------
 
-    def request(self, priority: int = 0):
+    def request(self, priority: int = 0, allowed: Optional[set] = None):
         """
         Returns a context manager: `with group.request(priority) as (req, sub):`
         acquires a slot on one SubMachine. The SubMachine it got is on the
         context manager's `sub_machine` once `req` has fired — for a parallel
         (cyclic) group the machine isn't chosen until then, so `sub` is None.
+        `allowed`: the sub_machines indexes this job may use (Route by
+        product on the station before); None = any.
         """
         if len(self.sub_machines) == 1:
             return _GroupRequest(self.sub_machines[0], priority)
         self._seq += 1
-        return _CyclicRequest(self, priority, self._seq)
+        return _CyclicRequest(self, priority, self._seq, allowed)
 
     def request_machine(self, index: int, priority: int = 0) -> "_PinnedRequest":
         """
@@ -526,22 +536,25 @@ class MachineGroup:
         self._dispatch_pending = False
         n = len(self.sub_machines)
         while self._waiting:
+            # Same ordering PriorityResource used: lower priority first,
+            # ties by arrival (FIFO; LIFO passes a decreasing priority). Only
+            # the job at the front is served: one that may only use certain
+            # machines (Route by product) holds the line until one of those
+            # is free, even if a job behind it could use another.
+            pending = min(self._waiting, key=lambda r: (r.priority, r.seq))
+
+            def usable(i: int) -> bool:
+                return self._is_free(self.sub_machines[i]) and (pending.allowed is None or i in pending.allowed)
+
             if self.strategy == "random":
-                free = [i for i in range(n) if self._is_free(self.sub_machines[i])]
+                free = [i for i in range(n) if usable(i)]
                 idx = self._rng.choice(free) if free else None
             elif self.strategy == "successor":
-                idx = next((i for i in self.priority_order if self._is_free(self.sub_machines[i])), None)
+                idx = next((i for i in self.priority_order if usable(i)), None)
             else:
-                idx = next(
-                    ((self._next_turn + k) % n for k in range(n)
-                     if self._is_free(self.sub_machines[(self._next_turn + k) % n])),
-                    None,
-                )
+                idx = next(((self._next_turn + k) % n for k in range(n) if usable((self._next_turn + k) % n)), None)
             if idx is None:
                 return
-            # Same ordering PriorityResource used: lower priority first,
-            # ties by arrival (FIFO; LIFO passes a decreasing priority).
-            pending = min(self._waiting, key=lambda r: (r.priority, r.seq))
             self._waiting.remove(pending)
             self._next_turn = (idx + 1) % n
             pending._grant(self.sub_machines[idx])
@@ -643,10 +656,12 @@ class _CyclicRequest:
     which SubMachine it gets is only known once the returned event fires —
     read it from `sub_machine` then."""
 
-    def __init__(self, group: MachineGroup, priority: int, seq: int):
+    def __init__(self, group: MachineGroup, priority: int, seq: int, allowed: Optional[set] = None):
         self._group = group
         self.priority = priority
         self.seq = seq
+        # Machines (sub_machines indexes) this job may use; None = any.
+        self.allowed = set(allowed) if allowed is not None else None
         self.sub_machine: Optional[SubMachine] = None
         self._event = group.env.event()
         self._req_ctx = None

@@ -37,6 +37,7 @@ def create_scenario(db: Session, payload: Dict[str, Any], user_id: Optional[int]
         setup_matrix=payload.get("setup_matrix", {}),
         operators_data=payload.get("operators_data", {}),
         simulation_config=payload.get("simulation_config", {}),
+        canvas_layout=payload.get("canvas_layout"),
         source_filename=payload.get("source_filename"),
         source_file=bytes(payload["source_file"]) if payload.get("source_file") else None,
     )

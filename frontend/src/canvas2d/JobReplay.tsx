@@ -19,14 +19,42 @@ export interface ReplayTarget {
   machine: number     // parallel machine number (#1 -> 1); 1 for a single box
   isSource: boolean   // Start box — released jobs wait here for their first station
   isDrain: boolean    // End box — finished jobs collect here
+  products?: string[] // Start box: job-id prefixes of the products it releases
 }
 
-interface Visit { station: string; machine: number; start: number; end: number }
-/** One job: when it entered the line / finished its route (null if unknown / never), and its station visits. */
-interface Job { num: number; color: string; release: number | null; finish: number | null; visits: Visit[] }
+// `work`: when work on it started (a main part sat on an Assembly waiting
+// for its parts from `start` until then). `part`: it waits there as a part.
+// `piece`: a Dismantle piece, waiting on the Dismantle for its next station.
+interface Visit { station: string; machine: number; start: number; work: number; end: number; part?: boolean; piece?: boolean }
+/**
+ * One job: when it entered the line / finished its route (null if unknown /
+ * never), and its station visits. Assembly: `gone` — when it disappears into
+ * an assembly (a part, or the main part of a New FE); `mix` — from when it's
+ * drawn in slices, one colour per part type attached.
+ */
+interface Job {
+  id: string; num: number; prefix: string; color: string; release: number | null; finish: number | null; visits: Visit[]
+  gone: number | null; mix: { from: number; colors: string[] } | null
+  // Attach all parts: the main part and the parts in it (from mix.from).
+  // A Dismantle piece: the job it came from.
+  madeFrom: string[] | null
+}
+
+/** An assembly made in the run (simulation_state.assemblies, keyed by the job that leaves). */
+export interface AssemblyRecord { station: string; main: string; mode: string; parts: string[] }
+
+/** A job dismantled in the run (simulation_state.dismantles, keyed by that job): its pieces, one per next station. */
+export interface DismantleRecord { station: string; mode: string; pieces: string[] }
 
 const SPEEDS = [1, 10, 30, 50, 100]
 const CIRCLE = 30
+// Hover card: at most this many jobs listed (the rest counted).
+const MAX_LISTED = 200
+
+/** Where a job is shown at a moment, and what it's doing there. */
+// `rank`: which job the circle shows (the lowest; End: the highest).
+interface Place { target: ReplayTarget; after: boolean; came: number; leaves: number; rank: number; latest: boolean; status: string }
+const spotId = (p: Place) => `${p.target.nodeId}|${p.after}`
 
 // One colour per job, repeating after 16 — picked to stay distinct next to
 // each other and readable under white text.
@@ -39,14 +67,14 @@ const JOB_COLORS = [
  * prefix -> colour). Without one, each job gets its own colour; jobs of a
  * second variant get shifted colours so its job 1 doesn't look like the
  * first variant's job 1. */
-function jobLook(id: string, variants: Map<string, number>, byPrefix: Record<string, string>): { num: number; color: string } {
+function jobLook(id: string, variants: Map<string, number>, byPrefix: Record<string, string>): { num: number; prefix: string; color: string } {
   const m = id.match(/^(.*?)-?(\d+)$/)
   const prefix = m ? m[1] : id
   const num = m ? Number(m[2]) : 0
-  if (byPrefix[prefix]) return { num, color: byPrefix[prefix] }
+  if (byPrefix[prefix]) return { num, prefix, color: byPrefix[prefix] }
   if (!variants.has(prefix)) variants.set(prefix, variants.size)
   const shift = variants.get(prefix)! * 5
-  return { num, color: JOB_COLORS[(Math.max(num, 1) - 1 + shift) % JOB_COLORS.length] }
+  return { num, prefix, color: JOB_COLORS[(Math.max(num, 1) - 1 + shift) % JOB_COLORS.length] }
 }
 
 /** "2025-01-01 06:02:00" -> minutes since the epoch (timezone-free). */
@@ -69,12 +97,19 @@ function parseLog(
   releaseTimes: Record<string, unknown>,
   finishTimes: Record<string, unknown>,
   variantColors: Record<string, string>,
+  assemblies: Record<string, AssemblyRecord>,
+  dismantles: Record<string, DismantleRecord>,
 ) {
   const jobs = new Map<string, Job>()
   const variants = new Map<string, number>()
   const byPrefix = Object.fromEntries(Object.entries(variantColors).map(([v, c]) => [jobPrefix(v), c]))
   const job = (id: string) => {
-    if (!jobs.has(id)) jobs.set(id, { ...jobLook(id, variants, byPrefix), release: null, finish: null, visits: [] })
+    if (!jobs.has(id)) {
+      jobs.set(id, {
+        id, ...jobLook(id, variants, byPrefix), release: null, finish: null, visits: [],
+        gone: null, mix: null, madeFrom: null,
+      })
+    }
     return jobs.get(id)!
   }
   const stationOrder = Object.keys(log)
@@ -83,12 +118,15 @@ function parseLog(
   const see = (t: number) => { t0 = Math.min(t0, t); tEnd = Math.max(tEnd, t) }
   for (const station of stationOrder) {
     for (const raw of log[station] as Record<string, unknown>[]) {
-      const start = toMinutes(raw['process_start_time_real'])
+      const logged = toMinutes(raw['process_start_time_real'])
       const end = toMinutes(raw['process_end_time_real'])
       const id = raw['job_id']
-      if (start === null || end === null || typeof id !== 'string') continue
+      if (logged === null || end === null || typeof id !== 'string') continue
+      // A main part sat on the Assembly waiting for its parts before that.
+      const partsWait = raw['Waiting for parts']
+      const start = typeof partsWait === 'number' ? logged - partsWait : logged
       const machine = typeof raw['machine'] === 'number' ? raw['machine'] : 1
-      job(id).visits.push({ station, machine, start, end })
+      job(id).visits.push({ station, machine, start, work: logged, end })
       see(start); see(end)
     }
   }
@@ -100,6 +138,74 @@ function parseLog(
     const t = toMinutes(stamp)
     if (t !== null) { job(id).finish = t; see(t) }
   }
+  // Assemblies: the parts wait on the Assembly until it finishes, then go —
+  // into the main part, or, with a New FE, the main part goes too and the
+  // New FE leaves from there. Attached items are drawn in slices.
+  for (const [out, rec] of Object.entries(assemblies)) {
+    const main = jobs.get(rec.main)
+    if (!main) continue
+    const partVisits = rec.parts.map((id) => {
+      const p = jobs.get(id)
+      const at = p?.visits.filter((v) => v.station === rec.station) ?? []
+      return { p, v: at.reduce<Visit | undefined>((last, v) => (!last || v.start > last.start ? v : last), undefined) }
+    })
+    const joined = Math.max(-Infinity, ...partVisits.map(({ v }) => v?.end ?? -Infinity))
+    const done = main.visits
+      .filter((v) => v.station === rec.station && v.end >= joined)
+      .reduce<Visit | undefined>((first, v) => (!first || v.end < first.end ? v : first), undefined)
+    if (!done) continue
+    for (const { p, v } of partVisits) {
+      if (!p || !v) continue
+      v.end = done.end
+      v.part = true
+      p.gone = done.end
+    }
+    if (out !== rec.main) {
+      main.gone = done.end
+      const made = job(out)
+      // A renumbered Main FE (a-A001): still the main part's product.
+      if (out.startsWith(`${main.prefix}-A`)) { made.prefix = main.prefix; made.color = main.color }
+      made.visits.push({ station: rec.station, machine: done.machine, start: done.end, work: done.end, end: done.end })
+    }
+    if (rec.mode === 'attach') {
+      // One slice per part type (product), in its colour; main part first.
+      const colors = new Map<string, string>()
+      for (const id of [rec.main, ...rec.parts]) {
+        const j = jobs.get(id)
+        if (j && !colors.has(j.prefix)) colors.set(j.prefix, j.color)
+      }
+      job(out).mix = { from: done.end, colors: [...colors.values()] }
+      job(out).madeFrom = [rec.main, ...rec.parts]
+    }
+  }
+  // Dismantles: the job disappears when the Dismantle finishes it; its
+  // pieces leave from there in its colour, each waiting on the Dismantle
+  // until its next station takes it.
+  for (const [id, rec] of Object.entries(dismantles)) {
+    const whole = jobs.get(id)
+    const done = whole?.visits
+      .filter((v) => v.station === rec.station)
+      .reduce<Visit | undefined>((last, v) => (!last || v.start > last.start ? v : last), undefined)
+    if (!whole || !done) continue
+    if (!rec.pieces.includes(id)) whole.gone = done.end
+    for (const pid of rec.pieces) {
+      const p = job(pid)
+      if (pid !== id) {
+        p.color = whole.color
+        p.mix = whole.mix && { from: done.end, colors: whole.mix.colors }
+        p.madeFrom = [id]
+        // Every piece shows the number of the job it came from (job 1's
+        // pieces: 1 and 1). Detach FE (Car-001-2): its product too.
+        p.num = whole.num
+        if (pid.startsWith(`${id}-`)) p.prefix = whole.prefix
+      }
+      const next = Math.min(Infinity, ...p.visits.filter((v) => v !== done && v.start >= done.end).map((v) => v.start))
+      const leaves = Number.isFinite(next) ? next : p.finish ?? Infinity
+      if (leaves > done.end) {
+        p.visits.push({ station: rec.station, machine: done.machine, start: done.end, work: done.end, end: leaves, piece: true })
+      }
+    }
+  }
   if (t0 === Infinity) return { jobs: [] as Job[], t0: 0, total: 0 }
   // Ties (zero-time Start/Connector entries at the same instant as the next
   // station) fall back to flow order — the order stations first appear.
@@ -108,11 +214,16 @@ function parseLog(
   for (const j of jobs.values()) {
     j.visits.sort((a, b) => a.start - b.start || a.end - b.end || rank.get(a.station)! - rank.get(b.station)!)
     list.push({
+      id: j.id,
       num: j.num,
+      prefix: j.prefix,
       color: j.color,
       release: j.release === null ? null : j.release - t0,
       finish: j.finish === null ? null : j.finish - t0,
-      visits: j.visits.map((v) => ({ ...v, start: v.start - t0, end: v.end - t0 })),
+      visits: j.visits.map((v) => ({ ...v, start: v.start - t0, work: v.work - t0, end: v.end - t0 })),
+      gone: j.gone === null ? null : j.gone - t0,
+      mix: j.mix && { from: j.mix.from - t0, colors: j.mix.colors },
+      madeFrom: j.madeFrom,
     })
   }
   return { jobs: list, t0, total: tEnd - t0 }
@@ -126,17 +237,21 @@ function formatClock(t0: number, t: number): string {
   return `Day ${day} · ${hh}:${mm}`
 }
 
-export default function JobReplay({ completionLog, releaseTimes, finishTimes, targets, variantColors }: {
+export default function JobReplay({ completionLog, releaseTimes, finishTimes, assemblies, dismantles, targets, variantColors }: {
   completionLog: Record<string, unknown[]>
   releaseTimes?: Record<string, unknown>
   finishTimes?: Record<string, unknown>
+  // Absent on runs made before Assemblies joined parts.
+  assemblies?: Record<string, AssemblyRecord>
+  // Absent on runs made before Dismantles made pieces.
+  dismantles?: Record<string, DismantleRecord>
   targets: ReplayTarget[]
   // Product (variant) -> its colour, from the Start's MU table.
   variantColors?: Record<string, string>
 }) {
   const { jobs, t0, total } = useMemo(
-    () => parseLog(completionLog, releaseTimes ?? {}, finishTimes ?? {}, variantColors ?? {}),
-    [completionLog, releaseTimes, finishTimes, variantColors],
+    () => parseLog(completionLog, releaseTimes ?? {}, finishTimes ?? {}, variantColors ?? {}, assemblies ?? {}, dismantles ?? {}),
+    [completionLog, releaseTimes, finishTimes, variantColors, assemblies, dismantles],
   )
 
   const [time, setTime] = useState(0)          // simulated minutes since t0
@@ -176,55 +291,111 @@ export default function JobReplay({ completionLog, releaseTimes, finishTimes, ta
     for (const t of targets) map.set(`${t.station}|${t.machine}`, t)
     return map
   }, [targets])
-  const source = useMemo(() => targets.find((t) => t.isSource), [targets])
+  // Each job waits at the Start that releases its product (the first Start
+  // for a product no Start lists).
+  const sources = useMemo(() => targets.filter((t) => t.isSource), [targets])
+  const sourceOf = useMemo(() => (job: Job) => sources.find((t) => t.products?.includes(job.prefix)) ?? sources[0], [sources])
   const drain = useMemo(() => targets.find((t) => t.isDrain), [targets])
+
+  // Where a job is at `time` (undefined: not on the Canvas): its box, right
+  // of it (`after`: waiting to move on) or on it, when it got there and when
+  // it moves on (End: when it got there; `latest` — End shows the last one).
+  const place = useMemo(() => {
+    const find = (v: Visit) => byKey.get(`${v.station}|${v.machine}`) ?? byKey.get(`${v.station}|1`)
+    return (j: Job, time: number): Place | undefined => {
+      const { release, finish, visits } = j
+      if (j.gone !== null && time >= j.gone) return undefined // used up in an assembly
+      const firstStart = visits[0]?.start ?? Infinity
+      const atStart = (): Place | undefined => {
+        const target = sourceOf(j)
+        return target && { target, after: true, came: release ?? 0, leaves: firstStart, rank: firstStart, latest: false, status: 'Released — waiting for its first station' }
+      }
+      // The very first frame shows the starting point: every job released at
+      // the start is still at Start, before the first moves of that same
+      // minute (e.g. Job 1 into a free Station 1) happen.
+      if (time <= 0 && sources.length > 0) return release !== null && release <= 0 ? atStart() : undefined
+      if (finish !== null && time >= finish) {
+        return drain && { target: drain, after: false, came: finish, leaves: finish, rank: finish, latest: true, status: 'Finished' }
+      }
+      if (!visits.length || time < firstStart) {
+        // Released, waiting for its first station.
+        return release !== null && time >= release ? atStart() : undefined
+      }
+      let i = visits.length - 1
+      while (i > 0 && visits[i].start > time) i--
+      const v = visits[i]
+      const target = find(v)
+      if (!target) return undefined
+      const nextMove = visits[i + 1]?.start ?? finish ?? Infinity
+      if (time < v.end) {
+        // Being worked on / riding. Parts on an Assembly never cover the
+        // main part (the circle shown).
+        const status = v.part ? 'Part — waiting to be assembled'
+          : v.piece ? 'Piece — waiting for its next station'
+            : time < v.work ? 'Waiting for parts' : 'Being worked on'
+        return { target, after: false, came: v.start, leaves: v.end, rank: v.part ? Infinity : v.end, latest: false, status }
+      }
+      if (i === visits.length - 1 && target.isDrain) {
+        return { target, after: false, came: v.end, leaves: v.end, rank: v.end, latest: true, status: 'Finished' }
+      }
+      return { target, after: true, came: v.end, leaves: nextMove, rank: nextMove, latest: false, status: 'Waiting to move on' }
+    }
+  }, [byKey, sources, sourceOf, drain])
 
   // Where every job is right now, grouped into one circle per spot. Each
   // spot shows the job that leaves it next (the log already knows when each
   // job moves on, so this follows FIFO/LIFO/Cyclic by itself); End shows the
   // job that finished last.
   const groups = useMemo(() => {
-    interface Group { nodeId: string; after: boolean; count: number; job: Job; key: number; latest: boolean }
+    interface Group { id: string; nodeId: string; after: boolean; count: number; job: Job; key: number }
     const spots = new Map<string, Group>()
-    // `leaves`: when this job moves on from the spot (End: when it got there).
-    const add = (target: ReplayTarget | undefined, after: boolean, job: Job, leaves: number, latest = false) => {
-      if (!target) return
-      const id = `${target.nodeId}|${after}`
-      const g = spots.get(id)
-      if (!g) { spots.set(id, { nodeId: target.nodeId, after, count: 1, job, key: leaves, latest }); return }
-      g.count++
-      if (latest ? leaves > g.key : leaves < g.key) { g.job = job; g.key = leaves }
-    }
-    const find = (v: Visit) => byKey.get(`${v.station}|${v.machine}`) ?? byKey.get(`${v.station}|1`)
     for (const j of jobs) {
-      const { release, finish, visits } = j
-      const firstStart = visits[0]?.start ?? Infinity
-      // The very first frame shows the starting point: every job released at
-      // the start is still at Start, before the first moves of that same
-      // minute (e.g. Job 1 into a free Station 1) happen.
-      if (time <= 0 && source) {
-        if (release !== null && release <= 0) add(source, true, j, firstStart)
-        continue
-      }
-      if (finish !== null && time >= finish) { add(drain, false, j, finish, true); continue } // finished, at End
-      if (!visits.length || time < firstStart) {
-        // Released, waiting for its first station.
-        if (release !== null && time >= release) add(source, true, j, firstStart)
-        continue
-      }
-      let i = visits.length - 1
-      while (i > 0 && visits[i].start > time) i--
-      const v = visits[i]
-      const target = find(v)
-      const nextMove = visits[i + 1]?.start ?? finish ?? Infinity
-      if (time < v.end) add(target, false, j, v.end)                                      // being worked on / riding
-      else if (i === visits.length - 1 && target?.isDrain) add(target, false, j, v.end, true) // finished, at End
-      else add(target, true, j, nextMove)                                                 // waiting to move on
+      const p = place(j, time)
+      if (!p) continue
+      const id = spotId(p)
+      const g = spots.get(id)
+      if (!g) { spots.set(id, { id, nodeId: p.target.nodeId, after: p.after, count: 1, job: j, key: p.rank }); continue }
+      g.count++
+      if (p.latest ? p.rank > g.key : p.rank < g.key) { g.job = j; g.key = p.rank }
     }
     return [...spots.values()]
-  }, [jobs, time, byKey, source, drain])
+  }, [jobs, time, place])
+
+  // Hover card: the spot under the mouse; it stays open while the mouse
+  // moves from the circle onto the card (to scroll a long list).
+  const [hovered, setHovered] = useState<string | null>(null)
+  const closeTimer = useRef<number | undefined>(undefined)
+  const hoverOn = (id: string) => { window.clearTimeout(closeTimer.current); setHovered(id) }
+  const hoverOff = () => { closeTimer.current = window.setTimeout(() => setHovered(null), 150) }
+  useEffect(() => () => window.clearTimeout(closeTimer.current), [])
+  const hoveredGroup = hovered ? groups.find((g) => g.id === hovered) : undefined
+  // Every job in the hovered spot, the one leaving next first.
+  const hoveredJobs = useMemo(() => {
+    if (!hovered) return []
+    const here: { job: Job; place: Place }[] = []
+    for (const j of jobs) {
+      const p = place(j, time)
+      if (p && spotId(p) === hovered) here.push({ job: j, place: p })
+    }
+    return here.sort((a, b) => (a.place.latest ? b.place.rank - a.place.rank : a.place.rank - b.place.rank))
+  }, [hovered, jobs, time, place])
+  // Job-id prefix -> product name.
+  const productOf = useMemo(() => {
+    const names = new Map(Object.keys(variantColors ?? {}).map((v) => [jobPrefix(v), v]))
+    return (j: Job) => names.get(j.prefix) ?? j.prefix
+  }, [variantColors])
 
   if (total <= 0) return null
+
+  const clock = (t: number) => (Number.isFinite(t) ? formatClock(t0, t) : '—')
+  const boxName = (t: ReplayTarget) => (t.machine > 1 ? `${t.station} #${t.machine}` : t.station)
+  const card = (() => {
+    const n = hoveredGroup && nodeInternals.get(hoveredGroup.nodeId)
+    if (!hoveredGroup || !n?.positionAbsolute || !n.width || !n.height || !hoveredJobs.length) return null
+    const x = hoveredGroup.after ? n.positionAbsolute.x + n.width + 14 : n.positionAbsolute.x + n.width / 2
+    const y = n.positionAbsolute.y + n.height / 2
+    return { left: (x + CIRCLE / 2) * zoom + tx + 10, top: y * zoom + ty - 20 }
+  })()
 
   return (
     <>
@@ -235,11 +406,18 @@ export default function JobReplay({ completionLog, releaseTimes, finishTimes, ta
             if (!n?.positionAbsolute || !n.width || !n.height) return null
             const x = g.after ? n.positionAbsolute.x + n.width + 14 : n.positionAbsolute.x + n.width / 2
             const y = n.positionAbsolute.y + n.height / 2
+            // Attached parts: equal slices, one colour per part type.
+            const mix = g.job.mix && time >= g.job.mix.from ? g.job.mix.colors : null
+            const background = mix && mix.length > 1
+              ? `conic-gradient(${mix.map((c, i) => `${c} ${(i * 100) / mix.length}% ${((i + 1) * 100) / mix.length}%`).join(', ')})`
+              : mix?.[0] ?? g.job.color
             return (
               <div
-                key={`${g.nodeId}|${g.after}`}
+                key={g.id}
+                onMouseEnter={() => hoverOn(g.id)}
+                onMouseLeave={hoverOff}
                 className="absolute rounded-full border-2 border-white shadow-md flex items-center justify-center text-white font-bold tabular-nums leading-none"
-                style={{ left: x - CIRCLE / 2, top: y - CIRCLE / 2, width: CIRCLE, height: CIRCLE, background: g.job.color, fontSize: g.job.num >= 1000 ? 9 : g.job.num >= 100 ? 10.5 : 12 }}
+                style={{ left: x - CIRCLE / 2, top: y - CIRCLE / 2, width: CIRCLE, height: CIRCLE, background, pointerEvents: 'auto', fontSize: g.job.num >= 1000 ? 9 : g.job.num >= 100 ? 10.5 : 12 }}
               >
                 {g.job.num}
                 {g.count > 1 && (
@@ -251,6 +429,44 @@ export default function JobReplay({ completionLog, releaseTimes, finishTimes, ta
             )
           })}
         </div>
+
+        {/* Hover card: the job (or every job) in the spot; updates as it plays. */}
+        {card && (() => {
+          const where = hoveredJobs[0].place
+          const one = hoveredJobs.length === 1
+          const shown = hoveredJobs.slice(0, MAX_LISTED)
+          return (
+            <div
+              onMouseEnter={() => hoverOn(hovered!)}
+              onMouseLeave={hoverOff}
+              className="absolute w-64 rounded-xl border border-gray-200 bg-white/95 backdrop-blur-sm shadow-lg text-[11px] text-gray-700"
+              style={{ left: card.left, top: card.top, pointerEvents: 'auto' }}
+            >
+              <div className="px-3 py-2 border-b border-gray-100 font-semibold text-gray-900">
+                {where.after ? `After ${boxName(where.target)}` : boxName(where.target)}
+                {!one && <span className="font-normal text-gray-500"> · {hoveredJobs.length} jobs</span>}
+              </div>
+              <div className="max-h-64 overflow-y-auto divide-y divide-gray-100">
+                {shown.map(({ job: j, place: p }) => (
+                  <div key={j.id} className="px-3 py-1.5 space-y-0.5">
+                    <div className="flex items-baseline justify-between gap-2">
+                      <span className="font-semibold text-gray-900">{j.id}</span>
+                      <span className="text-gray-500 truncate">{productOf(j)}</span>
+                    </div>
+                    <div>{p.status}</div>
+                    <div className="text-gray-500 tabular-nums">
+                      {p.status === 'Finished' ? `Finished ${clock(p.came)}` : `Came ${clock(p.came)} · Leaves ${clock(p.leaves)}`}
+                    </div>
+                    {j.madeFrom && (!j.mix || time >= j.mix.from) && <div className="text-gray-500">Made from {j.madeFrom.join(' + ')}</div>}
+                  </div>
+                ))}
+                {hoveredJobs.length > shown.length && (
+                  <div className="px-3 py-1.5 text-gray-400">and {hoveredJobs.length - shown.length} more</div>
+                )}
+              </div>
+            </div>
+          )
+        })()}
       </div>
 
       <Panel position="bottom-center">

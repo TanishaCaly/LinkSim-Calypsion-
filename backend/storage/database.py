@@ -24,6 +24,7 @@ def init_db():
     Base.metadata.create_all(bind=engine)
     _migrate_users_table()
     _migrate_station_stats_table()
+    _migrate_scenarios_table()
 
 
 def _migrate_users_table():
@@ -73,6 +74,18 @@ def _migrate_station_stats_table():
     with engine.begin() as conn:
         for stmt in statements:
             conn.execute(text(stmt))
+
+
+def _migrate_scenarios_table():
+    """One-time ALTER TABLE for scenario columns added after the table
+    already existed in deployed DBs. Idempotent."""
+    inspector = inspect(engine)
+    if "scenarios" not in inspector.get_table_names():
+        return
+    existing = {col["name"] for col in inspector.get_columns("scenarios")}
+    if "canvas_layout" not in existing:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE scenarios ADD COLUMN canvas_layout JSON"))
 
 
 def get_db() -> Generator[Session, None, None]:

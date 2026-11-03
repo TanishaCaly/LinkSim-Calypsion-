@@ -7,7 +7,7 @@ import ReactFlow, {
   Handle, Position, MarkerType, ConnectionMode, SelectionMode,
 } from 'reactflow'
 import 'reactflow/dist/style.css'
-import JobReplay, { type ReplayTarget } from '../canvas2d/JobReplay'
+import JobReplay, { type AssemblyRecord, type DismantleRecord, type ReplayTarget } from '../canvas2d/JobReplay'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import {
@@ -24,8 +24,8 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import Scene from '@/canvas3d/Scene'
 import { buildScene3D } from '@/canvas3d/layout'
-import type { StationNodeData, ScenarioCreate, StationConfig, MuRow } from '@/types'
-import { defaultVariantColor, unusedVariantColor } from '@/lib/variantColors'
+import type { StationNodeData, ScenarioCreate, StationConfig, MuRow, AssemblyConfig, AssemblyTableKind, AssemblyTableRow, DismantleConfig, DismantleRow, CanvasLayout, WorkerStat, StationStateStat, BufferStateStat, PartsFlow } from '@/types'
+import { defaultVariantColor, unusedVariantColor, jobPrefix } from '@/lib/variantColors'
 
 // ─── Detailed Object Palette icons ───────────────────────────────────────────
 //
@@ -885,11 +885,13 @@ function MultiStyledSelect({
 // ─── Property editor ─────────────────────────────────────────────────────────
 
 function PropertyEditor({
-  node, nodes, edges, onChange, onDelete, onSaveStation, onAddParallel, onOpenMuTable, startProducts, onAddWorkplace, onRemoveWorkplace, onToggleWire, onAssignOperator, onUnassignOperator, numShifts, shiftNames, operatorsData,
+  node, nodes, edges, allEdges, onChange, onDelete, onSaveStation, onAddParallel, onOpenMuTable, startProducts, products, onAddWorkplace, onRemoveWorkplace, onToggleWire, onAssignOperator, onUnassignOperator, numShifts, shiftNames, operatorsData, workerResults, stationStates, bufferStates, partsFlow,
 }: {
   node: Node<StationNodeData>
   nodes: Node<StationNodeData>[]
   edges: Edge[]
+  // Every line on the drawing, whichever product uses it.
+  allEdges: Edge[]
   onChange: (id: string, data: Partial<StationNodeData>) => void
   onDelete: (id: string) => void
   onSaveStation: () => void
@@ -897,6 +899,8 @@ function PropertyEditor({
   onOpenMuTable: (id: string) => void
   // Start only: its products (MU table), for its Exit Controller.
   startProducts: string[]
+  // The scenario's products, for Route by product.
+  products: string[]
   onAddWorkplace: (id: string) => void
   onRemoveWorkplace: (id: string) => void
   onToggleWire: (sourceId: string, targetId: string, connect: boolean) => void
@@ -905,6 +909,14 @@ function PropertyEditor({
   numShifts: number
   shiftNames: Record<number, string | undefined>
   operatorsData: Record<string, { 'Skill Rating': number; 'Availability (%)': number }>
+  // The last run's pooled Workers, by name (empty before a run).
+  workerResults: Record<string, WorkerStat>
+  // The last run's statistical analysis, by station (empty before a run).
+  stationStates: Record<string, StationStateStat>
+  // The same for the Buffers.
+  bufferStates: Record<string, BufferStateStat>
+  // The last run's parts delivered / collected (undefined before a run).
+  partsFlow?: PartsFlow
 }) {
   const nodeType = inferStationType(node.data.label, node.data.stationType)
   // A Connector is a routing junction, a Conveyor is transport, and a
@@ -1097,7 +1109,6 @@ function PropertyEditor({
             { key: 'label',       label: 'Name',              type: 'text'   },
             { key: 'cycleTime',   label: 'Cycle Time (min)',   type: 'number' },
             { key: 'setupTime',   label: 'Setup Time (min)',   type: 'number' },
-            { key: 'processTime', label: 'Process Time (min)', type: 'number' },
             { key: 'operators',   label: 'Operators',          type: 'number' },
             { key: 'repairTime',  label: 'Repair Time (min)',  type: 'number' },
           ]
@@ -1114,27 +1125,6 @@ function PropertyEditor({
       .filter((op): op is string => !!op)
   )
   const operatorNames = Object.keys(operatorsData)
-
-  // "Assembly Count" only makes sense on stations built from the Assembly
-  // palette item. Keyed off stationType (set once at creation, restored from
-  // the saved scenario) rather than the label, so renaming the station in
-  // the Name field doesn't hide this field. Falls back to a label check for
-  // scenarios saved before stationType existed (no persisted type to read).
-  const isAssembly = node.data.stationType
-    ? node.data.stationType === 'Assembly'
-    : baseStationName(node.data.label).startsWith('Assembly')
-
-  // Distinct upstream STATIONS feeding this node — the "Assembly type/table"
-  // rows for an Assembly station: one row per incoming station, with a
-  // quantity-needed field.
-  const sourceBases = Array.from(new Set(
-    edges
-      .filter((e) => e.target === node.id)
-      .map((e) => nodes.find((n) => n.id === e.source))
-      .filter((n): n is Node<StationNodeData> => !!n)
-      .map(groupKey)
-  ))
-  const assemblyInputs = node.data.assemblyInputs ?? {}
 
   // 2+ successors = this station needs an Exit Controller.
   const successorBases = exitSuccessorLabels(node.id, nodes, edges)
@@ -1276,8 +1266,8 @@ function PropertyEditor({
                     </button>
                   )}
                   {node.data.conveyorSensor && node.data.conveyorSensor.length > (node.data.conveyorLength ?? 0) && (
-                    <p className="text-[10px] text-amber-600 mt-1">
-                      Sensor ({formatDecimal(node.data.conveyorSensor.length)} m) is longer than the conveyor ({formatDecimal(node.data.conveyorLength ?? 0)} m) — it will be ignored in the simulation.
+                    <p className="text-[10px] text-red-600 mt-1">
+                      Sensor ({formatDecimal(node.data.conveyorSensor.length)} m) is longer than the conveyor ({formatDecimal(node.data.conveyorLength ?? 0)} m) — change one of them before saving.
                     </p>
                   )}
                   {sensorDialogOpen && (
@@ -1334,7 +1324,7 @@ function PropertyEditor({
               >
                 <option value="cyclic">Cyclic</option>
                 <option value="random">Random</option>
-                <option value="successor">Successor</option>
+                <option value="successor">Route</option>
                 <option value="percentage">Percentage</option>
               </select>
 
@@ -1575,6 +1565,68 @@ function PropertyEditor({
               <p className="text-[10px] text-gray-400 mt-1">Delay paid only when reassigned to a different Workplace.</p>
             </div>
             <p className="text-[10px] text-gray-400 mt-2">Connect this to a Worker Controller to join its pool.</p>
+            {/* Last run: how long this Worker worked, and where. */}
+            {node.data.assignedOperator && workerResults[node.data.assignedOperator] && (() => {
+              const w = workerResults[node.data.assignedOperator!]
+              return (
+                <div className="mt-3">
+                  <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+                    Last Run
+                  </label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
+                      <p className="text-sm font-bold text-gray-800">{w.worked_time.toFixed(1)} min</p>
+                      <p className="text-[9px] text-gray-500">Worked</p>
+                    </div>
+                    <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
+                      <p className="text-sm font-bold text-gray-800">{w.jobs}</p>
+                      <p className="text-[9px] text-gray-500">Jobs</p>
+                    </div>
+                  </div>
+                  {w.workplaces.map((p) => (
+                    <p key={p.station} className="text-[10px] text-gray-500 mt-1.5">
+                      Worked {p.worked_time.toFixed(1)} min at {p.station} ({p.jobs} job{p.jobs === 1 ? '' : 's'})
+                    </p>
+                  ))}
+                  <p className="text-[10px] text-gray-400 mt-1">{w.utilization.toFixed(1)}% of the run.</p>
+                  {/* Statistical analysis: Working / Free % of its available
+                      time — the Worker Controller's shift minus the time it
+                      was away, after the warm-up. Walking counts as Free. */}
+                  {w.working_pct !== undefined && (() => {
+                    const rows = [
+                      { label: 'Working', value: w.working_pct ?? 0, color: '#22c55e' },
+                      { label: 'Free', value: w.free_pct ?? 0, color: '#cbd5e1' },
+                    ]
+                    return (
+                      <div className="mt-3">
+                        <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+                          Statistical Analysis
+                        </label>
+                        <div className="flex h-2.5 w-full overflow-hidden rounded-full bg-gray-100">
+                          {rows.map((r) => r.value > 0 && (
+                            <div key={r.label} style={{ width: `${r.value}%`, background: r.color }} title={`${r.label} ${r.value.toFixed(2)}%`} />
+                          ))}
+                        </div>
+                        <div className="mt-2 space-y-1">
+                          {rows.map((r) => (
+                            <div key={r.label} className="flex items-center justify-between text-xs">
+                              <span className="flex items-center gap-1.5 text-gray-600">
+                                <span className="h-2 w-2 rounded-sm" style={{ background: r.color }} />
+                                {r.label}
+                              </span>
+                              <span className="font-semibold text-gray-800 tabular-nums">{r.value.toFixed(2)}%</span>
+                            </div>
+                          ))}
+                        </div>
+                        <p className="text-[10px] text-gray-400 mt-1.5">
+                          Of {(w.available_time ?? 0).toFixed(0)} min available (the Worker Controller's shift, minus time away, after the warm-up).
+                        </p>
+                      </div>
+                    )
+                  })()}
+                </div>
+              )
+            })()}
 
             <div className="mt-3">
               <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
@@ -1927,50 +1979,56 @@ function PropertyEditor({
         </div>
         )}
 
-        {/* Assembly count — only relevant on stations built from the
-            Assembly palette item: how many input sub-parts combine into
-            one assembled unit. Config-only for now; not yet read by the
-            simulation engine. */}
-        {isAssembly && (
-          <div>
-            <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
-              Number of Assemblies
-            </label>
-            <NumericField
-              value={node.data.assemblyCount ?? 1}
-              onCommit={(n) => onChange(node.id, { assemblyCount: n })}
-              className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
-            />
-            <p className="text-[10px] text-gray-400 mt-1">Sub-parts required to produce one assembled unit.</p>
-          </div>
+        {/* Assembly: its settings, applied as you change them. UI only for now. */}
+        {nodeType === 'Assembly' && (
+          <AssemblyPanel
+            assembly={assemblySettings(node.data.assembly)}
+            products={products}
+            incoming={incomingStations(node.id, nodes, allEdges)}
+            lineProducts={Object.fromEntries(incomingStations(node.id, nodes, allEdges).map((from) => [from, Array.from(new Set(
+              allEdges
+                .filter((e) => e.target === node.id && nodes.some((n) => n.id === e.source && groupKey(n) === from))
+                .flatMap((e) => edgeProducts(e) ?? []),
+            ))]))}
+            onChange={(assembly) => onChange(node.id, { assembly })}
+          />
         )}
 
-        {/* Assembly type/table — quantity of each upstream station's output
-            needed per assembled unit. One row per station actually connected
-            into this node on the canvas; config-only, same as Assembly Count. */}
-        {isAssembly && (
-          <div>
-            <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
-              Assembly Table
-            </label>
-            {sourceBases.length > 0 ? (
+        {/* Dismantle: its settings, applied as you change them. */}
+        {nodeType === 'Dismantle' && (
+          <DismantlePanel
+            dismantle={dismantleSettings(node.data.dismantle)}
+            outgoing={outgoingStations(node.id, nodes, allEdges)}
+            onChange={(dismantle) => onChange(node.id, { dismantle })}
+          />
+        )}
+
+        {/* Dismantle / Assembly: the Workers who worked here in the last run
+            (from calling them — Assembly: once every part is there — until
+            the parts were separated / merged). */}
+        {(nodeType === 'Dismantle' || nodeType === 'Assembly') && (() => {
+          const station = node.data.savedName ?? stationKey(node)
+          const here = Object.values(workerResults).flatMap((w) =>
+            w.workplaces.filter((p) => p.station === station).map((p) => ({ name: w.name, ...p })))
+          if (here.length === 0) return null
+          return (
+            <div>
+              <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+                Workers (last run)
+              </label>
               <div className="space-y-1.5">
-                {sourceBases.map((src) => (
-                  <div key={src} className="flex items-center gap-2">
-                    <span className="text-[11px] text-gray-500 flex-1 truncate">{src}</span>
-                    <NumericField
-                      value={assemblyInputs[src] ?? 1}
-                      onCommit={(n) => onChange(node.id, { assemblyInputs: { ...assemblyInputs, [src]: n } })}
-                      className="h-7 w-16 text-xs rounded-lg border-gray-200 bg-gray-50 focus:bg-white"
-                    />
+                {here.map((p) => (
+                  <div key={p.name} className="flex items-center justify-between gap-2 bg-gray-50 border border-gray-100 rounded-lg px-2.5 py-2">
+                    <span className="text-xs font-semibold text-gray-700 truncate">{p.name}</span>
+                    <span className="text-xs text-gray-600 tabular-nums whitespace-nowrap">
+                      {p.worked_time.toFixed(1)} min · {p.jobs} job{p.jobs === 1 ? '' : 's'}
+                    </span>
                   </div>
                 ))}
               </div>
-            ) : (
-              <p className="text-[10px] text-gray-400">Connect one or more stations into this one to list them here.</p>
-            )}
-          </div>
-        )}
+            </div>
+          )
+        })()}
 
         {/* Parallel machines — capacity is derived from the number of "Name #N"
             boxes for this station, so it's controlled here instead of a raw
@@ -2103,7 +2161,9 @@ function PropertyEditor({
         {/* Exit Controller — which of this station's next stations (parallel
             copies or different stations) each finished job goes to.
             Cyclic/Random/Successor run in the simulation; Percentage is UI
-            only for now. */}
+            only for now. Route by product is saved as before ('Route By
+            Product' + 'Product Routes'), with Cyclic/Random as its Exit
+            Strategy — so a scenario saved with the old checkbox opens on it. */}
         {successorBases.length > 1 && (
           <div>
             <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
@@ -2115,24 +2175,36 @@ function PropertyEditor({
               </p>
             )}
             <select
-              value={exitStrategy}
-              onChange={(e) => onChange(node.id, { exitStrategy: e.target.value as StationNodeData['exitStrategy'] })}
+              value={node.data.routeByProduct ? 'product' : exitStrategy}
+              onChange={(e) => onChange(node.id, e.target.value === 'product'
+                ? {
+                    routeByProduct: true,
+                    // First time on: every product may go everywhere.
+                    productRoutes: node.data.productRoutes
+                      ?? Object.fromEntries(products.map((p) => [p, [...successorBases]])),
+                    // Route based is always Cyclic.
+                    exitStrategy: 'cyclic',
+                  }
+                : { routeByProduct: false, exitStrategy: e.target.value as StationNodeData['exitStrategy'] })}
               className="h-8 w-full text-sm rounded-lg border border-gray-200 bg-gray-50 focus:bg-white px-2"
             >
               <option value="cyclic">Cyclic</option>
               <option value="random">Random</option>
               <option value="successor">Successor</option>
               <option value="percentage">Percentage</option>
+              {(products.length > 1 || node.data.routeByProduct) && (
+                <option value="product">Route based</option>
+              )}
             </select>
 
-            {exitStrategy === 'cyclic' && (
+            {!node.data.routeByProduct && exitStrategy === 'cyclic' && (
               <p className="text-[10px] text-gray-400 mt-1.5">Sends jobs to each next station in turn.</p>
             )}
-            {exitStrategy === 'random' && (
+            {!node.data.routeByProduct && exitStrategy === 'random' && (
               <p className="text-[10px] text-gray-400 mt-1.5">Sends each job to a randomly chosen next station.</p>
             )}
 
-            {exitStrategy === 'successor' && (
+            {!node.data.routeByProduct && exitStrategy === 'successor' && (
               <div className="mt-2 space-y-1.5">
                 <label className="text-[10px] text-gray-400 block">Priority (1 = first choice)</label>
                 {successorBases.map((s, i) => (
@@ -2158,7 +2230,7 @@ function PropertyEditor({
               </div>
             )}
 
-            {exitStrategy === 'percentage' && (
+            {!node.data.routeByProduct && exitStrategy === 'percentage' && (
               <div className="mt-2 space-y-1.5">
                 {successorBases.map((s) => (
                   <div key={s} className="flex items-center gap-2">
@@ -2178,8 +2250,218 @@ function PropertyEditor({
                 </p>
               </div>
             )}
+
+            {/* Route by product: the ticks say which next stations each
+                product may go to; the choice below picks among a product's
+                ticked ones (Cyclic: its own strict turn), and a job waits
+                for the station it was given. */}
+            {node.data.routeByProduct && (() => {
+              const routes = node.data.productRoutes ?? {}
+              const allowed = (p: string) => (routes[p] ?? []).filter((s) => successorBases.includes(s))
+              const toggle = (p: string, s: string) => {
+                const now = allowed(p)
+                onChange(node.id, {
+                  productRoutes: { ...routes, [p]: now.includes(s) ? now.filter((x) => x !== s) : [...now, s] },
+                })
+              }
+              const missing = products.filter((p) => allowed(p).length === 0)
+              return (
+                <div className="mt-2">
+                  <div className="overflow-x-auto">
+                    <table className="text-[11px] border border-gray-200 rounded-lg">
+                      <thead>
+                        <tr className="bg-gray-50 text-gray-500">
+                          <th className="px-1.5 py-1 text-left font-semibold"></th>
+                          {successorBases.map((s) => (
+                            <th key={s} className="px-1.5 py-1 font-semibold whitespace-nowrap">{s}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {products.map((p) => (
+                          <tr key={p} className="border-t border-gray-100">
+                            <td className={`px-1.5 py-1 whitespace-nowrap ${allowed(p).length === 0 ? 'text-amber-600 font-semibold' : 'text-gray-700'}`}>{p}</td>
+                            {successorBases.map((s) => (
+                              <td key={s} className="px-1.5 py-1 text-center">
+                                <input
+                                  type="checkbox"
+                                  checked={allowed(p).includes(s)}
+                                  onChange={() => toggle(p, s)}
+                                />
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {missing.length > 0 && (
+                    <p className="text-[10px] text-amber-600 mt-1.5">
+                      Tick at least one station for {missing.join(', ')}.
+                    </p>
+                  )}
+                  <p className="text-[10px] text-gray-400 mt-1.5">
+                    Each product only goes to its ticked stations, strictly in turn from the first (#1, #2, #1, …) — a job waits for the one whose turn it is, never skipping to another.
+                  </p>
+                </div>
+              )
+            })()}
           </div>
         )}
+
+        {/* Start: parts delivered / End: parts collected (last run, after
+            the warm-up) — the total and per product. An End collects what
+            leaves the stations whose lines go into it (for the products on
+            those lines); a Dismantle's pieces count one by one. */}
+        {(nodeType === 'Source' || nodeType === 'Drain') && partsFlow && (() => {
+          const isStart = nodeType === 'Source'
+          const byProduct: Record<string, number> = {}
+          const add = (counts: Record<string, number> | undefined) => {
+            for (const [p, n] of Object.entries(counts ?? {})) byProduct[p] = (byProduct[p] ?? 0) + n
+          }
+          if (isStart) {
+            const key = node.data.savedName ?? stationKey(node)
+            const starts = nodes.filter((n) => inferStationType(n.data.label, n.data.stationType) === 'Source')
+            // A scenario whose Start isn't a saved station: the only Start delivers all.
+            if (partsFlow.delivered[key]) add(partsFlow.delivered[key])
+            else if (starts.length === 1) Object.values(partsFlow.delivered).forEach((c) => add(c))
+          } else {
+            // Each line in: the parts whose route is a product of that line
+            // (every product for a line not tagged), by the part's own name.
+            for (const e of allEdges.filter((e) => e.target === node.id)) {
+              const src = nodes.find((n) => n.id === e.source)
+              if (!src) continue
+              const lineProducts = edgeProducts(e)
+              for (const [route, names] of Object.entries(partsFlow.collected[src.data.savedName ?? stationKey(src)] ?? {})) {
+                if (!lineProducts || lineProducts.includes(route)) add(names)
+              }
+            }
+          }
+          const count = (n: number) => (Number.isInteger(n) ? String(n) : n.toFixed(1))
+          const total = Object.values(byProduct).reduce((a, b) => a + b, 0)
+          return (
+            <div>
+              <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+                Statistical Analysis
+              </label>
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-semibold text-gray-700">{isStart ? 'Parts delivered' : 'Parts collected'}</span>
+                <span className="font-bold text-gray-900 tabular-nums">{count(total)}</span>
+              </div>
+              <div className="mt-1.5 space-y-1">
+                {Object.entries(byProduct).sort(([a], [b]) => a.localeCompare(b)).map(([p, n]) => (
+                  <div key={p} className="flex items-center justify-between text-xs">
+                    <span className="text-gray-600 truncate">{p}</span>
+                    <span className="font-semibold text-gray-800 tabular-nums">{count(n)}</span>
+                  </div>
+                ))}
+              </div>
+              <p className="text-[10px] text-gray-400 mt-1.5">Last run, after the warm-up.</p>
+            </div>
+          )
+        })()}
+
+        {/* Buffer: statistical analysis (last run) — the share of its
+            operating time it was Empty, Occupied (parts, room for more) or
+            Full; the three add up to 100%. */}
+        {nodeType === 'Buffer' && (() => {
+          const st = bufferStates[node.data.savedName ?? stationKey(node)]
+          if (!st) return null
+          const rows = [
+            { label: 'Empty', value: st.empty, color: '#cbd5e1' },
+            { label: 'Occupied', value: st.occupied, color: '#3b82f6' },
+            { label: 'Full', value: st.full, color: '#ef4444' },
+          ]
+          return (
+            <div>
+              <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+                Statistical Analysis
+              </label>
+              <div className="flex h-2.5 w-full overflow-hidden rounded-full bg-gray-100">
+                {rows.map((r) => r.value > 0 && (
+                  <div key={r.label} style={{ width: `${r.value}%`, background: r.color }} title={`${r.label} ${r.value.toFixed(2)}%`} />
+                ))}
+              </div>
+              <div className="mt-2 space-y-1">
+                {rows.map((r) => (
+                  <div key={r.label} className="flex items-center justify-between text-xs">
+                    <span className="flex items-center gap-1.5 text-gray-600">
+                      <span className="h-2 w-2 rounded-sm" style={{ background: r.color }} />
+                      {r.label}
+                    </span>
+                    <span className="font-semibold text-gray-800 tabular-nums">{r.value.toFixed(2)}%</span>
+                  </div>
+                ))}
+              </div>
+              <p className="text-[10px] text-gray-400 mt-1.5">
+                Last run · of {st.operating_time.toFixed(0)} min operating time (shift time minus breaks).
+              </p>
+            </div>
+          )
+        })()}
+
+        {/* Statistical analysis (last run): the share of this station's
+            operating time — shift time minus breaks and PM — it spent in
+            each state; the five add up to 100%. Working stations only. */}
+        {!['Source', 'Drain', 'Buffer', 'Connector', 'Worker', 'Workplace', 'Worker Controller'].includes(nodeType) && (() => {
+          const st = stationStates[node.data.savedName ?? stationKey(node)]
+          if (!st) return null
+          const rows = [
+            { label: 'Working', value: st.working, color: '#22c55e' },
+            { label: 'Free', value: st.free, color: '#cbd5e1' },
+            { label: 'Setup', value: st.setup, color: '#8b5cf6' },
+            { label: 'Blocked', value: st.blocked, color: '#f59e0b' },
+            { label: 'Failed', value: st.failed, color: '#ef4444' },
+          ]
+          return (
+            <div>
+              <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-1.5">
+                Statistical Analysis
+              </label>
+              <div className="flex h-2.5 w-full overflow-hidden rounded-full bg-gray-100">
+                {rows.map((r) => r.value > 0 && (
+                  <div key={r.label} style={{ width: `${r.value}%`, background: r.color }} title={`${r.label} ${r.value.toFixed(2)}%`} />
+                ))}
+              </div>
+              <div className="mt-2 space-y-1">
+                {rows.map((r) => (
+                  <div key={r.label} className="flex items-center justify-between text-xs">
+                    <span className="flex items-center gap-1.5 text-gray-600">
+                      <span className="h-2 w-2 rounded-sm" style={{ background: r.color }} />
+                      {r.label}
+                    </span>
+                    <span className="font-semibold text-gray-800 tabular-nums">{r.value.toFixed(2)}%</span>
+                  </div>
+                ))}
+              </div>
+              <p className="text-[10px] text-gray-400 mt-1.5">
+                Last run · of {st.operating_time.toFixed(0)} min operating time (shift time minus breaks and PM).
+              </p>
+              {/* Parts: on the machine at the end of the run (not the queue in
+                  front); completed and scrapped after the warm-up; Dismantle:
+                  the pieces it gave out. */}
+              {st.completed_parts !== undefined && (() => {
+                const count = (n: number) => (Number.isInteger(n) ? String(n) : n.toFixed(1))
+                const parts = [
+                  { label: 'Current parts', value: st.current_parts ?? 0 },
+                  { label: 'Completed parts', value: st.completed_parts ?? 0 },
+                  { label: 'Scrap count', value: st.scrapped_parts ?? 0 },
+                  ...(st.output_components != null ? [{ label: 'Output components', value: st.output_components }] : []),
+                ]
+                return (
+                  <div className="mt-2.5 space-y-1 border-t border-gray-100 pt-2">
+                    {parts.map((p) => (
+                      <div key={p.label} className="flex items-center justify-between text-xs">
+                        <span className="text-gray-600">{p.label}</span>
+                        <span className="font-semibold text-gray-800 tabular-nums">{count(p.value)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )
+              })()}
+            </div>
+          )
+        })()}
       </div>
 
       {/* Save station button — applies the station's values and closes the panel.
@@ -2477,8 +2759,10 @@ function buildEditableGraph(
             exitStrategy: cfg?.['Exit Strategy'],
             exitPercentages: cfg?.['Exit Percentages'],
             exitPriorities: cfg?.['Exit Priorities'],
-            assemblyCount: cfg?.['Assembly Count'],
-            assemblyInputs: cfg?.['Assembly Inputs'],
+            routeByProduct: cfg?.['Route By Product'],
+            productRoutes: cfg?.['Product Routes'],
+            assembly: cfg?.['Assembly'],
+            dismantle: cfg?.['Dismantle'],
             setupTime: cfg?.['Setup time'],
             repairTime: cfg?.['Repair Time'],
             failurePolicy: cfg?.['Failure Policy'],
@@ -2620,6 +2904,389 @@ function buildEditableGraph(
   return { nodes, edges }
 }
 
+// ─── The saved drawing (canvas_layout) ───────────────────────────────────────
+// One drawing for the whole scenario. Each flow line remembers the products
+// whose route uses it, and the product picked on the Canvas is highlighted.
+// A line with no products yet (drawn, not saved) is the picked product's.
+// Worker / Worker Controller / Workplace lines are staffing wiring, never
+// part of a route. Routes stay in processflow_data, which the engine reads.
+
+type FlowStep = ScenarioCreate['processflow_data'][string][number]
+
+const WIRING_TYPES = ['Worker', 'Worker Controller', 'Workplace']
+
+function isWiringNode(n: Node<StationNodeData>): boolean {
+  return WIRING_TYPES.includes(inferStationType(n.data.label, n.data.stationType))
+}
+
+function edgeProducts(e: Edge): string[] | undefined {
+  return (e.data as { products?: string[] } | undefined)?.products
+}
+
+function withProducts(e: Edge, products: string[]): Edge {
+  return { ...e, data: { ...(e.data ?? {}), products } }
+}
+
+// Whether a flow line is part of `product`'s route, `shown` being the
+// product picked on the Canvas (a new line, with no products yet, is its; a
+// line with an empty list is used by no product).
+function lineIsFor(e: Edge, product: string | null, shown: string | null): boolean {
+  const ps = edgeProducts(e)
+  return ps !== undefined ? product !== null && ps.includes(product) : product === shown
+}
+
+// A line between two boxes of the flow (not staffing wiring).
+function isFlowEdge(e: Edge, byId: Map<string, Node<StationNodeData>>): boolean {
+  const a = byId.get(e.source)
+  const b = byId.get(e.target)
+  return !!a && !!b && !isWiringNode(a) && !isWiringNode(b)
+}
+
+// A box's id in the saved drawing is its kind plus a number: STN-3, SRC-1, ...
+const BOX_ID_PREFIX: Record<string, string> = {
+  Source: 'SRC', Drain: 'DRN', Station: 'STN', Assembly: 'ASM', Dismantle: 'DSM',
+  Buffer: 'BUF', Conveyor: 'CNV', Connector: 'CON', Robot: 'ROB',
+  Worker: 'WRK', 'Worker Controller': 'WCT', Workplace: 'WPL',
+}
+
+function boxIdPrefix(n: Node<StationNodeData>): string {
+  return BOX_ID_PREFIX[inferStationType(n.data.label, n.data.stationType)] ?? 'OBJ'
+}
+
+// One product's part of the drawing: its lines and the boxes on them, plus
+// the staffing wiring. For the picked product also boxes not joined to any
+// line yet (a box just dropped in is its, as before).
+function productGraph(
+  nodes: Node<StationNodeData>[], edges: Edge[], product: string, shown: string,
+): { nodes: Node<StationNodeData>[]; edges: Edge[] } {
+  const byId = new Map(nodes.map((n) => [n.id, n]))
+  const flow = edges.filter((e) => isFlowEdge(e, byId))
+  const used = new Set(flow.filter((e) => lineIsFor(e, product, shown)).flatMap((e) => [e.source, e.target]))
+  const wired = new Set(flow.flatMap((e) => [e.source, e.target]))
+  const kept = nodes.filter((n) => isWiringNode(n) || used.has(n.id) || (product === shown && !wired.has(n.id)))
+  const ids = new Set(kept.map((n) => n.id))
+  return {
+    nodes: kept,
+    edges: edges.filter((e) => ids.has(e.source) && ids.has(e.target)
+      && (!isFlowEdge(e, byId) || lineIsFor(e, product, shown))),
+  }
+}
+
+// A route compared by shape: the station pairs it goes along, and the
+// stations it starts and ends at. Same shape = same route.
+function routeShape(pairs: Set<string>, first: Set<string>, last: Set<string>): string {
+  return JSON.stringify([Array.from(pairs).sort(), Array.from(first).sort(), Array.from(last).sort()])
+}
+const EMPTY_ROUTE_SIG = routeShape(new Set(), new Set(), new Set())
+
+function routeSig(steps: FlowStep[]): string {
+  const cols = stepColumns(steps).map((col) => col.flatMap((st) => stepResourceOptions(st.resource)))
+  const pairs = new Set<string>()
+  for (let i = 0; i + 1 < cols.length; i++) {
+    for (const a of cols[i]) for (const b of cols[i + 1]) pairs.add(`${a}>${b}`)
+  }
+  return routeShape(pairs, new Set(cols[0] ?? []), new Set(cols[cols.length - 1] ?? []))
+}
+
+function graphRouteSig(
+  nodes: Node<StationNodeData>[], edges: Edge[], product: string, shown: string | null,
+  nameOf: (n: Node<StationNodeData>) => string,
+): string {
+  const byId = new Map(nodes.map((n) => [n.id, n]))
+  const typeOf = (n: Node<StationNodeData>) => inferStationType(n.data.label, n.data.stationType)
+  const pairs = new Set<string>()
+  const first = new Set<string>()
+  const last = new Set<string>()
+  for (const e of edges) {
+    if (!isFlowEdge(e, byId) || !lineIsFor(e, product, shown)) continue
+    const a = byId.get(e.source)!
+    const b = byId.get(e.target)!
+    const fromStart = typeOf(a) === 'Source'
+    const toEnd = typeOf(b) === 'Drain'
+    if (fromStart && !toEnd) first.add(nameOf(b))
+    else if (toEnd && !fromStart) last.add(nameOf(a))
+    else if (!fromStart && !toEnd) pairs.add(`${nameOf(a)}>${nameOf(b)}`)
+  }
+  return routeShape(pairs, first, last)
+}
+
+// Each product's lines on the drawing, by shape.
+function linesByProduct(products: string[], nodes: Node<StationNodeData>[], edges: Edge[]): Record<string, string> {
+  return Object.fromEntries(products.map((p) => [p, graphRouteSig(nodes, edges, p, null, (n) => n.data.savedName ?? stationKey(n))]))
+}
+
+// A route from a drawing: walk it from where it starts into a list of
+// steps, one per station, in flow order (splits and parallel machines
+// share a "branch").
+function routeFromGraph(
+  nodes: Node<StationNodeData>[], edges: Edge[], stepDuration: (n: Node<StationNodeData>) => number,
+): FlowStep[] {
+  const hasIncoming = new Set(edges.map((e) => e.target))
+  const entryNodes = nodes.filter((n) => !hasIncoming.has(n.id))
+  const steps: FlowStep[] = []
+  const seenStations = new Set<string>()
+  // Edges into a Worker, Worker Controller, or Workplace exist ONLY for
+  // the pool-wiring pass above (Station -> Workplace -> Worker Controller,
+  // Worker -> Worker Controller) — they are never a real "next step in
+  // the job's path," so this walk must not follow them. Without this
+  // filter, a Station wired to a Workplace would have the Workplace (and
+  // whatever it's wired to in turn) spliced into the middle of the job's
+  // actual flow, scrambling downstream routing.
+  const isPoolWiringTarget = (nodeId: string): boolean => {
+    const target = nodes.find((nn) => nn.id === nodeId)
+    if (!target) return false
+    const t = inferStationType(target.data.label, target.data.stationType)
+    return t === 'Worker' || t === 'Worker Controller' || t === 'Workplace'
+  }
+
+  // The stations of each split share a "branch" number on their steps —
+  // the engine then sends each job to only ONE of them (see
+  // _branch_slots in sim_core.py). They are pushed back to back below,
+  // since the walk reaches all of a split's stations in the same round.
+  // A parallel group's machines are one stop the same way (each job goes
+  // to one machine), so a group outside any split gets a number too.
+  const branchOf: Record<string, number> = {}
+  const splits = canvasSplits(nodes, edges)
+  splits.forEach((split, i) => {
+    for (const b of split.bases) branchOf[b] ??= i + 1
+  })
+  let nextBranch = splits.length + 1
+  for (const n of nodes) {
+    const g = n.data.parallelGroup
+    if (g && branchOf[g] === undefined && nodes.filter((o) => o.data.parallelGroup === g).length > 1) {
+      branchOf[g] = nextBranch++
+    }
+  }
+
+  let frontier = entryNodes
+  const visitedNodeIds = new Set<string>()
+  while (frontier.length > 0) {
+    const next: Node<StationNodeData>[] = []
+    for (const n of frontier) {
+      if (visitedNodeIds.has(n.id)) continue
+      visitedNodeIds.add(n.id)
+      const base = stationKey(n)
+      if (seenStations.has(base)) continue
+      seenStations.add(base)
+
+      const outgoing = edges.filter((e) => e.source === n.id && !isPoolWiringTarget(e.target))
+      const destNodes = outgoing
+        .map((e) => nodes.find((nn) => nn.id === e.target))
+        .filter((nn): nn is Node<StationNodeData> => !!nn)
+
+      // Source/Drain are entry/exit markers, not a step in the job's
+      // route — a saved scenario with a "Start"/"End" step in
+      // processflow_data shows a misleading editable column in
+      // ScenarioManager's Process Flow tab even at duration 0 (the
+      // column itself implies it's a real station). Skip pushing a step
+      // for them, but still walk through to whatever they connect to —
+      // Source has no incoming edge (it's always an entryNode) and Drain
+      // has no outgoing edges, so neither skip affects the rest of the
+      // walk.
+      const nodeType = inferStationType(n.data.label, n.data.stationType)
+      if (nodeType === 'Source' || nodeType === 'Drain') {
+        for (const d of destNodes) next.push(d)
+        continue
+      }
+
+      steps.push({
+        operation: `${base}_op`, resource: base, duration: stepDuration(n),
+        ...(branchOf[groupKey(n)] !== undefined ? { branch: branchOf[groupKey(n)] } : {}),
+      })
+      for (const d of destNodes) next.push(d)
+    }
+    frontier = next
+  }
+  return steps
+}
+
+// A station's box settings, read from its saved settings the same way a
+// route's boxes are.
+function stationBoxData(name: string, stationsData: Record<string, StationConfig>, duration: number): StationNodeData {
+  const { nodes } = buildEditableGraph(
+    { box: [{ operation: name, resource: name, duration }] }, 'box', { [name]: stationsData[name] },
+  )
+  return nodes[0].data
+}
+
+// The saved drawing, back as boxes and lines. Settings come from the saved
+// stations (the Scenario page edits those); a station deleted there loses
+// its box. A product whose route was changed on the Scenario page since the
+// drawing was saved gets its lines drawn again from the route (a station new
+// to the drawing is placed next to the one before it).
+function graphFromLayout(
+  layout: CanvasLayout,
+  processflow: Record<string, FlowStep[]>,
+  stationsData: Record<string, StationConfig>,
+): { nodes: Node<StationNodeData>[]; edges: Edge[] } {
+  const products = Object.keys(processflow)
+  const nodes: Node<StationNodeData>[] = []
+  for (const box of layout.boxes) {
+    // An older station of N machines is saved under its own name, its boxes as "Name #k".
+    const key = stationsData[box.name] ? box.name : baseStationName(box.name)
+    const cfg = stationsData[key]
+    if (!cfg && !['Source', 'Drain', ...WIRING_TYPES].includes(box.type)) continue
+    const data: StationNodeData = cfg
+      ? { ...box.data, ...stationBoxData(key, stationsData, box.data?.cycleTime ?? 0), label: box.name, savedName: key, capacity: 1, boxId: box.id }
+      : { capacity: 1, cycleTime: 0, operators: 0, shiftsPerDay: [1], ...box.data, label: box.name, boxId: box.id }
+    nodes.push({ id: box.id, type: 'station', position: { x: box.x, y: box.y }, data })
+  }
+  const ids = new Set(nodes.map((n) => n.id))
+  let edges: Edge[] = []
+  for (const line of layout.lines) {
+    if (!ids.has(line.from) || !ids.has(line.to)) continue
+    // Lines of products no longer in the scenario go.
+    const kept = line.products?.filter((p) => products.includes(p))
+    if (kept && kept.length === 0 && line.products!.length > 0) continue
+    edges.push({
+      id: `e_${line.from}__${line.to}`, source: line.from, target: line.to,
+      ...(line.label ? { label: line.label } : {}),
+      ...(kept ? { data: { products: kept } } : {}),
+    })
+  }
+
+  const nameOf = (n: Node<StationNodeData>) => n.data.savedName ?? stationKey(n)
+  const typeOf = (n: Node<StationNodeData>) => inferStationType(n.data.label, n.data.stationType)
+  for (const p of products) {
+    const steps = processflow[p] ?? []
+    const savedShape = layout.routes?.[p]
+    if (savedShape !== undefined
+      ? savedShape === routeSig(steps)
+      : graphRouteSig(nodes, edges, p, null, nameOf) === routeSig(steps)) continue
+    // Changed on the Scenario page: take its lines off, draw them from its route.
+    edges = edges.flatMap((e) => {
+      const ps = edgeProducts(e)
+      if (!ps || !ps.includes(p)) return [e]
+      const rest = ps.filter((x) => x !== p)
+      return rest.length > 0 ? [withProducts(e, rest)] : []
+    })
+    const cols = stepColumns(steps).map((col) => col.flatMap((st) => stepResourceOptions(st.resource)))
+    if (cols.length === 0) continue
+    const link = (a: Node<StationNodeData>, b: Node<StationNodeData>) => {
+      const existing = edges.find((e) => e.source === a.id && e.target === b.id)
+      if (!existing) {
+        edges.push({ id: `e_${a.id}__${b.id}`, source: a.id, target: b.id, data: { products: [p] } })
+      } else if (!(edgeProducts(existing) ?? []).includes(p)) {
+        edges = edges.map((e) => (e === existing ? withProducts(e, [...(edgeProducts(e) ?? []), p]) : e))
+      }
+    }
+    const boxesOf = (name: string, near?: Node<StationNodeData>): Node<StationNodeData>[] => {
+      const found = nodes.filter((n) => !isWiringNode(n) && nameOf(n) === name)
+      if (found.length > 0 || !stationsData[name]) return found
+      const box: Node<StationNodeData> = {
+        id: `added_${nodes.length}`, type: 'station',
+        position: near ? { x: near.position.x + 130, y: near.position.y + 170 } : { x: 40, y: 100 },
+        data: { ...stationBoxData(name, stationsData, 0), label: name, savedName: name, capacity: 1 },
+      }
+      nodes.push(box)
+      return [box]
+    }
+    const firstBoxes = boxesOf(cols[0][0])
+    const start = nodes.find((n) => typeOf(n) === 'Source' && edges.some((e) => e.source === n.id && firstBoxes.some((b) => b.id === e.target)))
+      ?? nodes.find((n) => typeOf(n) === 'Source')
+    let prev: Node<StationNodeData>[] = start ? [start] : []
+    for (const col of cols) {
+      const here = col.flatMap((name) => boxesOf(name, prev[0]))
+      for (const a of prev) for (const b of here) link(a, b)
+      prev = here
+    }
+    const end = nodes.find((n) => typeOf(n) === 'Drain' && edges.some((e) => e.target === n.id && prev.some((b) => b.id === e.source)))
+      ?? nodes.find((n) => typeOf(n) === 'Drain')
+    if (end) for (const a of prev) link(a, end)
+  }
+  return { nodes, edges }
+}
+
+// A scenario with no saved drawing (saved before drawings were kept, or
+// imported): every product's route drawn as one picture — each station
+// once, a line per step tagged with the products going along it, laid out
+// left to right by how far along the flow each station is.
+function wholeScenarioGraph(
+  processflow: Record<string, FlowStep[]>,
+  stationsData: Record<string, StationConfig>,
+): { nodes: Node<StationNodeData>[]; edges: Edge[] } {
+  const nodes: Node<StationNodeData>[] = []
+  let edges: Edge[] = []
+  const unionId = new Map<string, string>()
+  const typeOf = (n: Node<StationNodeData>) => inferStationType(n.data.label, n.data.stationType)
+  const link = (source: string, target: string, product?: string) => {
+    const existing = edges.find((e) => e.source === source && e.target === target)
+    if (!existing) {
+      edges.push({ id: `e_${source}__${target}`, source, target, ...(product ? { data: { products: [product] } } : {}) })
+    } else if (product && !(edgeProducts(existing) ?? []).includes(product)) {
+      edges = edges.map((e) => (e === existing ? withProducts(e, [...(edgeProducts(e) ?? []), product]) : e))
+    }
+  }
+  // A station's column: the furthest along any route has it first.
+  const column = new Map<string, number>()
+  const sourceName = Object.keys(stationsData).find((k) => stationsData[k]?.['Station Type'] === 'Source') ?? 'Start'
+  const drainName = Object.keys(stationsData).find((k) => stationsData[k]?.['Station Type'] === 'Drain') ?? 'End'
+  const start: Node<StationNodeData> = {
+    id: 'start', type: 'station', position: { x: 0, y: 0 },
+    data: { label: sourceName, stationType: 'Source', capacity: 1, cycleTime: 0, operators: 0, shiftsPerDay: [1] },
+  }
+  const end: Node<StationNodeData> = {
+    id: 'end', type: 'station', position: { x: 0, y: 0 },
+    data: { label: drainName, stationType: 'Drain', capacity: 1, cycleTime: 0, operators: 0, shiftsPerDay: [1] },
+  }
+  for (const p of Object.keys(processflow)) {
+    const g = buildEditableGraph(processflow, p, stationsData)
+    if (g.nodes.length === 0) continue
+    const local = new Map<string, string>()
+    for (const n of g.nodes) {
+      const key = `${typeOf(n)}|${n.data.label}`
+      if (!unionId.has(key)) {
+        unionId.set(key, n.id)
+        nodes.push(n)
+      }
+      local.set(n.id, unionId.get(key)!)
+    }
+    const gById = new Map(g.nodes.map((n) => [n.id, n]))
+    const flow = g.edges.filter((e) => isFlowEdge(e, gById))
+    // Where each station first comes in this route (its column).
+    const firstCol = new Map<string, number>()
+    for (const n of g.nodes) {
+      const col = Number(n.id.match(/^st_(\d+)_/)?.[1] ?? NaN)
+      const at = local.get(n.id)!
+      if (Number.isFinite(col) && !(firstCol.get(at)! <= col)) firstCol.set(at, col)
+    }
+    for (const e of g.edges) link(local.get(e.source)!, local.get(e.target)!, isFlowEdge(e, gById) ? p : undefined)
+    for (const [at, col] of firstCol) column.set(at, Math.max(column.get(at) ?? 0, col + 1))
+    // Its Start and End — unless the route already has its own.
+    for (const n of g.nodes.filter((x) => !isWiringNode(x))) {
+      const t = typeOf(n)
+      if (t !== 'Source' && !flow.some((e) => e.target === n.id)) link(start.id, local.get(n.id)!, p)
+      if (t !== 'Drain' && !flow.some((e) => e.source === n.id)) link(local.get(n.id)!, end.id, p)
+    }
+  }
+  if (nodes.length === 0) return { nodes, edges }
+  const taken = new Set(nodes.map((n) => n.data.label))
+  for (const box of [start, end]) {
+    if (!edges.some((e) => e.source === box.id || e.target === box.id)) continue
+    for (let k = 2; taken.has(box.data.label); k++) box.data = { ...box.data, label: `${box.id === 'start' ? sourceName : drainName} ${k}` }
+    taken.add(box.data.label)
+    if (box.id === 'start') nodes.unshift(box)
+    else nodes.push(box)
+  }
+  column.set(start.id, 0)
+  column.set(end.id, Math.max(0, ...column.values()) + 1)
+
+  // Each column's boxes stacked.
+  const rank = new Map(nodes.filter((n) => !isWiringNode(n) && column.has(n.id)).map((n) => [n.id, column.get(n.id)!]))
+  const ROW_GAP = 190
+  const columns = new Map<number, Node<StationNodeData>[]>()
+  for (const n of nodes) {
+    if (!rank.has(n.id)) continue
+    const col = rank.get(n.id)!
+    columns.set(col, [...(columns.get(col) ?? []), n])
+  }
+  const placed = new Map<string, { x: number; y: number }>()
+  for (const [col, boxes] of columns) {
+    boxes.forEach((n, i) => placed.set(n.id, { x: col * EDITABLE_COL_GAP + 40, y: 100 - ((boxes.length - 1) * ROW_GAP) / 2 + i * ROW_GAP }))
+  }
+  return { nodes: nodes.map((n) => (placed.has(n.id) ? { ...n, position: placed.get(n.id)! } : n)), edges }
+}
+
 // Station settings the Canvas save writes itself (from the boxes and their
 // wiring). Everything else in a station's saved settings is kept as is.
 const CANVAS_STATION_KEYS = [
@@ -2628,8 +3295,10 @@ const CANVAS_STATION_KEYS = [
   'MU Strategy', 'MU Priorities', 'MU Percentages',
   'Conveyor Speed', 'Conveyor Length', 'Conveyor Width', 'Conveyor Height', 'Conveyor Capacity',
   'Conveyor Sensor Length', 'Conveyor Sensor Position',
-  'Exit Strategy', 'Exit Percentages', 'Exit Priorities',
-  'Assembly Count', 'Assembly Inputs', 'Setup time',
+  'Exit Strategy', 'Exit Percentages', 'Exit Priorities', 'Route By Product', 'Product Routes',
+  // 'Assembly Count' / 'Assembly Inputs': the old assembly fields, now
+  // gone — listed so a save clears them.
+  'Assembly', 'Assembly Count', 'Assembly Inputs', 'Dismantle', 'Setup time',
   'Buffer Capacity', 'Buffer Unlimited', 'Buffer Config Mode', 'Buffer X', 'Buffer Y', 'Buffer Z', 'Buffer Discipline',
   'Repair Time', 'Failure Policy',
   // Worker Controller wiring — rebuilt from the edges on every save.
@@ -2641,63 +3310,6 @@ const CANVAS_STATION_KEYS = [
 // here since ensureSourceAndDrain positions its inserted boxes relative to it.
 const EDITABLE_COL_GAP = 260
 
-/**
- * Ensures a Build-mode graph starts with a Source and ends with a Drain —
- * the Tecnomatix convention every line should follow (see Object Palette).
- * Purely a layout/graph nicety: a Source/Drain has no special simulation
- * behaviour today (same generic station fields as everything else), so this
- * only runs when loading a scenario that doesn't already have them, never
- * overriding one the user placed deliberately.
- *
- * Entry = nodes with no incoming edge; Exit = nodes with no outgoing edge.
- * Insert only when NONE of the current entry/exit nodes are already typed
- * Source/Drain — a graph that already starts/ends correctly is left alone.
- */
-function ensureSourceAndDrain(
-  nodes: Node<StationNodeData>[],
-  edges: Edge[],
-  nextId: () => number,
-): { nodes: Node<StationNodeData>[]; edges: Edge[] } {
-  if (nodes.length === 0) return { nodes, edges }
-
-  const hasIncoming = new Set(edges.map((e) => e.target))
-  const hasOutgoing = new Set(edges.map((e) => e.source))
-  const entryNodes = nodes.filter((n) => !hasIncoming.has(n.id))
-  const exitNodes = nodes.filter((n) => !hasOutgoing.has(n.id))
-  const isType = (n: Node<StationNodeData>, type: string) =>
-    inferStationType(n.data.label, n.data.stationType) === type
-
-  const needsSource = !entryNodes.some((n) => isType(n, 'Source'))
-  const needsDrain = !exitNodes.some((n) => isType(n, 'Drain'))
-  if (!needsSource && !needsDrain) return { nodes, edges }
-
-  const nextNodes = [...nodes]
-  const nextEdges = [...edges]
-  const minX = Math.min(...nodes.map((n) => n.position.x))
-  const maxX = Math.max(...nodes.map((n) => n.position.x))
-  const avgY = nodes.reduce((sum, n) => sum + n.position.y, 0) / nodes.length
-
-  if (needsSource) {
-    const id = `station_${nextId()}`
-    nextNodes.push({
-      id, type: 'station',
-      position: { x: minX - EDITABLE_COL_GAP, y: avgY },
-      data: { label: 'Start', stationType: 'Source', capacity: 1, cycleTime: 0, operators: 0, shiftsPerDay: [1] },
-    })
-    for (const n of entryNodes) nextEdges.push({ id: `e_${id}__${n.id}`, source: id, target: n.id })
-  }
-  if (needsDrain) {
-    const id = `station_${nextId()}`
-    nextNodes.push({
-      id, type: 'station',
-      position: { x: maxX + EDITABLE_COL_GAP, y: avgY },
-      data: { label: 'End', stationType: 'Drain', capacity: 1, cycleTime: 0, operators: 0, shiftsPerDay: [1] },
-    })
-    for (const n of exitNodes) nextEdges.push({ id: `e_${n.id}__${id}`, source: n.id, target: id })
-  }
-
-  return { nodes: nextNodes, edges: nextEdges }
-}
 
 /** A conveyor's transport time (min) = Length (m) / Speed (m/min); undefined until both are > 0. */
 function conveyorTransportTime(data: StationNodeData): number | undefined {
@@ -2805,6 +3417,650 @@ function ConveyorSensorDialog({ conveyorName, conveyorLength, initial, onApply, 
 interface MuDialogRow extends MuRow {
   orig?: string
   copyFrom?: string
+  // The Start that releases it (its station name); one Start's products are
+  // kept in that Start's own MU table.
+  start?: string
+}
+
+// Assembly station settings — Tecnomatix's AssemblyStation Attributes tab,
+// shown in the station panel; each change applies at once, like the panel's
+// other fields. UI only for now: saved with the scenario, not read by the
+// simulation.
+const DEFAULT_ASSEMBLY: AssemblyConfig = {
+  table: 'none', mainMuFromPredecessor: 1, mainMuDefault: true,
+  mode: 'delete_mus', exitingMu: 'main_mu',
+  predecessorRows: [], muTypeRows: [],
+}
+
+const ASSEMBLY_TABLE_KINDS: { value: AssemblyTableKind; label: string }[] = [
+  { value: 'none', label: 'None' },
+  { value: 'predecessors', label: 'Predecessors' },
+  { value: 'mu_types', label: 'Flow Entity(FE)' },
+]
+
+// A box's assembly settings with every field set. A type no longer offered
+// (Depends on / Fill-up Main MU) reads as None; Default is ticked when the
+// main part is predecessor 1.
+function assemblySettings(saved?: AssemblyConfig): AssemblyConfig {
+  const a = { ...DEFAULT_ASSEMBLY, ...saved }
+  return {
+    ...a,
+    mainMuDefault: saved?.mainMuDefault ?? a.mainMuFromPredecessor === 1,
+    table: ASSEMBLY_TABLE_KINDS.some((k) => k.value === a.table) ? a.table : 'none',
+  }
+}
+
+// The stations whose lines come into a box, in the order they were
+// connected (P1 = the first line connected; delete one and the later ones
+// move up) — staffing wiring left out. For an Assembly: its incoming lines.
+function incomingStations(nodeId: string, nodes: Node<StationNodeData>[], edges: Edge[]): string[] {
+  return Array.from(new Set(
+    edges
+      .filter((e) => e.target === nodeId)
+      .map((e) => nodes.find((n) => n.id === e.source))
+      .filter((n): n is Node<StationNodeData> => !!n && !isWiringNode(n))
+      .map(groupKey),
+  ))
+}
+
+// The stations a box's lines go to, in the order they were connected
+// (staffing wiring left out). For a Dismantle: its successors 1, 2, ...
+function outgoingStations(nodeId: string, nodes: Node<StationNodeData>[], edges: Edge[]): string[] {
+  return Array.from(new Set(
+    edges
+      .filter((e) => e.source === nodeId)
+      .map((e) => nodes.find((n) => n.id === e.target))
+      .filter((n): n is Node<StationNodeData> => !!n && !isWiringNode(n))
+      .map(groupKey),
+  ))
+}
+
+// Each line's No. into an Assembly: Predecessors — as typed in Assembly
+// needs; otherwise (or not typed) the order the lines were connected.
+function typedNumbers(assembly: AssemblyConfig, incoming: string[]): Record<string, number> {
+  return Object.fromEntries(incoming.map((from, i) => {
+    const no = assembly.table === 'predecessors' ? assembly.needs?.find((x) => x.from === from)?.no : undefined
+    return [from, no ?? i + 1]
+  }))
+}
+
+// The number each line shows on the canvas (P1, P2, ...): its No., but while
+// that No. is in error (not a whole number from 1 to the lines coming in, or
+// another line has it too) the order it was connected.
+function lineNumbers(assembly: AssemblyConfig, incoming: string[]): Record<string, number> {
+  const typed = typedNumbers(assembly, incoming)
+  const nos = Object.values(typed)
+  return Object.fromEntries(incoming.map((from, i) => {
+    const no = typed[from]
+    const ok = Number.isInteger(no) && no >= 1 && no <= incoming.length && nos.filter((x) => x === no).length === 1
+    return [from, ok ? no : i + 1]
+  }))
+}
+
+// Why a Predecessors Assembly needs table can't be used, or undefined (shown
+// in the panel; blocks Save): every No. a whole number from 1 to the lines
+// coming in, each line its own; every amount 1 or more; a line with the No.
+// of Main FE from predecessor.
+function needsProblem(assembly: AssemblyConfig, incoming: string[]): string | undefined {
+  if (assembly.table !== 'predecessors' || incoming.length === 0) return undefined
+  const whole = (n: number | null | undefined, min: number) => n != null && Number.isInteger(n) && n >= min
+  const numbers = typedNumbers(assembly, incoming)
+  const nos = incoming.map((from) => numbers[from])
+  const amounts = incoming.map((from) => assembly.needs?.find((x) => x.from === from)?.amount ?? 1)
+  const mainNo = assembly.mainMuDefault ? 1 : assembly.mainMuFromPredecessor
+  const lines = incoming.length
+  return nos.some((n) => !whole(n, 1)) ? 'No. must be a whole number, 1 or more.'
+    : nos.some((n) => n > lines) ? `No. can't be more than ${lines} — only ${lines} line${lines === 1 ? '' : 's'} come in.`
+      : new Set(nos).size !== nos.length ? 'Each line needs its own No.'
+        : amounts.some((n) => !whole(n, 1)) ? 'Amount must be a whole number, 1 or more.'
+          : !nos.includes(mainNo) ? `No line has No. ${mainNo} — the main part (Main FE from predecessor).`
+            : undefined
+}
+
+// Why these assembly settings can't be used, or undefined.
+// - Types None and Flow Entity(FE): Main FE from predecessor is the main
+//   line, counted in the order connected, so it can't be more than the lines
+//   coming in.
+// - With exactly 2 lines, Attach all parts can't go on as the Main FE.
+// - Delete entity keeps only the main part, so nothing is joined to make a New FE.
+function assemblyProblem(assembly: AssemblyConfig, incomingLines: number): string | undefined {
+  const mainLine = assembly.mainMuDefault ? 1 : assembly.mainMuFromPredecessor
+  if (assembly.table !== 'predecessors' && incomingLines > 0 && mainLine > incomingLines) {
+    return `Main FE from predecessor is ${mainLine}, but only ${incomingLines} line${incomingLines === 1 ? '' : 's'} come into this Assembly.`
+  }
+  // With exactly 2 lines, attached parts can't go on as the Main FE (any type).
+  if (incomingLines === 2 && assembly.mode === 'attach_mus' && assembly.exitingMu === 'main_mu') {
+    return 'With 2 lines, Attach all parts needs a New FE — or choose Delete entity.'
+  }
+  if (assembly.exitingMu !== 'new_fe') return undefined
+  if (assembly.mode === 'delete_mus') return 'Delete entity keeps only the main part — a New FE needs Attach all parts (or choose Main FE).'
+  if (!(assembly.newFeName ?? '').trim()) return 'Give the New FE a name.'
+  return undefined
+}
+
+function AssemblyPanel({ assembly, products, incoming, lineProducts, onChange }: {
+  assembly: AssemblyConfig
+  products: string[]
+  // The stations whose lines come into this Assembly, in the order connected.
+  incoming: string[]
+  // Incoming station -> the products whose route uses its line in.
+  lineProducts: Record<string, string[]>
+  onChange: (assembly: AssemblyConfig) => void
+}) {
+  const set = (patch: Partial<AssemblyConfig>) => onChange({ ...assembly, ...patch })
+  // Flow Entity(FE): its table (FE Name + Amount) is right here; Predecessors
+  // has the Assembly needs table. Each keeps its own rows.
+  const hasRows = assembly.table === 'mu_types'
+  const rows = assembly.muTypeRows
+  const setRows = (next: AssemblyTableRow[]) => set({ muTypeRows: next })
+  const update = (i: number, patch: Partial<AssemblyTableRow>) => setRows(rows.map((r, ri) => (ri === i ? { ...r, ...patch } : r)))
+  const whole = (n: number | null | undefined, min: number) => n != null && Number.isInteger(n) && n >= min
+
+  const mainMuValid = assembly.mainMuDefault || whole(assembly.mainMuFromPredecessor, 1)
+  const feNames = rows.map((r) => (r.mu ?? '').trim())
+  // The main part (on line "Main FE from predecessor", in the order connected) is not
+  // an FE to add — it's already the main part.
+  const mainLine = incoming[(assembly.mainMuDefault ? 1 : assembly.mainMuFromPredecessor) - 1]
+  const mainParts = mainLine ? lineProducts[mainLine] ?? [] : []
+  const mainPicked = feNames.find((n) => mainParts.includes(n))
+  const problem =
+    feNames.some((n) => !n) ? 'Choose an FE for every row.'
+      : mainPicked ? `${mainPicked} is the main part (Main FE from predecessor) — pick another FE.`
+      : new Set(feNames).size !== feNames.length ? 'Each FE only once — add up its Amount instead.'
+        : rows.some((r) => !whole(r.amount, 1)) ? 'Amount must be a whole number, 1 or more.'
+          : undefined
+
+  const heading = 'text-[11px] font-medium text-gray-500 block mb-1'
+  const small = 'text-[10px] text-gray-400 block mb-0.5'
+  const field = 'h-8 text-sm rounded-lg border-gray-200 bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden'
+  const select = 'h-8 w-full text-sm rounded-lg border border-gray-200 bg-white px-2'
+
+  return (
+    <div className="rounded-xl border border-pink-200 overflow-hidden">
+      {/* Header */}
+      <div className="flex items-center justify-between px-3 py-2 bg-pink-50 border-b border-pink-100">
+        <span className="flex items-center gap-1.5 text-xs font-bold text-gray-800">
+          <span className="h-2 w-2 rounded-full bg-pink-500" />
+          Assembly
+        </span>
+      </div>
+
+      <div className="p-2.5 space-y-3 bg-white">
+        <div>
+          <label className={heading}>Assembly type</label>
+          <select value={assembly.table} onChange={(e) => set({ table: e.target.value as AssemblyTableKind })} className={select}>
+            {ASSEMBLY_TABLE_KINDS.map((k) => <option key={k.value} value={k.value}>{k.label}</option>)}
+          </select>
+        </div>
+
+        {/* Assembly needs: every line coming in — its No. (you set it; Main
+            MU from predecessor points at one) and how many of its parts make
+            one assembly. The Assembly holds that many of each while it
+            waits for the rest. Applied as you type, like the rest. Not for
+            type None: it takes 1 part from each line (numbered in the order connected). */}
+        {assembly.table === 'predecessors' && (() => {
+          // Each line's No. starts as the order it was connected (1 = the
+          // first line, P1); a No. changed in its box is kept as set.
+          const saved = assembly.needs ?? []
+          const numbers = typedNumbers(assembly, incoming)
+          const needRows = incoming.map((from) => ({ from, no: numbers[from], amount: saved.find((x) => x.from === from)?.amount ?? 1 }))
+          // Only a No. you typed is saved — the others keep following the
+          // connection order.
+          const setNeed = (from: string, patch: { no?: number; amount?: number }) => set({
+            needs: incoming.map((f) => {
+              const s = saved.find((x) => x.from === f)
+              const p = f === from ? patch : {}
+              const no = 'no' in p ? p.no : s?.no
+              return { from: f, ...(no !== undefined ? { no } : {}), amount: p.amount ?? s?.amount ?? 1 }
+            }),
+          })
+          const mainNo = assembly.mainMuDefault ? 1 : assembly.mainMuFromPredecessor
+          const needProblem = needsProblem(assembly, incoming)
+          // Every line, with its amount; the main line (Main FE from
+          // predecessor) is the one whose route the output follows.
+          return (
+            <div>
+              <label className={heading}>Assembly needs</label>
+              <p className="text-[10px] text-gray-400 mb-1.5">Lines are numbered in the order you connected them (P1, P2, ...) — change a No. if needed.</p>
+              {needRows.length === 0 ? (
+                <p className="text-[10px] text-gray-400">Connect the lines coming into this Assembly to list them here.</p>
+              ) : (
+                <div className="space-y-1.5">
+                  {needRows.map((r) => {
+                    const isMain = r.no === mainNo
+                    return (
+                      <div
+                        key={r.from}
+                        className={`rounded-lg border px-2.5 py-2 ${isMain ? 'border-pink-200 bg-pink-50/50' : 'border-gray-200 bg-gray-50/60'}`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className={`shrink-0 h-5 w-5 rounded-full flex items-center justify-center text-[10px] font-bold ${isMain ? 'bg-pink-500 text-white' : 'bg-gray-200 text-gray-600'}`}>
+                            {r.no}
+                          </span>
+                          <span className="min-w-0 flex-1 text-xs font-semibold text-gray-700 break-words">{r.from}</span>
+                          {isMain && (
+                            <span className="shrink-0 rounded-full bg-pink-100 px-1.5 py-0.5 text-[9px] font-semibold text-pink-600">Main</span>
+                          )}
+                        </div>
+                        <div className="mt-1.5 grid grid-cols-2 gap-2">
+                          <label className="min-w-0 block">
+                            <span className="text-[10px] text-gray-500 block mb-0.5">No.</span>
+                            <NumericField
+                              value={r.no}
+                              onCommit={(n) => setNeed(r.from, { no: n })}
+                              className={`${field} h-7 w-full min-w-0 px-1 text-center`}
+                            />
+                          </label>
+                          <label className="min-w-0 block">
+                            <span className="text-[10px] text-gray-500 block mb-0.5">Amount</span>
+                            <NumericField
+                              value={r.amount}
+                              onCommit={(n) => setNeed(r.from, { amount: n })}
+                              className={`${field} h-7 w-full min-w-0 px-1 text-center`}
+                            />
+                          </label>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+              {needProblem && <p className="text-[10px] text-red-600 mt-1">{needProblem}</p>}
+            </div>
+          )
+        })()}
+
+        {/* FE table: which FEs (products) and how many of each make one
+            assembly. Applied as you choose, like the rest. */}
+        {hasRows && (
+          <div>
+            <label className={heading}>FE table</label>
+            <div className="space-y-1.5">
+              {rows.map((r, i) => (
+                <div key={i} className="rounded-lg border border-gray-200 bg-gray-50/60 px-2.5 py-2">
+                  <label className="block">
+                    <span className="text-[10px] text-gray-500 block mb-0.5">FE Name</span>
+                    <select
+                      value={r.mu ?? ''}
+                      onChange={(e) => update(i, { mu: e.target.value })}
+                      className="h-8 w-full text-sm text-gray-900 rounded-lg border border-gray-300 bg-white px-2 shadow-sm"
+                    >
+                      <option value="">Choose…</option>
+                      {Array.from(new Set([...products.filter((p) => !mainParts.includes(p)), ...(r.mu ? [r.mu] : [])])).map((p) => (
+                        <option key={p} value={p}>{p}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <div className="mt-1.5 flex items-end justify-between gap-2">
+                    <label className="block">
+                      <span className="text-[10px] text-gray-500 block mb-0.5">Amount</span>
+                      <NumericField
+                        value={r.amount}
+                        onCommit={(n) => update(i, { amount: n })}
+                        className={`${field} w-20 px-1 text-center`}
+                      />
+                    </label>
+                    <button
+                      onClick={() => setRows(rows.filter((_, ri) => ri !== i))}
+                      className="mb-2 text-gray-300 hover:text-red-500 transition-colors"
+                      aria-label="Delete row"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {rows.length === 0 && <p className="text-[10px] text-gray-400">No FEs yet — add one below.</p>}
+            </div>
+            <button
+              type="button"
+              onClick={() => setRows([...rows, { mu: '', amount: 1 }])}
+              className="mt-2 flex items-center gap-1.5 text-xs font-semibold text-blue-600 hover:text-blue-700"
+            >
+              <Plus className="h-3.5 w-3.5" /> Add row
+            </button>
+            {problem && <p className="text-[10px] text-amber-600 mt-1">{problem}</p>}
+          </div>
+        )}
+
+        {/* Default = predecessor 1; switch it off to choose another. */}
+        <div>
+          <label className={heading}>Main FE from predecessor</label>
+          <div className="flex items-center justify-between gap-2">
+            <div className="w-14 shrink-0">
+              <NumericField
+                value={assembly.mainMuDefault ? 1 : assembly.mainMuFromPredecessor}
+                disabled={assembly.mainMuDefault}
+                onCommit={(n) => set({ mainMuFromPredecessor: n })}
+                className={`${field} w-full px-1 text-center disabled:bg-gray-100 disabled:text-gray-400 disabled:opacity-100`}
+              />
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={!!assembly.mainMuDefault}
+              onClick={() => set(assembly.mainMuDefault ? { mainMuDefault: false } : { mainMuDefault: true, mainMuFromPredecessor: 1 })}
+              className="flex shrink-0 items-center gap-1.5 text-xs font-medium text-gray-600"
+            >
+              <span className={`relative inline-flex h-4 w-7 shrink-0 rounded-full transition-colors ${assembly.mainMuDefault ? 'bg-blue-600' : 'bg-gray-300'}`}>
+                <span className={`absolute top-0.5 h-3 w-3 rounded-full bg-white shadow transition-transform ${assembly.mainMuDefault ? 'translate-x-3.5' : 'translate-x-0.5'}`} />
+              </span>
+              Default
+            </button>
+          </div>
+          {!mainMuValid && (
+            <p className="text-[10px] text-amber-600 mt-1">Must be a whole number, 1 or more.</p>
+          )}
+        </div>
+
+        {/* Assembly mode: the parts are deleted, or all attached to the main part. */}
+        <div className="flex flex-col rounded-lg border border-gray-200 overflow-hidden divide-y divide-gray-200">
+          {([['delete_mus', 'Delete entity'], ['attach_mus', 'Attach all parts']] as const).map(([value, text]) => (
+            <button
+              key={value}
+              type="button"
+              onClick={() => set({ mode: value })}
+              className={`h-8 text-xs font-semibold transition-all ${assembly.mode === value
+                ? 'bg-blue-600 text-white'
+                : 'text-gray-500 hover:bg-gray-50'}`}
+            >
+              {text}
+            </button>
+          ))}
+        </div>
+
+        {/* Main FE: the main part continues. New FE: a new product, made
+            from the attached parts, continues. */}
+        <div>
+          <label className={heading}>Assembled FE</label>
+          <select value={assembly.exitingMu} onChange={(e) => set({ exitingMu: e.target.value as AssemblyConfig['exitingMu'] })} className={select}>
+            <option value="main_mu">Main FE</option>
+            <option value="new_fe">New FE</option>
+          </select>
+          {assembly.exitingMu === 'new_fe' && (
+            <div className="mt-2">
+              <label className={small}>New FE name</label>
+              <Input
+                value={assembly.newFeName ?? ''}
+                onChange={(e) => set({ newFeName: e.target.value })}
+                placeholder="e.g. Car"
+                className={field}
+              />
+            </div>
+          )}
+          {assemblyProblem(assembly, incoming.length) && (
+            <p className="text-[10px] text-red-600 mt-1.5">{assemblyProblem(assembly, incoming.length)}</p>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// Dismantle station settings — Tecnomatix's DismantleStation Attributes tab,
+// shown in the station panel; each change applies at once. The simulation
+// uses Sequence (FEs to all Successors: one piece per next station; Dismantle
+// input configuration: the Dismantle table) and Exiting FE (Main FE: every
+// piece keeps the part's name; New FE: the New FE name). Dismantle Mode and
+// Main FE to Successor (the main line) make no difference yet.
+const DEFAULT_DISMANTLE: DismantleConfig = {
+  sequence: 'all_successors', mode: 'create_fe', mainFeToSuccessor: 1, exitingFe: 'new_fe',
+}
+
+// FEs to all Successors with Create FE: Exiting FE is New FE only (Main FE
+// isn't offered). One saved with Main FE before keeps it until changed.
+const dismantleNoMainFe = (d: DismantleConfig) => d.sequence === 'all_successors' && d.mode === 'create_fe'
+
+// Why these Dismantle settings can't be used, or undefined (shown in the
+// panel; blocks Save). FEs to all Successors + Create FE + New FE: Main FE to
+// Successor is the line that keeps the part's name, so it can't be more than
+// the lines going out.
+function dismantleProblem(d: DismantleConfig, outgoingLines: number): string | undefined {
+  if (!dismantleNoMainFe(d) || d.exitingFe !== 'new_fe' || outgoingLines === 0) return undefined
+  const n = d.mainFeToSuccessor
+  if (Number.isInteger(n) && n >= 1 && n > outgoingLines) {
+    return `Main FE to Successor is ${n}, but only ${outgoingLines} line${outgoingLines === 1 ? '' : 's'} go out.`
+  }
+  return undefined
+}
+
+function dismantleSettings(saved?: DismantleConfig): DismantleConfig {
+  return { ...DEFAULT_DISMANTLE, ...saved }
+}
+
+// The Dismantle table's rows: one per line going out, as saved or (a new
+// line) Number 1, Successor = its line's number.
+function dismantleRows(dismantle: DismantleConfig, outgoing: string[]): DismantleRow[] {
+  return outgoing.map((to, i) =>
+    dismantle.table?.find((r) => r.to === to) ?? { to, number: 1, successor: i + 1 })
+}
+
+function DismantlePanel({ dismantle, outgoing, onChange }: {
+  dismantle: DismantleConfig
+  // The stations its lines go to, in the order connected (successor 1, 2, ...).
+  outgoing: string[]
+  onChange: (dismantle: DismantleConfig) => void
+}) {
+  const set = (patch: Partial<DismantleConfig>) => onChange({ ...dismantle, ...patch })
+  // Choosing a Sequence / Dismantle Mode that has no Main FE moves Exiting FE
+  // to New FE.
+  const setFlow = (patch: Partial<DismantleConfig>) => {
+    const next = { ...dismantle, ...patch }
+    onChange(dismantleNoMainFe(next) && next.exitingFe === 'main_fe' ? { ...next, exitingFe: 'new_fe' } : next)
+  }
+  const offerMainFe = !dismantleNoMainFe(dismantle) || dismantle.exitingFe === 'main_fe'
+  const successorValid = Number.isInteger(dismantle.mainFeToSuccessor) && dismantle.mainFeToSuccessor >= 1
+  const whole = (n: number, min: number) => Number.isInteger(n) && n >= min
+
+  const tableRows = dismantleRows(dismantle, outgoing)
+  const setRow = (to: string, patch: Partial<DismantleRow>) =>
+    set({ table: tableRows.map((r) => (r.to === to ? { ...r, ...patch } : r)) })
+  const tableProblem =
+    tableRows.some((r) => !whole(r.number, 1)) ? 'Number must be a whole number, 1 or more.'
+        : tableRows.some((r) => !whole(r.successor, 1) || r.successor > outgoing.length)
+          ? `Successor must be from 1 to ${outgoing.length}.`
+          : undefined
+
+  const heading = 'text-[11px] font-medium text-gray-500 block mb-1'
+  const small = 'text-[10px] text-gray-400 block mb-0.5'
+  const field = 'h-8 text-sm rounded-lg border-gray-200 bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden'
+  const select = 'h-8 w-full text-sm rounded-lg border border-gray-200 bg-white px-2'
+
+  return (
+    <div className="rounded-xl border border-lime-200 overflow-hidden">
+      {/* Header */}
+      <div className="flex items-center justify-between px-3 py-2 bg-lime-50 border-b border-lime-100">
+        <span className="flex items-center gap-1.5 text-xs font-bold text-gray-800">
+          <span className="h-2 w-2 rounded-full bg-lime-600" />
+          Dismantle
+        </span>
+      </div>
+
+      <div className="p-2.5 space-y-3 bg-white">
+        <div>
+          <label className={heading}>Sequence</label>
+          <select value={dismantle.sequence} onChange={(e) => setFlow({ sequence: e.target.value as DismantleConfig['sequence'] })} className={select}>
+            <option value="all_successors">FEs to all Successors</option>
+            <option value="input_config">Dismantle input configuration</option>
+          </select>
+        </div>
+
+        {/* Dismantle table: one row per line out — how many pieces go
+            there, and its Successor: the order the pieces leave in (1
+            first). Their name comes from Exiting FE, as with FEs to all
+            Successors. */}
+        {dismantle.sequence === 'input_config' && (
+          <div>
+            <label className={heading}>Dismantle table</label>
+            {tableRows.length === 0 ? (
+              <p className="text-[10px] text-gray-400">Connect the lines leaving this Dismantle to list them here.</p>
+            ) : (
+              <div className="space-y-1.5">
+                {tableRows.map((r, i) => (
+                  <div key={r.to} className="rounded-lg border border-gray-200 bg-gray-50/60 px-2.5 py-2">
+                    <div className="flex items-center gap-2">
+                      <span className="shrink-0 h-5 w-5 rounded-full flex items-center justify-center text-[10px] font-bold bg-gray-200 text-gray-600">
+                        {i + 1}
+                      </span>
+                      <span className="min-w-0 flex-1 text-xs font-semibold text-gray-700 break-words">{r.to}</span>
+                    </div>
+                    <div className="mt-1.5 grid grid-cols-2 gap-2">
+                      <label className="min-w-0 block">
+                        <span className="text-[10px] text-gray-500 block mb-0.5">Number</span>
+                        <NumericField
+                          value={r.number}
+                          onCommit={(n) => setRow(r.to, { number: n })}
+                          className={`${field} h-7 w-full min-w-0 px-1 text-center`}
+                        />
+                      </label>
+                      <label className="min-w-0 block">
+                        <span className="text-[10px] text-gray-500 block mb-0.5">Successor</span>
+                        <NumericField
+                          value={r.successor}
+                          onCommit={(n) => setRow(r.to, { successor: n })}
+                          className={`${field} h-7 w-full min-w-0 px-1 text-center`}
+                        />
+                      </label>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            {tableProblem && <p className="text-[10px] text-red-600 mt-1">{tableProblem}</p>}
+          </div>
+        )}
+
+        <div>
+          <label className={heading}>Dismantle Mode</label>
+          <select value={dismantle.mode} onChange={(e) => setFlow({ mode: e.target.value as DismantleConfig['mode'] })} className={select}>
+            <option value="create_fe">Create FE</option>
+            <option value="detach_fe">Detach FE</option>
+          </select>
+        </div>
+
+        <div>
+          <label className={heading}>Main FE to Successor</label>
+          <div className="w-14">
+            <NumericField
+              value={dismantle.mainFeToSuccessor}
+              onCommit={(n) => set({ mainFeToSuccessor: n })}
+              className={`${field} w-full px-1 text-center`}
+            />
+          </div>
+          {!successorValid && (
+            <p className="text-[10px] text-red-600 mt-1">Must be a whole number, 1 or more.</p>
+          )}
+          {dismantleProblem(dismantle, outgoing.length) && (
+            <p className="text-[10px] text-red-600 mt-1">{dismantleProblem(dismantle, outgoing.length)}</p>
+          )}
+        </div>
+
+        {/* Main FE: every piece keeps the part's name. New FE: every piece
+            gets the New FE name (empty: the part's name + A). */}
+        <div>
+          <label className={heading}>Exiting FE</label>
+          <select value={dismantle.exitingFe} onChange={(e) => set({ exitingFe: e.target.value as DismantleConfig['exitingFe'] })} className={select}>
+            {offerMainFe && <option value="main_fe">Main FE</option>}
+            <option value="new_fe">New FE</option>
+          </select>
+          {dismantle.exitingFe === 'new_fe' && (
+            <div className="mt-2">
+              <label className={small}>New FE name</label>
+              <Input
+                value={dismantle.newFeName ?? ''}
+                onChange={(e) => set({ newFeName: e.target.value })}
+                placeholder="e.g. Body"
+                className={field}
+              />
+              <p className="text-[10px] text-gray-400 mt-1">
+                Every piece gets this name. Empty: the part’s name + A.
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// The Routes panel (right side): one row per station, one column per
+// product — tick the stations each product goes through (the order comes
+// from the drawing). Apply gives the products their lines; Cancel closes.
+function RoutesPanel({ products, stations, colors, initial, problemsOf, onApply, onClose }: {
+  products: string[]
+  stations: string[]
+  colors: Record<string, string>
+  initial: Record<string, string[]>
+  problemsOf: (ticks: Record<string, string[]>) => string[]
+  onApply: (ticks: Record<string, string[]>) => void
+  onClose: () => void
+}) {
+  const [ticks, setTicks] = useState<Record<string, string[]>>(initial)
+  const toggle = (p: string, st: string) => setTicks((t) => {
+    const now = t[p] ?? []
+    return { ...t, [p]: now.includes(st) ? now.filter((x) => x !== st) : [...now, st] }
+  })
+  const problems = problemsOf(ticks)
+  const changed = JSON.stringify(ticks) !== JSON.stringify(initial)
+
+  return (
+    <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+      <div className="flex items-center justify-between px-4 py-3 bg-blue-50 border-b border-blue-100">
+        <span className="text-xs font-bold text-gray-800">Routes</span>
+        <button onClick={onClose} className="text-gray-400 hover:text-gray-600" aria-label="Close">
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+      <div className="p-3 space-y-3">
+        <p className="text-[10px] text-gray-400">Tick the stations each product goes through — the order comes from the drawing.</p>
+        <div className="rounded-lg border border-gray-200 overflow-hidden">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="bg-gray-50 border-b border-gray-200 text-gray-500">
+                <th className="px-2 py-1.5 text-left text-[10px] font-semibold">Station</th>
+                {products.map((p) => (
+                  <th key={p} className="px-1 py-1.5 text-center text-[10px] font-semibold">
+                    <span className="inline-flex items-center gap-1">
+                      <span className="h-2 w-2 rounded-full" style={{ background: colors[p] || '#9ca3af' }} />
+                      {p}
+                    </span>
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {stations.map((st) => (
+                <tr key={st} className="border-b border-gray-100 last:border-0">
+                  <td className="px-2 py-1.5 text-gray-700 break-words">{st}</td>
+                  {products.map((p) => (
+                    <td key={p} className="px-1 py-1.5 text-center">
+                      <input
+                        type="checkbox"
+                        checked={(ticks[p] ?? []).includes(st)}
+                        onChange={() => toggle(p, st)}
+                        className="h-3.5 w-3.5 cursor-pointer"
+                      />
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {problems.length > 0 && (
+          <div className="space-y-1">
+            {problems.map((msg) => <p key={msg} className="text-[10px] text-amber-600">{msg}</p>)}
+          </div>
+        )}
+        <div className="flex gap-2">
+          <Button size="sm" variant="outline" className="flex-1" onClick={onClose}>Cancel</Button>
+          <Button size="sm" className="flex-1" disabled={problems.length > 0 || !changed} onClick={() => { onApply(ticks); onClose() }}>
+            Apply
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 // Start's MU table (Tecnomatix style): one row per product the Start
@@ -2814,8 +4070,11 @@ interface MuDialogRow extends MuRow {
 // once (see applyMuTable): a new row copies an existing product's route, a
 // deleted row (after a confirmation) takes its route with it, a renamed MU
 // renames the product everywhere.
-function MuTableDialog({ startName, initial, onApply, onClose }: {
+function MuTableDialog({ startName, starts, initial, onApply, onClose }: {
   startName: string
+  // Every Start on the Canvas (station names); the first is the one a new
+  // row is released from when opened from it.
+  starts: string[]
   initial: MuDialogRow[]
   onApply: (rows: MuDialogRow[]) => Promise<void> | void
   onClose: () => void
@@ -2856,11 +4115,12 @@ function MuTableDialog({ startName, initial, onApply, onClose }: {
   const head = 'px-2 py-1.5 text-[10px] font-bold uppercase tracking-widest text-left whitespace-nowrap'
   const cellInput = 'h-8 text-sm rounded-md border-gray-200 bg-gray-50 focus:bg-white'
   const deleting = confirmDelete !== null ? rows[confirmDelete] : null
+  const manyStarts = starts.length > 1
 
   return createPortal(
     <div className="fixed inset-0 z-[9999] flex items-center justify-center">
       <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative bg-white rounded-2xl shadow-2xl w-[760px] max-h-[80vh] flex flex-col overflow-hidden">
+      <div className={`relative bg-white rounded-2xl shadow-2xl ${manyStarts ? 'w-[900px]' : 'w-[760px]'} max-h-[80vh] flex flex-col overflow-hidden`}>
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100 bg-gradient-to-r from-blue-50 to-indigo-50">
           <div>
@@ -2884,6 +4144,7 @@ function MuTableDialog({ startName, initial, onApply, onClose }: {
                 <th className={head}>string <span className="text-gray-300">3</span></th>
                 <th className={head}>time <span className="text-gray-300">4</span></th>
                 <th className={head}>color <span className="text-gray-300">5</span></th>
+                {manyStarts && <th className={head}>object <span className="text-gray-300">6</span></th>}
                 <th className="w-8"></th>
               </tr>
               <tr className="bg-blue-50/60 text-gray-700 border-b border-gray-200">
@@ -2893,6 +4154,7 @@ function MuTableDialog({ startName, initial, onApply, onClose }: {
                 <th className={head}>Name</th>
                 <th className={head}>Interval (min)</th>
                 <th className={head}>Colour</th>
+                {manyStarts && <th className={head}>Released from</th>}
                 <th></th>
               </tr>
             </thead>
@@ -2960,6 +4222,17 @@ function MuTableDialog({ startName, initial, onApply, onClose }: {
                       className="h-8 w-12 cursor-pointer rounded-md border border-gray-200 bg-gray-50 p-0.5"
                     />
                   </td>
+                  {manyStarts && (
+                    <td className="px-2 py-1">
+                      <select
+                        value={r.start ?? starts[0]}
+                        onChange={(e) => update(i, { start: e.target.value })}
+                        className="h-8 w-full text-sm text-gray-700 bg-gray-50 border border-gray-200 rounded-md px-1.5"
+                      >
+                        {starts.map((st) => <option key={st} value={st}>{st}</option>)}
+                      </select>
+                    </td>
+                  )}
                   <td className="px-1 py-2">
                     <button
                       onClick={() => (r.orig === undefined
@@ -2975,7 +4248,7 @@ function MuTableDialog({ startName, initial, onApply, onClose }: {
               ))}
               {rows.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="py-6 text-center text-gray-400 text-xs">No products yet — add a row below.</td>
+                  <td colSpan={manyStarts ? 8 : 7} className="py-6 text-center text-gray-400 text-xs">No products yet — add a row below.</td>
                 </tr>
               )}
             </tbody>
@@ -2984,6 +4257,8 @@ function MuTableDialog({ startName, initial, onApply, onClose }: {
             onClick={() => setRows((rs) => [...rs, {
               mu: '', number: 0, name: '', interval: null, copyFrom: rs.find((x) => x.orig !== undefined)?.orig,
               color: unusedVariantColor(rs.map((x) => x.color ?? ''), rs.length),
+              // Released from the Start the table was opened from.
+              start: startName,
             }])}
             className="mt-3 flex items-center gap-1.5 text-xs font-semibold text-blue-600 hover:text-blue-700"
           >
@@ -3046,11 +4321,10 @@ function MuTableDialog({ startName, initial, onApply, onClose }: {
 }
 
 // What Save would write from the canvas — compared to tell unsaved changes.
-// Box positions aren't saved, so they don't count.
 function canvasSignatureOf(nodes: Node<StationNodeData>[], edges: Edge[]): string {
   return JSON.stringify({
-    n: nodes.map((n) => [n.id, n.data]),
-    e: edges.map((e) => [e.source, e.target]),
+    n: nodes.map((n) => [n.id, n.data, Math.round(n.position.x), Math.round(n.position.y)]),
+    e: edges.map((e) => [e.source, e.target, edgeProducts(e) ?? null]),
   })
 }
 
@@ -3325,13 +4599,22 @@ export default function Canvas() {
   // Build mode state
   const [nodes, setNodes, onNodesChange] = useNodesState<StationNodeData>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState([])
-  // The product (variant) whose line is on the Build canvas — Save writes
-  // only that product's route; every other product is kept as it is.
+  // The product (variant) picked on the Build canvas — the drawing is one
+  // for the whole scenario; this product's lines are highlighted, new lines
+  // are its, and Save writes its route (others keep theirs unless their
+  // lines were changed).
   const [buildVariant, setBuildVariant] = useState<string | null>(null)
   // The product the last Save wrote (read once it succeeds).
   const savedVariantRef = useRef<string | null>(null)
-  // Unsaved changes: the canvas as last loaded/saved, compared with now.
-  // Box positions aren't saved, so they don't count.
+  // The ids and line products the last Save gave the drawing.
+  const savedDrawingRef = useRef<{ boxIdOf: Record<string, string>; productsOf: Record<string, string[] | undefined> } | null>(null)
+  // Each product's lines (their shape) as last loaded/saved: Save keeps
+  // another product's route as it is unless these were changed.
+  const loadedLinesRef = useRef<Record<string, string>>({})
+  // Each box's time as last loaded/saved (box id -> minutes).
+  const loadedTimesRef = useRef<Record<string, number>>({})
+  // Unsaved changes: the canvas as last loaded/saved, compared with now
+  // (box positions included — they are saved).
   const canvasSignature = canvasSignatureOf(nodes, edges)
   const [savedSignature, setSavedSignature] = useState<string | null>(null)
   const canvasDirty = savedSignature === null ? nodes.length > 0 : savedSignature !== canvasSignature
@@ -3347,22 +4630,107 @@ export default function Canvas() {
   // diagram only shows the actual production flow. The edges themselves
   // still exist in `edges` and are used exactly as before for save/pool
   // logic; only the rendered ReactFlow instance gets this filtered view.
+  // The drawing is one for every product: with 2+ products, lines and boxes
+  // the picked product doesn't use are faded.
+  const nodeById = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes])
+  const fadeOthers = !!buildVariant && Object.keys(activeScenario?.processflow_data ?? {}).length > 1
+  // Lines into an Assembly carry their number (P1, P2, ...) — next to a
+  // label of your own, if the line has one.
+  const assemblyLineNo = useMemo(() => {
+    const out = new Map<string, number>()
+    for (const n of nodes) {
+      if (inferStationType(n.data.label, n.data.stationType) !== 'Assembly') continue
+      const numbers = lineNumbers(assemblySettings(n.data.assembly), incomingStations(n.id, nodes, edges))
+      for (const e of edges) {
+        const src = e.target === n.id ? nodeById.get(e.source) : undefined
+        if (src && !isWiringNode(src) && numbers[groupKey(src)] !== undefined) out.set(e.id, numbers[groupKey(src)])
+      }
+    }
+    return out
+  }, [nodes, edges, nodeById])
   const visibleEdges = useMemo(
     () =>
       edges.map((e) => {
-        const src = nodes.find((n) => n.id === e.source)
-        const dst = nodes.find((n) => n.id === e.target)
-        const srcType = src ? inferStationType(src.data.label, src.data.stationType) : undefined
-        const dstType = dst ? inferStationType(dst.data.label, dst.data.stationType) : undefined
-        const isPoolWiring = (t?: string) => t === 'Worker' || t === 'Worker Controller' || t === 'Workplace'
-        if (isPoolWiring(srcType) || isPoolWiring(dstType)) {
+        const src = nodeById.get(e.source)
+        const dst = nodeById.get(e.target)
+        if ((src && isWiringNode(src)) || (dst && isWiringNode(dst))) {
           return { ...e, style: { ...e.style, opacity: 0, pointerEvents: 'none' as const } }
         }
-        return e
+        const no = assemblyLineNo.get(e.id)
+        const line = no === undefined ? e : { ...e, label: e.label ? `P${no} · ${e.label}` : `P${no}` }
+        if (fadeOthers && !lineIsFor(e, buildVariant, buildVariant)) {
+          return { ...line, style: { ...e.style, opacity: 0.15 } }
+        }
+        return line
       }),
-    [edges, nodes]
+    [edges, nodeById, fadeOthers, buildVariant, assemblyLineNo]
+  )
+  const visibleNodes = useMemo(() => {
+    if (!fadeOthers) return nodes
+    const flow = edges.filter((e) => isFlowEdge(e, nodeById))
+    const used = new Set(flow.filter((e) => lineIsFor(e, buildVariant, buildVariant)).flatMap((e) => [e.source, e.target]))
+    const wired = new Set(flow.flatMap((e) => [e.source, e.target]))
+    return nodes.map((n) => (isWiringNode(n) || used.has(n.id) || !wired.has(n.id)
+      ? n
+      : { ...n, style: { ...n.style, opacity: 0.3 } }))
+  }, [nodes, edges, nodeById, fadeOthers, buildVariant])
+  // Routes table: the stations a product can be ticked for, left to right
+  // (a parallel group is one column — a job goes to one of its machines).
+  const [routesOpen, setRoutesOpen] = useState(false)
+  const routeStations = useMemo(() => {
+    const leftmost = new Map<string, number>()
+    for (const n of nodes) {
+      const t = inferStationType(n.data.label, n.data.stationType)
+      if (t === 'Source' || t === 'Drain' || isWiringNode(n)) continue
+      const key = groupKey(n)
+      leftmost.set(key, Math.min(leftmost.get(key) ?? Infinity, n.position.x))
+    }
+    return Array.from(leftmost.entries()).sort((a, b) => a[1] - b[1]).map(([key]) => key)
+  }, [nodes])
+  // The picked product's lines (plus staffing wiring): what the station
+  // panel and the Save checks look at.
+  const productEdges = useMemo(
+    () => edges.filter((e) => !isFlowEdge(e, nodeById) || lineIsFor(e, buildVariant, buildVariant)),
+    [edges, nodeById, buildVariant]
   )
   const [selectedNode, setSelectedNode] = useState<Node<StationNodeData> | null>(null)
+  // A line into an Assembly deleted: the No.s typed in its Assembly needs are
+  // cleared, so its lines go back to the order connected (P1, P2, ...) — in
+  // the panel, on Save and in the run. Amounts are kept. Seen by the lines
+  // themselves (box ids), so renaming a station clears nothing; nor does
+  // taking 1 machine of a parallel group off while the group's line stays.
+  // Not when a drawing is opened (the loader clears the ref).
+  const assemblyLinesRef = useRef<Map<string, Map<string, string>> | null>(null)
+  useEffect(() => {
+    // Each Assembly's lines in: source box id -> its station (groupKey).
+    const now = new Map<string, Map<string, string>>()
+    for (const n of nodes) {
+      if (inferStationType(n.data.label, n.data.stationType) !== 'Assembly') continue
+      const lines = new Map<string, string>()
+      for (const e of edges) {
+        const src = e.target === n.id ? nodes.find((x) => x.id === e.source) : undefined
+        if (src && !isWiringNode(src)) lines.set(src.id, groupKey(src))
+      }
+      now.set(n.id, lines)
+    }
+    const before = assemblyLinesRef.current
+    assemblyLinesRef.current = now
+    if (!before) return
+    const reset = new Map<string, AssemblyConfig>()
+    for (const n of nodes) {
+      const was = before.get(n.id)
+      const is = now.get(n.id)
+      const assembly = n.data.assembly
+      if (!was || !is || !assembly?.needs?.some((x) => x.no !== undefined)) continue
+      const stations = new Set(is.values())
+      const deleted = Array.from(was.entries()).some(([id, station]) => !is.has(id) && !stations.has(station))
+      if (!deleted) continue
+      reset.set(n.id, { ...assembly, needs: assembly.needs.map(({ from, amount }) => ({ from, amount })) })
+    }
+    if (reset.size === 0) return
+    setNodes((nds) => nds.map((n) => (reset.has(n.id) ? { ...n, data: { ...n.data, assembly: reset.get(n.id) } } : n)))
+    setSelectedNode((p) => (p && reset.has(p.id) ? { ...p, data: { ...p.data, assembly: reset.get(p.id) } } : p))
+  }, [nodes, edges, setNodes])
   const [scenarioName, setScenarioName] = useState('')
 
   // FIX: was a module-level `let nodeCounter = 0`, which persists across
@@ -3587,9 +4955,13 @@ export default function Canvas() {
       machine: suffix ? Number(suffix[1]) : 1,
       isSource: inferStationType(n.data.label, n.data.stationType) === 'Source',
       isDrain: inferStationType(n.data.label, n.data.stationType) === 'Drain',
+      // A Start: the products it releases (its own MU table).
+      products: inferStationType(n.data.label, n.data.stationType) === 'Source'
+        ? (n.data.muTable ?? activeScenario?.stations_data?.[stationKey(n)]?.['MU Table'] ?? []).map((r) => jobPrefix(r.mu))
+        : undefined,
     }
-  }), [nodes])
-  const replayState = (activeRun?.result as { simulation_state?: { job_release_times?: Record<string, unknown>; job_finish_times?: Record<string, unknown> } } | null)?.simulation_state
+  }), [nodes, activeScenario])
+  const replayState = (activeRun?.result as { simulation_state?: { job_release_times?: Record<string, unknown>; job_finish_times?: Record<string, unknown>; assemblies?: Record<string, AssemblyRecord>; dismantles?: Record<string, DismantleRecord> } } | null)?.simulation_state
 
   // The store's copy of the scenario can be older than the saved one — the
   // Scenarios page saves straight to the server without touching it. Fetch
@@ -3622,21 +4994,27 @@ export default function Canvas() {
     // Boxes already on the canvas stay — unless they are another product's
     // line with nothing unsaved (e.g. a different product was picked in View).
     if (nodes.length > 0 && (buildVariant === null || buildVariant === selectedVariant || canvasDirty)) return
-    const { nodes: editNodes, edges: editEdges } = buildEditableGraph(
-      activeScenario.processflow_data, selectedVariant, activeScenario.stations_data
-    )
-    if (editNodes.length === 0) {
-      // A product with no route yet: an empty canvas, saved as that product.
+    // The saved drawing exactly as it was left — or, for a scenario not saved
+    // from the Canvas since drawings were kept (or imported), every
+    // product's route drawn as one picture.
+    const { nodes: drawnNodes, edges: finalEdges } = activeScenario.canvas_layout?.boxes?.length
+      ? graphFromLayout(activeScenario.canvas_layout, activeScenario.processflow_data, activeScenario.stations_data)
+      : wholeScenarioGraph(activeScenario.processflow_data, activeScenario.stations_data)
+    if (drawnNodes.length === 0) {
+      // No route yet: an empty canvas, saved as that product.
       setBuildVariant(selectedVariant)
       return
     }
-    // Every line should start with a Source and end with a Drain (Tecnomatix
-    // convention) — added automatically for scenarios saved before this
-    // existed, or imported from Excel/YAML, which never have them.
-    const { nodes: drawnNodes, edges: finalEdges } = ensureSourceAndDrain(editNodes, editEdges, nextNodeId)
+    // Each box shows the picked product's time at it.
+    const shownTime: Record<string, number> = {}
+    for (const st of activeScenario.processflow_data[selectedVariant] ?? []) {
+      for (const r of stepResourceOptions(st.resource)) shownTime[r] = st.duration
+    }
     // The Start isn't a route step, so it is drawn fresh — give it back its
     // saved MU table and Exit Controller.
-    const finalNodes = drawnNodes.map((n) => {
+    const finalNodes = drawnNodes.map((drawn) => {
+      const time = shownTime[drawn.data.savedName ?? drawn.data.label]
+      const n = time !== undefined ? { ...drawn, data: { ...drawn.data, cycleTime: time } } : drawn
       if (inferStationType(n.data.label, n.data.stationType) !== 'Source') return n
       const cfg = activeScenario.stations_data?.[n.data.label]
       if (!cfg) return n
@@ -3656,8 +5034,11 @@ export default function Canvas() {
     // renders the same clean right-to-left flow instead of React Flow
     // picking default (possibly backward-looking) anchor points.
     const loadedEdges = finalEdges.map((e) => ({ ...e, sourceHandle: 'right', targetHandle: 'left' }))
+    assemblyLinesRef.current = null
     setNodes(finalNodes)
     setEdges(loadedEdges)
+    loadedLinesRef.current = linesByProduct(Object.keys(activeScenario.processflow_data ?? {}), finalNodes, loadedEdges)
+    loadedTimesRef.current = Object.fromEntries(finalNodes.map((n) => [n.id, n.data.cycleTime]))
     setScenarioName(activeScenario.name)
     setBuildVariant(selectedVariant)
     setSavedSignature(canvasSignatureOf(finalNodes, loadedEdges))
@@ -3676,9 +5057,13 @@ export default function Canvas() {
   // between, so every edge reads the same direction on the canvas.
   const onConnect = useCallback(
     (params: Connection | Edge) => {
-      setEdges((eds) => addEdge({ ...params, sourceHandle: 'right', targetHandle: 'left' }, eds))
+      // A new line is the picked product's (see productGraph).
+      setEdges((eds) => addEdge({
+        ...params, sourceHandle: 'right', targetHandle: 'left',
+        ...(buildVariant ? { data: { products: [buildVariant] } } : {}),
+      }, eds))
     },
-    [setEdges]
+    [setEdges, buildVariant]
   )
 
   // Edge (connection line) labeling — purely a visual note on the arrow
@@ -3687,8 +5072,45 @@ export default function Canvas() {
   const updateEdgeLabel = (id: string, label: string) => {
     setEdges((eds) => eds.map((e) => (e.id === id ? { ...e, label } : e)))
   }
+  // The drawing is shared by every product. Deleting a line another product
+  // also uses only takes it out of the picked product's route; deleting
+  // boxes joins the other products' routes around them (the picked
+  // product's gap is left for you to reconnect, as before).
+  const dropLines = (eds: Edge[], lineIds: Set<string>): Edge[] => eds.flatMap((e) => {
+    if (!lineIds.has(e.id)) return [e]
+    const ps = edgeProducts(e)
+    if (buildVariant && ps && ps.includes(buildVariant) && ps.length > 1) {
+      return [withProducts(e, ps.filter((p) => p !== buildVariant))]
+    }
+    return []
+  })
+  const removeBoxes = (eds: Edge[], ids: Set<string>): Edge[] => {
+    let out = eds
+    for (const id of ids) {
+      const bridges: Edge[] = []
+      for (const a of out.filter((e) => e.target === id && isFlowEdge(e, nodeById))) {
+        for (const b of out.filter((e) => e.source === id && isFlowEdge(e, nodeById))) {
+          const both = (edgeProducts(a) ?? []).filter((p) => p !== buildVariant && (edgeProducts(b) ?? []).includes(p))
+          if (both.length === 0 || a.source === b.target) continue
+          bridges.push({ id: `e_${a.source}__${b.target}`, source: a.source, target: b.target, sourceHandle: 'right', targetHandle: 'left', data: { products: both } })
+        }
+      }
+      out = out.filter((e) => e.source !== id && e.target !== id)
+      for (const br of bridges) {
+        const existing = out.find((o) => o.source === br.source && o.target === br.target)
+        if (!existing) {
+          out = [...out, br]
+          continue
+        }
+        const had = edgeProducts(existing)
+        const base = had !== undefined ? had : buildVariant ? [buildVariant] : []
+        out = out.map((o) => (o === existing ? withProducts(o, Array.from(new Set([...base, ...(edgeProducts(br) ?? [])]))) : o))
+      }
+    }
+    return out
+  }
   const deleteEdge = (id: string) => {
-    setEdges((eds) => eds.filter((e) => e.id !== id))
+    setEdges((eds) => dropLines(eds, new Set([id])))
     setSelectedEdgeId(null)
   }
 
@@ -3713,7 +5135,12 @@ export default function Canvas() {
     // setState updater twice — nextLabel has a side effect (advancing
     // labelCounterRef), so calling it from inside the updater silently burnt
     // two numbers per add (only odd numbers ever appearing: Worker 1, 3, 5).
-    const label = initialName ?? nextLabel(initialName ?? typeName, nodes)
+    // Every box needs its own name: a second Start is "Start 2", and so on.
+    let label = initialName ?? nextLabel(typeName, nodes)
+    if (initialName) {
+      const taken = new Set(nodes.map((n) => n.data.label))
+      for (let k = 2; taken.has(label); k++) label = `${initialName} ${k}`
+    }
     const newNodeId = `station_${id}`
     setNodes((nds) => {
       const rightmostX = nds.length > 0 ? Math.max(...nds.map((n) => n.position.x)) : 40
@@ -3848,7 +5275,7 @@ export default function Canvas() {
     const lines = new Set(pendingDelete.edgeIds)
     setNodes((nds) => nds.filter((n) => !ids.has(n.id)))
     // Lines of removed stations go too, hidden worker wiring included.
-    setEdges((eds) => eds.filter((ed) => !lines.has(ed.id) && !ids.has(ed.source) && !ids.has(ed.target)))
+    setEdges((eds) => removeBoxes(dropLines(eds, lines), ids))
     setSelectedNode(null)
     setSelectedEdgeId(null)
     setPendingDelete(null)
@@ -3906,6 +5333,7 @@ export default function Canvas() {
         })
         const pastedEdges = clip.edges.map((ed) => ({
           ...ed, id: `e_${newId[ed.source]}__${newId[ed.target]}`, source: newId[ed.source], target: newId[ed.target], selected: false,
+          data: buildVariant ? { products: [buildVariant] } : undefined,
         }))
         setNodes((nds) => [...nds.map((n) => (n.selected ? { ...n, selected: false } : n)), ...pasted])
         setEdges((eds) => [...eds.map((ed) => (ed.selected ? { ...ed, selected: false } : ed)), ...pastedEdges])
@@ -3920,7 +5348,7 @@ export default function Canvas() {
 
   const deleteNode = (id: string) => {
     setNodes((nds) => nds.filter((n) => n.id !== id))
-    setEdges((eds) => eds.filter((e) => e.source !== id && e.target !== id))
+    setEdges((eds) => removeBoxes(eds, new Set([id])))
     setSelectedNode(null)
   }
 
@@ -4091,6 +5519,28 @@ export default function Canvas() {
       // share a base name ("Stitching #1" / "Stitching #2") are still merged
       // into one station whose capacity is the number of such boxes.
       const stationsData: ScenarioCreate['stations_data'] = {}
+      // An Assembly's settings, with the lines coming into it for the
+      // simulation, in the order connected: No. as in Assembly needs
+      // (Predecessors) or that order, amount as in Assembly needs
+      // (Predecessors) or 1.
+      const assemblyToSave = (n: Node<StationNodeData>): AssemblyConfig => {
+        const assembly = assemblySettings(n.data.assembly)
+        const incoming = incomingStations(n.id, nodes, edges)
+        const numbers = typedNumbers(assembly, incoming)
+        const lines = incoming.map((from) => {
+          const need = assembly.table === 'predecessors' ? assembly.needs?.find((x) => x.from === from) : undefined
+          return { from, no: numbers[from], amount: need?.amount ?? 1 }
+        })
+        return { ...assembly, lines }
+      }
+      // A Dismantle's settings, with its Dismantle table as shown: one row
+      // per line going out now (a deleted line's row is left out).
+      // Plus its lines out, in the order connected (successor 1, 2, ...).
+      const dismantleToSave = (n: Node<StationNodeData>): DismantleConfig => {
+        const dismantle = dismantleSettings(n.data.dismantle)
+        const outgoing = outgoingStations(n.id, nodes, edges)
+        return { ...dismantle, table: dismantleRows(dismantle, outgoing), successors: outgoing }
+      }
       const capacityCount: Record<string, number> = {}
       nodes.forEach((n) => {
         const base = stationKey(n)
@@ -4140,11 +5590,14 @@ export default function Canvas() {
             'Conveyor Sensor Length': n.data.conveyorSensor.length,
             'Conveyor Sensor Position': n.data.conveyorSensor.position === 'rear' ? 'Rear' : 'Front',
           } : {}),
-          ...(n.data.exitStrategy !== undefined ? { 'Exit Strategy': n.data.exitStrategy } : {}),
+          // Route based is always Cyclic (one saved with Random before runs Cyclic too).
+          ...(n.data.routeByProduct ? { 'Exit Strategy': 'cyclic' }
+            : n.data.exitStrategy !== undefined ? { 'Exit Strategy': n.data.exitStrategy } : {}),
           ...(n.data.exitPercentages !== undefined ? { 'Exit Percentages': n.data.exitPercentages } : {}),
           ...(n.data.exitPriorities !== undefined ? { 'Exit Priorities': n.data.exitPriorities } : {}),
-          ...(n.data.assemblyCount !== undefined ? { 'Assembly Count': n.data.assemblyCount } : {}),
-          ...(n.data.assemblyInputs !== undefined ? { 'Assembly Inputs': n.data.assemblyInputs } : {}),
+          ...(n.data.routeByProduct ? { 'Route By Product': true, 'Product Routes': n.data.productRoutes ?? {} } : {}),
+          ...(inferStationType(n.data.label, n.data.stationType) === 'Assembly' ? { 'Assembly': assemblyToSave(n) } : {}),
+          ...(inferStationType(n.data.label, n.data.stationType) === 'Dismantle' ? { 'Dismantle': dismantleToSave(n) } : {}),
           ...(n.data.setupTime !== undefined ? { 'Setup time': n.data.setupTime } : {}),
           // Buffer Quantity from the Build panel — only meaningful for a
           // Buffer node (see backend's _is_buffer hand-off); harmless to
@@ -4174,9 +5627,11 @@ export default function Canvas() {
       // passthroughs for this walk, so walking upstream from the Controller
       // resolves straight through a Workplace to the real Station wired into
       // it, and through a Connector to whatever's further upstream still.
+      // A Worker is not walked through: it is found, so it joins the pool
+      // (walked through, it was never found and the pool stayed empty).
       const isPassthroughForPoolWiring = (n: Node<StationNodeData>): boolean => {
         const t = inferStationType(n.data.label, n.data.stationType)
-        return t === 'Worker' || t === 'Connector' || t === 'Workplace'
+        return t === 'Connector' || t === 'Workplace'
       }
       const walkRealStations = (
         startId: string, direction: 'upstream' | 'downstream',
@@ -4216,7 +5671,7 @@ export default function Canvas() {
         if (!controllerConfig) return
 
         // Everything reachable upstream of this Controller (through any
-        // chain of Worker/Connector/Workplace passthroughs) — Worker nodes
+        // chain of Connector/Workplace passthroughs) — Worker nodes
         // become this Controller's pool; anything else found here is a REAL
         // station reached by walking straight through a Workplace, i.e. the
         // one station that Workplace stands in for (Station -> Workplace ->
@@ -4263,13 +5718,6 @@ export default function Canvas() {
         }
       })
 
-      // Walk the graph (which may branch/merge for parallel stations) into a
-      // single linear list of steps, one per distinct base station name, in
-      // flow order.
-      const hasIncoming = new Set(edges.map((e) => e.target))
-      const entryNodes = nodes.filter((n) => !hasIncoming.has(n.id))
-      const steps: ScenarioCreate['processflow_data'][string] = []
-      const seenStations = new Set<string>()
       // The duration written into the process-flow step. A Conveyor's time is
       // its transport time, Length / Speed (the engine computes the same but
       // falls back to the step duration), and a Connector never takes any
@@ -4286,81 +5734,11 @@ export default function Canvas() {
         if (t === 'Conveyor') return conveyorTransportTime(n.data) ?? n.data.cycleTime
         return n.data.cycleTime
       }
-      // Edges into a Worker, Worker Controller, or Workplace exist ONLY for
-      // the pool-wiring pass above (Station -> Workplace -> Worker Controller,
-      // Worker -> Worker Controller) — they are never a real "next step in
-      // the job's path," so this walk must not follow them. Without this
-      // filter, a Station wired to a Workplace would have the Workplace (and
-      // whatever it's wired to in turn) spliced into the middle of the job's
-      // actual flow, scrambling downstream routing.
-      const isPoolWiringTarget = (nodeId: string): boolean => {
-        const target = nodes.find((nn) => nn.id === nodeId)
-        if (!target) return false
-        const t = inferStationType(target.data.label, target.data.stationType)
-        return t === 'Worker' || t === 'Worker Controller' || t === 'Workplace'
-      }
 
-      // The stations of each split share a "branch" number on their steps —
-      // the engine then sends each job to only ONE of them (see
-      // _branch_slots in sim_core.py). They are pushed back to back below,
-      // since the walk reaches all of a split's stations in the same round.
-      // A parallel group's machines are one stop the same way (each job goes
-      // to one machine), so a group outside any split gets a number too.
-      const branchOf: Record<string, number> = {}
-      const splits = canvasSplits(nodes, edges)
-      splits.forEach((split, i) => {
-        for (const b of split.bases) branchOf[b] ??= i + 1
-      })
-      let nextBranch = splits.length + 1
-      for (const n of nodes) {
-        const g = n.data.parallelGroup
-        if (g && branchOf[g] === undefined && nodes.filter((o) => o.data.parallelGroup === g).length > 1) {
-          branchOf[g] = nextBranch++
-        }
-      }
-
-      let frontier = entryNodes
-      const visitedNodeIds = new Set<string>()
-      while (frontier.length > 0) {
-        const next: Node<StationNodeData>[] = []
-        for (const n of frontier) {
-          if (visitedNodeIds.has(n.id)) continue
-          visitedNodeIds.add(n.id)
-          const base = stationKey(n)
-          if (seenStations.has(base)) continue
-          seenStations.add(base)
-
-          const outgoing = edges.filter((e) => e.source === n.id && !isPoolWiringTarget(e.target))
-          const destNodes = outgoing
-            .map((e) => nodes.find((nn) => nn.id === e.target))
-            .filter((nn): nn is Node<StationNodeData> => !!nn)
-
-          // Source/Drain are entry/exit markers, not a step in the job's
-          // route — a saved scenario with a "Start"/"End" step in
-          // processflow_data shows a misleading editable column in
-          // ScenarioManager's Process Flow tab even at duration 0 (the
-          // column itself implies it's a real station). Skip pushing a step
-          // for them, but still walk through to whatever they connect to —
-          // Source has no incoming edge (it's always an entryNode) and Drain
-          // has no outgoing edges, so neither skip affects the rest of the
-          // walk.
-          const nodeType = inferStationType(n.data.label, n.data.stationType)
-          if (nodeType === 'Source' || nodeType === 'Drain') {
-            for (const d of destNodes) next.push(d)
-            continue
-          }
-
-          steps.push({
-            operation: `${base}_op`, resource: base, duration: stepDuration(n),
-            ...(branchOf[groupKey(n)] !== undefined ? { branch: branchOf[groupKey(n)] } : {}),
-          })
-          for (const d of destNodes) next.push(d)
-        }
-        frontier = next
-      }
-
-      // The canvas is ONE product's line: the product it was loaded from
-      // (picked in View/Build). A brand-new line gets a name from its first box.
+      // The product this Save writes from the Canvas: the one picked in
+      // View/Build. A brand-new line gets a name from its first box.
+      const hasIncoming = new Set(edges.map((e) => e.target))
+      const entryNodes = nodes.filter((n) => !hasIncoming.has(n.id))
       const savedFlow = (savedScenario?.processflow_data ?? {}) as ScenarioCreate['processflow_data']
       const variant = buildVariant && (buildVariant in savedFlow || !savedScenario)
         ? buildVariant
@@ -4368,6 +5746,72 @@ export default function Canvas() {
           ? `product_${baseStationName(entryNodes[0].data.label)}`.toLowerCase()
           : 'product'
       savedVariantRef.current = variant
+      // Its route: the stations along its lines on the drawing — or, while
+      // its lines are as loaded, its saved route kept as it is (a drawing
+      // shows each station once, so walking it would lose a route's second
+      // visit to a station), with only the times changed on its boxes.
+      const shownGraph = productGraph(nodes, edges, variant, variant)
+      const steps = routeFromGraph(shownGraph.nodes, shownGraph.edges, stepDuration)
+      const shownLinesBefore = loadedLinesRef.current[variant]
+      const shownLinesKept = shownLinesBefore !== undefined && graphRouteSig(
+        shownGraph.nodes, shownGraph.edges, variant, variant, (n) => n.data.savedName ?? stationKey(n),
+      ) === shownLinesBefore
+      const timesFromBoxes = (route: FlowStep[]): FlowStep[] => route.map((step) => {
+        const box = typeof step.resource === 'string'
+          ? nodes.find((n) => !isWiringNode(n) && stationKey(n) === step.resource)
+          : undefined
+        if (!box) return step
+        const changed = inferStationType(box.data.label, box.data.stationType) === 'Conveyor'
+          || box.data.cycleTime !== loadedTimesRef.current[box.id]
+        return changed ? { ...step, duration: stepDuration(box) } : step
+      })
+
+      // The drawing itself, as it is now. Every box keeps its id (a new box
+      // gets the next free id of its kind) and every flow line its products
+      // (a new line: the product on the Canvas).
+      const boxIdOf: Record<string, string> = {}
+      const highestId: Record<string, number> = {}
+      for (const n of nodes) {
+        const m = n.data.boxId?.match(/^([A-Z]+)-(\d+)$/)
+        if (m) highestId[m[1]] = Math.max(highestId[m[1]] ?? 0, Number(m[2]))
+      }
+      const usedBoxIds = new Set<string>()
+      for (const n of nodes) {
+        let id = n.data.boxId
+        if (!id || usedBoxIds.has(id)) {
+          const prefix = boxIdPrefix(n)
+          highestId[prefix] = (highestId[prefix] ?? 0) + 1
+          id = `${prefix}-${highestId[prefix]}`
+        }
+        usedBoxIds.add(id)
+        boxIdOf[n.id] = id
+      }
+      const nodeOf = new Map(nodes.map((n) => [n.id, n]))
+      const productsOf: Record<string, string[] | undefined> = {}
+      for (const e of edges) {
+        const ps = edgeProducts(e)
+        productsOf[e.id] = isFlowEdge(e, nodeOf) ? (ps !== undefined ? ps : [variant]) : undefined
+      }
+      const layout: CanvasLayout = {
+        version: 1,
+        boxes: nodes.map((n) => {
+          const data: Partial<StationNodeData> = { ...n.data }
+          delete data.savedName
+          delete data.copiedFrom
+          delete data.boxId
+          return {
+            id: boxIdOf[n.id], name: n.data.label, type: inferStationType(n.data.label, n.data.stationType),
+            x: Math.round(n.position.x), y: Math.round(n.position.y), data,
+          }
+        }),
+        lines: edges.filter((e) => nodeOf.has(e.source) && nodeOf.has(e.target)).map((e) => ({
+          from: boxIdOf[e.source],
+          to: boxIdOf[e.target],
+          ...(productsOf[e.id] ? { products: productsOf[e.id] } : {}),
+          ...(typeof e.label === 'string' && e.label ? { label: e.label } : {}),
+        })),
+      }
+      savedDrawingRef.current = { boxIdOf, productsOf }
 
       // Editing the scenario that's already open updates it in place (same
       // id, same row) instead of creating a second copy. Only this product's
@@ -4405,25 +5849,47 @@ export default function Canvas() {
         }
         const processflow: ScenarioCreate['processflow_data'] = {}
         for (const [v, otherSteps] of Object.entries(savedFlow)) {
-          processflow[v] = v === variant ? steps : followRenames(otherSteps)
+          if (v === variant) continue
+          // Another product keeps its route as saved — unless its lines on
+          // the drawing were changed here; then its route follows them, each
+          // station keeping its time.
+          const graph = productGraph(nodes, edges, v, variant)
+          const drawn = graphRouteSig(graph.nodes, graph.edges, v, variant, (n) => n.data.savedName ?? stationKey(n))
+          const before = loadedLinesRef.current[v]
+          if (before !== undefined ? drawn === before : drawn === EMPTY_ROUTE_SIG || drawn === routeSig(otherSteps)) {
+            processflow[v] = followRenames(otherSteps)
+            continue
+          }
+          const timeOf: Record<string, number> = {}
+          for (const st of otherSteps) for (const r of stepResourceOptions(st.resource)) timeOf[r] = st.duration
+          processflow[v] = routeFromGraph(graph.nodes, graph.edges, (n) => {
+            const name = n.data.savedName ?? stationKey(n)
+            return inferStationType(n.data.label, n.data.stationType) !== 'Conveyor' && name in timeOf ? timeOf[name] : stepDuration(n)
+          })
         }
-        processflow[variant] = steps
+        processflow[variant] = shownLinesKept && savedFlow[variant]
+          ? timesFromBoxes(followRenames(savedFlow[variant]))
+          : steps
         const variantQty: Record<string, number> = {
           ...(savedScenario.variant_quantities ?? {}),
           [variant]: savedScenario.variant_quantities?.[variant] ?? 200,
         }
+        layout.routes = Object.fromEntries(Object.entries(processflow).map(([v, st]) => [v, routeSig(st)]))
         return scenariosApi.update(activeScenario.id, {
           name: scenarioName, stations_data: stationsData, processflow_data: processflow,
           variant_quantities: variantQty,
           variant_intervals: savedScenario.variant_intervals ?? {},
+          canvas_layout: layout,
         })
       }
 
       const processflow: ScenarioCreate['processflow_data'] = { [variant]: steps }
       const variantQty: Record<string, number> = { [variant]: 200 }
+      layout.routes = { [variant]: routeSig(steps) }
       return scenariosApi.create({
         name: scenarioName, stations_data: stationsData, processflow_data: processflow,
         variant_quantities: variantQty,
+        canvas_layout: layout,
         operators_data: { Op1: { 'Skill Rating': 3, 'Availability (%)': 100 } },
         simulation_config: {
           SIM_TIME: 10080, SHIFT_DURATION: 480,
@@ -4436,14 +5902,24 @@ export default function Canvas() {
       queryClient.invalidateQueries({ queryKey: ['scenarios'] })
       setActiveScenario(scenario)
       setJustReset(false)
-      // Each box is now saved under its own station name.
-      const savedNodes = nodes.map((n) => (
-        n.data.savedName === stationKey(n)
+      // Each box is now saved under its own station name and id, and each
+      // line with its products.
+      const drawing = savedDrawingRef.current
+      const savedNodes = nodes.map((n) => {
+        const boxId = drawing?.boxIdOf[n.id] ?? n.data.boxId
+        return n.data.savedName === stationKey(n) && n.data.boxId === boxId
           ? n
-          : { ...n, data: { ...n.data, savedName: stationKey(n) } }
-      ))
+          : { ...n, data: { ...n.data, savedName: stationKey(n), boxId } }
+      })
+      const savedEdges = edges.map((e) => {
+        const ps = drawing?.productsOf[e.id]
+        return ps && JSON.stringify(ps) !== JSON.stringify(edgeProducts(e)) ? withProducts(e, ps) : e
+      })
       setNodes(savedNodes)
-      setSavedSignature(canvasSignatureOf(savedNodes, edges))
+      setEdges(savedEdges)
+      setSavedSignature(canvasSignatureOf(savedNodes, savedEdges))
+      loadedLinesRef.current = linesByProduct(Object.keys(scenario.processflow_data ?? {}), savedNodes, savedEdges)
+      loadedTimesRef.current = Object.fromEntries(savedNodes.map((n) => [n.id, n.data.cycleTime]))
       // The canvas now shows this saved product.
       if (savedVariantRef.current) {
         setBuildVariant(savedVariantRef.current)
@@ -4473,13 +5949,41 @@ export default function Canvas() {
       showToast('Connect your stations before saving (drag from one box to the next)', 'error')
       return
     }
+    // Every Assembly box (also one never opened: its defaults count too).
+    // Assembly needs (Predecessors) too: a wrong No. or amount.
+    const assemblyIssue = (n: Node<StationNodeData>) => {
+      if (inferStationType(n.data.label, n.data.stationType) !== 'Assembly') return undefined
+      const assembly = assemblySettings(n.data.assembly)
+      const incoming = incomingStations(n.id, nodes, edges)
+      return assemblyProblem(assembly, incoming.length) ?? needsProblem(assembly, incoming)
+    }
+    const badAssembly = nodes.find((n) => assemblyIssue(n))
+    if (badAssembly) {
+      showToast(`${badAssembly.data.label}: ${assemblyIssue(badAssembly)}`, 'error')
+      return
+    }
+    const dismantleIssue = (n: Node<StationNodeData>) => inferStationType(n.data.label, n.data.stationType) === 'Dismantle'
+      ? dismantleProblem(dismantleSettings(n.data.dismantle), outgoingStations(n.id, nodes, edges).length)
+      : undefined
+    const badDismantle = nodes.find((n) => dismantleIssue(n))
+    if (badDismantle) {
+      showToast(`${badDismantle.data.label}: ${dismantleIssue(badDismantle)}`, 'error')
+      return
+    }
+    // Every box needs its own name — the simulation finds stations by name.
+    const named = nodes.filter((n) => !isWiringNode(n))
+    const sameName = named.find((n, i) => named.findIndex((o) => o.data.label.trim() === n.data.label.trim()) !== i)
+    if (sameName) {
+      showToast(`Two boxes are named "${sameName.data.label}" — give each box its own name`, 'error')
+      return
+    }
     const badPriorities = nodes.find((n) => {
-      const successors = exitSuccessorLabels(n.id, nodes, edges)
+      const successors = exitSuccessorLabels(n.id, nodes, productEdges)
       return n.data.exitStrategy === 'successor' && successors.length > 1
         && !exitPrioritiesAreValid(exitPriorityValues(n.data, successors))
     })
     if (badPriorities) {
-      showToast(`${badPriorities.data.label}: Exit Controller priorities must use each number from 1 to ${exitSuccessorLabels(badPriorities.id, nodes, edges).length} once`, 'error')
+      showToast(`${badPriorities.data.label}: Exit Controller priorities must use each number from 1 to ${exitSuccessorLabels(badPriorities.id, nodes, productEdges).length} once`, 'error')
       return
     }
     const emptyConveyor = nodes.find((n) =>
@@ -4499,10 +6003,26 @@ export default function Canvas() {
       showToast(`${noSpeed.data.label}: Conveyor speed must be more than 0`, 'error')
       return
     }
-    const badSplit = canvasSplits(nodes, edges).find((s) => s.problem)
+    const badSensor = conveyors.find((n) => n.data.conveyorSensor && n.data.conveyorSensor.length > (n.data.conveyorLength ?? 0))
+    if (badSensor) {
+      showToast(`${badSensor.data.label}: sensor (${formatDecimal(badSensor.data.conveyorSensor!.length)} m) is longer than the conveyor (${formatDecimal(badSensor.data.conveyorLength ?? 0)} m)`, 'error')
+      return
+    }
+    const badSplit = canvasSplits(nodes, productEdges).find((s) => s.problem)
     if (badSplit) {
       showToast(`${badSplit.sourceLabel}: ${badSplit.problem}`, 'error')
       return
+    }
+    // Route by product: every product needs at least one ticked station.
+    for (const n of nodes) {
+      if (!n.data.routeByProduct || variants.length < 2) continue
+      const successors = exitSuccessorLabels(n.id, nodes, productEdges)
+      if (successors.length < 2) continue
+      const none = variants.find((p) => !(n.data.productRoutes?.[p] ?? []).some((s) => successors.includes(s)))
+      if (none) {
+        showToast(`${n.data.label}: Route based — tick at least one station for ${none}`, 'error')
+        return
+      }
     }
     const groupProblem = parallelGroupProblem(nodes, edges)
     if (groupProblem) {
@@ -4537,22 +6057,32 @@ export default function Canvas() {
   // quantity and interval; Name from the Start's saved table. Products keep
   // the saved table's order, then any others. A canvas not saved yet as a
   // scenario only has the table on its Start box.
+  // The MU table: the products of every Start together, each with the Start
+  // that releases it — the Start whose own MU table lists it (one listed
+  // nowhere: the first Start, as the simulation does too).
+  const startBoxes = nodes.filter((n) => inferStationType(n.data.label, n.data.stationType) === 'Source')
+  const startTableOf = (startNode: Node<StationNodeData>): MuRow[] => startNode.data.muTable
+    ?? activeScenario?.stations_data?.[stationKey(startNode)]?.['MU Table'] ?? []
   const muTableRows = (startNode: Node<StationNodeData>): MuDialogRow[] => {
-    const savedTable: MuRow[] = startNode.data.muTable
-      ?? activeScenario?.stations_data?.[stationKey(startNode)]?.['MU Table'] ?? []
-    if (!activeScenario) return savedTable.map((r, i) => ({ ...r, color: r.color ?? defaultVariantColor(i) }))
+    const starts = startBoxes.length > 0 ? startBoxes : [startNode]
+    const listed = starts.flatMap((st) => startTableOf(st).map((r) => ({ row: r, start: stationKey(st) })))
+    const ownerOf = (v: string) => listed.find((x) => x.row.mu === v)
+    if (!activeScenario) {
+      return listed.map(({ row, start }, i) => ({ ...row, start, color: row.color ?? defaultVariantColor(i) }))
+    }
     const products = Array.from(new Set([
-      ...savedTable.map((r) => r.mu),
+      ...listed.map((x) => x.row.mu),
       ...Object.keys(activeScenario.processflow_data ?? {}),
       ...Object.keys(activeScenario.variant_quantities ?? {}),
     ])).filter((v) => v in (activeScenario.processflow_data ?? {}) || v in (activeScenario.variant_quantities ?? {}))
     return products.map((v, i) => ({
       mu: v,
       orig: v,
-      color: savedTable.find((r) => r.mu === v)?.color ?? defaultVariantColor(i),
+      color: ownerOf(v)?.row.color ?? defaultVariantColor(i),
       number: activeScenario.variant_quantities?.[v] ?? 0,
-      name: savedTable.find((r) => r.mu === v)?.name ?? '',
+      name: ownerOf(v)?.row.name ?? '',
       interval: activeScenario.variant_intervals?.[v] ?? null,
+      start: ownerOf(v)?.start ?? stationKey(starts[0]),
     }))
   }
 
@@ -4576,16 +6106,21 @@ export default function Canvas() {
   // copy of the chosen product's route; a deleted row takes its route with
   // it. Name is kept in the Start's own settings.
   const applyMuTable = async (startNode: Node<StationNodeData>, rows: MuDialogRow[]) => {
-    const table: MuRow[] = rows.map(({ mu, number, name, interval, color }) => ({ mu, number, name, interval: interval ?? null, color }))
-    // The Start's Exit Controller entries follow renamed products; deleted
-    // ones go, new ones start unset.
-    const byProduct = (values?: Record<string, number>) => (values ? Object.fromEntries(
-      rows.filter((r) => r.orig !== undefined && r.orig in values).map((r) => [r.mu, values[r.orig!]]),
+    // Each Start keeps its own products in its own MU table.
+    const starts = startBoxes.length > 0 ? startBoxes : [startNode]
+    const isStart = (n: Node<StationNodeData>) => starts.some((st) => st.id === n.id)
+    const ownRows = (st: Node<StationNodeData>) => rows.filter((r) => (r.start ?? stationKey(startNode)) === stationKey(st))
+    const tableOf = (st: Node<StationNodeData>): MuRow[] => ownRows(st)
+      .map(({ mu, number, name, interval, color }) => ({ mu, number, name, interval: interval ?? null, color }))
+    // A Start's Exit Controller entries follow its renamed products; deleted
+    // (or moved to another Start) ones go, new ones start unset.
+    const byProduct = (st: Node<StationNodeData>, values?: Record<string, number>) => (values ? Object.fromEntries(
+      ownRows(st).filter((r) => r.orig !== undefined && r.orig in values).map((r) => [r.mu, values[r.orig!]]),
     ) : undefined)
-    const muPriorities = byProduct(startNode.data.muPriorities)
-    const muPercentages = byProduct(startNode.data.muPercentages)
     const setStartTable = () => setNodes((nds) => nds.map((n) => (
-      n.id === startNode.id ? { ...n, data: { ...n.data, muTable: table, muPriorities, muPercentages } } : n
+      isStart(n)
+        ? { ...n, data: { ...n.data, muTable: tableOf(n), muPriorities: byProduct(n, n.data.muPriorities), muPercentages: byProduct(n, n.data.muPercentages) } }
+        : n
     )))
     if (!activeScenario) {
       setStartTable()
@@ -4618,25 +6153,71 @@ export default function Canvas() {
         if (Object.keys(kept).length > 0) setupMatrix[station] = kept
       }
       // Name lives in the Start's settings (a Start, so the engine skips it).
-      const startKey = stationKey(startNode)
       const stations = { ...(fresh.stations_data ?? {}) }
-      stations[startKey] = {
-        ...(stations[startKey] ?? { 'Station Type': 'Source', capacity: 1, shifts_per_day: 1, operator_per_station: 0 }),
-        'MU Table': table,
-        'MU Strategy': startNode.data.muStrategy ?? stations[startKey]?.['MU Strategy'] ?? 'cyclic',
-        ...(muPriorities ? { 'MU Priorities': muPriorities } : {}),
-        ...(muPercentages ? { 'MU Percentages': muPercentages } : {}),
-      } as StationConfig
+      // Route by product ticks follow renamed products; a deleted product's go.
+      const followProducts = (routes?: Record<string, string[]>) => (routes ? Object.fromEntries(
+        Object.entries(routes).filter(([p]) => p in renamed).map(([p, to]) => [renamed[p], to]),
+      ) : routes)
+      for (const [name, cfg] of Object.entries(stations)) {
+        if (cfg['Product Routes']) stations[name] = { ...cfg, 'Product Routes': followProducts(cfg['Product Routes']) }
+      }
+      for (const st of starts) {
+        const key = stationKey(st)
+        const muPriorities = byProduct(st, st.data.muPriorities)
+        const muPercentages = byProduct(st, st.data.muPercentages)
+        stations[key] = {
+          ...(stations[key] ?? { 'Station Type': 'Source', capacity: 1, shifts_per_day: 1, operator_per_station: 0 }),
+          'MU Table': tableOf(st),
+          'MU Strategy': st.data.muStrategy ?? stations[key]?.['MU Strategy'] ?? 'cyclic',
+          ...(muPriorities ? { 'MU Priorities': muPriorities } : {}),
+          ...(muPercentages ? { 'MU Percentages': muPercentages } : {}),
+        } as StationConfig
+      }
+      // Lines on the drawing follow the products: renamed, copied for a new
+      // product, gone with a deleted one.
+      const retag = (products: string[]) => {
+        const next = new Set<string>()
+        for (const p of products) if (p in renamed) next.add(renamed[p])
+        for (const r of rows) if (r.orig === undefined && r.copyFrom && products.includes(r.copyFrom)) next.add(r.mu)
+        return Array.from(next)
+      }
+      const savedRoutes = fresh.canvas_layout?.routes
+      const layout = fresh.canvas_layout
+        ? {
+            ...fresh.canvas_layout,
+            lines: fresh.canvas_layout.lines.flatMap((l) => {
+              if (!l.products || l.products.length === 0) return [l]
+              const products = retag(l.products)
+              return products.length > 0 ? [{ ...l, products }] : []
+            }),
+            routes: savedRoutes
+              ? Object.fromEntries(rows.flatMap((r) => {
+                  const from = r.orig ?? r.copyFrom
+                  return from !== undefined && savedRoutes[from] !== undefined ? [[r.mu, savedRoutes[from]]] : []
+                }))
+              : undefined,
+          }
+        : undefined
       const updated = await scenariosApi.update(activeScenario.id, {
         processflow_data: processflow,
         variant_quantities: quantities,
         variant_intervals: intervals,
         setup_matrix: setupMatrix,
         stations_data: stations,
+        ...(layout ? { canvas_layout: layout } : {}),
       })
       queryClient.invalidateQueries({ queryKey: ['scenarios'] })
       setActiveScenario(updated)
       setStartTable()
+      setNodes((nds) => nds.map((n) => (
+        n.data.productRoutes ? { ...n, data: { ...n.data, productRoutes: followProducts(n.data.productRoutes) } } : n
+      )))
+      setEdges((eds) => eds.flatMap((e) => {
+        const ps = edgeProducts(e)
+        if (!ps || ps.length === 0) return [e]
+        const products = retag(ps)
+        return products.length > 0 ? [withProducts(e, products)] : []
+      }))
       // The product on the canvas follows its rename; if it was deleted,
       // open another one.
       const shown = buildVariant ?? selectedVariant
@@ -4652,6 +6233,70 @@ export default function Canvas() {
       showToast((err as Error).message || 'Could not save the products', 'error')
       throw err
     }
+  }
+
+  // Routes table. A product's ticks are the stations on its lines; Apply
+  // gives each product the lines between its ticked stations, the line from
+  // its own Start and the line into End — the order of the route still
+  // comes from the drawing. The drawing itself never changes.
+  const isRouteStation = (n: Node<StationNodeData>) => {
+    const t = inferStationType(n.data.label, n.data.stationType)
+    return t !== 'Source' && t !== 'Drain' && !isWiringNode(n)
+  }
+  const routeTicksNow = (): Record<string, string[]> => Object.fromEntries(variants.map((p) => [p, Array.from(new Set(
+    edges.filter((e) => isFlowEdge(e, nodeById) && lineIsFor(e, p, buildVariant))
+      .flatMap((e) => [nodeById.get(e.source)!, nodeById.get(e.target)!])
+      .filter(isRouteStation)
+      .map(groupKey),
+  ))]))
+  // The Start(s) a product comes from: its "Released from" in the MU table.
+  const releasingStarts = (p: string): Node<StationNodeData>[] => {
+    if (startBoxes.length < 2) return startBoxes
+    const owner = muTableRows(startBoxes[0]).find((r) => r.mu === p)?.start
+    const own = startBoxes.filter((st) => stationKey(st) === owner)
+    return own.length > 0 ? own : startBoxes
+  }
+  const routeLines = (p: string, ticked: string[]): Set<string> => {
+    const on = (n: Node<StationNodeData>) => isRouteStation(n) && ticked.includes(groupKey(n))
+    const starts = new Set(releasingStarts(p).map((n) => n.id))
+    const flow = edges.filter((e) => isFlowEdge(e, nodeById))
+    const middle = flow.filter((e) => on(nodeById.get(e.source)!) && on(nodeById.get(e.target)!))
+    const fromStart = flow.filter((e) => starts.has(e.source) && on(nodeById.get(e.target)!))
+    const toEnd = flow.filter((e) => on(nodeById.get(e.source)!)
+      && inferStationType(nodeById.get(e.target)!.data.label, nodeById.get(e.target)!.data.stationType) === 'Drain'
+      && !middle.some((m) => m.source === e.source))
+    return new Set([...middle, ...fromStart, ...toEnd].map((e) => e.id))
+  }
+  const routeProblems = (ticks: Record<string, string[]>): string[] => variants.flatMap((p) => {
+    const ticked = ticks[p] ?? []
+    if (ticked.length === 0) return [`${p}: tick at least one station.`]
+    const lines = edges.filter((e) => routeLines(p, ticked).has(e.id))
+    const reached = new Set<string>()
+    let frontier = releasingStarts(p).map((n) => n.id)
+    const seen = new Set(frontier)
+    while (frontier.length > 0) {
+      const next: string[] = []
+      for (const id of frontier) {
+        for (const e of lines.filter((l) => l.source === id)) {
+          const n = nodeById.get(e.target)!
+          if (isRouteStation(n)) reached.add(groupKey(n))
+          if (!seen.has(n.id)) { seen.add(n.id); next.push(n.id) }
+        }
+      }
+      frontier = next
+    }
+    const starts = releasingStarts(p).map((n) => n.data.label).join(' / ') || 'a Start'
+    return ticked.filter((st) => !reached.has(st))
+      .map((st) => `${p}: ${st} is ticked, but no line reaches it from ${starts} through its ticked stations — draw the line or untick it.`)
+  })
+  const applyRoutes = (ticks: Record<string, string[]>) => {
+    const linesOf = Object.fromEntries(variants.map((p) => [p, routeLines(p, ticks[p] ?? [])]))
+    setEdges((eds) => eds.map((e) => {
+      if (!isFlowEdge(e, nodeById)) return e
+      const had = edgeProducts(e) ?? (buildVariant ? [buildVariant] : [])
+      const kept = had.filter((p) => !variants.includes(p))
+      return withProducts(e, [...kept, ...variants.filter((p) => linesOf[p].has(e.id))])
+    }))
   }
 
   const pickBuildProduct = (v: string) => {
@@ -4924,13 +6569,24 @@ export default function Canvas() {
                   ))}
                 </div>
               )}
+              {activeScenario && variants.length > 0 && nodes.length > 0 && (
+                <button
+                  onClick={() => { setRoutesOpen((o) => !o); setSelectedNode(null); setSelectedEdgeId(null) }}
+                  className={`px-3 py-1.5 text-xs font-semibold rounded-lg border transition-colors ${routesOpen
+                    ? 'bg-indigo-600 text-white border-indigo-600'
+                    : 'text-indigo-600 bg-indigo-50 hover:bg-indigo-100 border-indigo-100'}`}
+                >
+                  Routes
+                </button>
+              )}
               <span className="text-xs text-gray-400">{nodes.length} stations · {edges.length} connections</span>
               {muDialogNodeId && (() => {
                 const startNode = nodes.find((n) => n.id === muDialogNodeId)
                 if (!startNode) return null
                 return (
                   <MuTableDialog
-                    startName={startNode.data.label}
+                    startName={stationKey(startNode)}
+                    starts={startBoxes.map(stationKey)}
                     initial={muTableRows(startNode)}
                     onApply={(rows) => applyMuTable(startNode, rows)}
                     onClose={() => setMuDialogNodeId(null)}
@@ -5055,7 +6711,7 @@ export default function Canvas() {
                 }}
               >
               <ReactFlow
-                nodes={nodes}
+                nodes={visibleNodes}
                 edges={visibleEdges}
                 onNodesChange={onNodesChange}
                 onEdgesChange={onEdgesChange}
@@ -5079,11 +6735,12 @@ export default function Canvas() {
                 onNodeClick={(_, node) => {
                   setSelectedNode(node as Node<StationNodeData>)
                   setSelectedEdgeId(null)
+                  setRoutesOpen(false)
                   // Clicking Start opens its MU table.
                   const data = (node as Node<StationNodeData>).data
                   if (inferStationType(data.label, data.stationType) === 'Source') setMuDialogNodeId(node.id)
                 }}
-                onEdgeClick={(_, edge) => { setSelectedEdgeId(edge.id); setSelectedNode(null) }}
+                onEdgeClick={(_, edge) => { setSelectedEdgeId(edge.id); setSelectedNode(null); setRoutesOpen(false) }}
                 onPaneClick={() => { setSelectedNode(null); setSelectedEdgeId(null) }}
                 nodesDraggable
                 elementsSelectable
@@ -5123,6 +6780,8 @@ export default function Canvas() {
                     completionLog={completionLog}
                     releaseTimes={replayState?.job_release_times}
                     finishTimes={replayState?.job_finish_times}
+                    assemblies={replayState?.assemblies}
+                    dismantles={replayState?.dismantles}
                     targets={replayTargets}
                     variantColors={variantColors}
                   />
@@ -5526,19 +7185,38 @@ export default function Canvas() {
             </div>
           )}
 
+          {/* Routes panel — from the Routes button in the top bar. */}
+          {mode === 'build' && routesOpen && !selectedNode && !selectedEdgeId && (
+            <div className="w-56 border-l border-gray-200 bg-white p-3 overflow-y-auto">
+              <RoutesPanel
+                products={variants}
+                stations={routeStations}
+                colors={variantColorsNow}
+                initial={routeTicksNow()}
+                problemsOf={routeProblems}
+                onApply={applyRoutes}
+                onClose={() => setRoutesOpen(false)}
+              />
+            </div>
+          )}
+
           {/* Build mode property panel */}
           {mode === 'build' && selectedNode && (
             <div className="w-56 border-l border-gray-200 bg-white p-3 overflow-y-auto">
               <PropertyEditor
                 node={selectedNode}
                 nodes={nodes}
-                edges={edges}
+                edges={productEdges}
+                allEdges={edges}
                 onChange={updateNode}
                 onDelete={deleteNode}
                 onSaveStation={() => { setSelectedNode(null); handleSave(false) }}
                 onAddParallel={addParallelMachine}
                 onOpenMuTable={setMuDialogNodeId}
-                startProducts={inferStationType(selectedNode.data.label, selectedNode.data.stationType) === 'Source' ? muTableRows(selectedNode).map((r) => r.mu) : []}
+                products={variants}
+                startProducts={inferStationType(selectedNode.data.label, selectedNode.data.stationType) === 'Source'
+                  ? muTableRows(selectedNode).filter((r) => r.start === stationKey(selectedNode)).map((r) => r.mu)
+                  : []}
                 onAddWorkplace={addWorkplaceFor}
                 onRemoveWorkplace={removeWorkplaceFor}
                 onToggleWire={toggleWire}
@@ -5547,6 +7225,11 @@ export default function Canvas() {
                 numShifts={numShifts}
                 shiftNames={shiftNames}
                 operatorsData={activeScenario?.operators_data ?? {}}
+                workerResults={Object.fromEntries(Object.values(activeRun?.result?.worker_pool_stats ?? {})
+                  .flatMap((p) => (p.workers ?? []).map((w) => [w.name, w] as const)))}
+                stationStates={(activeRun?.result?.station_states as Record<string, StationStateStat> | undefined) ?? {}}
+                bufferStates={(activeRun?.result?.buffer_states as Record<string, BufferStateStat> | undefined) ?? {}}
+                partsFlow={activeRun?.result?.parts_flow as PartsFlow | undefined}
               />
             </div>
           )}

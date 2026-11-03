@@ -20,6 +20,7 @@ class ScenarioCreate(BaseModel):
     setup_matrix: Dict[str, Dict[str, float]] = Field(default_factory=dict)
     operators_data: Dict[str, Any] = Field(default_factory=dict)
     simulation_config: Dict[str, Any] = Field(default_factory=dict)
+    canvas_layout: Optional[Dict[str, Any]] = None
     source_filename: Optional[str] = None
     source_file: Optional[List[int]] = None
 
@@ -34,6 +35,7 @@ class ScenarioUpdate(BaseModel):
     setup_matrix: Optional[Dict[str, Dict[str, float]]] = None
     operators_data: Optional[Dict[str, Any]] = None
     simulation_config: Optional[Dict[str, Any]] = None
+    canvas_layout: Optional[Dict[str, Any]] = None
 
 
 class ScenarioResponse(BaseModel):
@@ -49,6 +51,7 @@ class ScenarioResponse(BaseModel):
     setup_matrix: Dict[str, Dict[str, float]] = Field(default_factory=dict)
     operators_data: Dict[str, Any]
     simulation_config: Dict[str, Any]
+    canvas_layout: Optional[Dict[str, Any]] = None
 
     model_config = {"from_attributes": True}
 
