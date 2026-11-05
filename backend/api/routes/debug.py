@@ -8,7 +8,8 @@ from backend.api.auth import require_auth
 
 router = APIRouter(prefix="/api/debug", tags=["debug"])
 
-_LOG_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "..", "linksim.log")
+_LOG_PATH = os.path.join(os.environ.get("LINKSIM_DATA_DIR") or os.path.join(os.path.dirname(__file__), "..", "..", ".."),
+                         "linksim.log")
 
 
 @router.get("/log")

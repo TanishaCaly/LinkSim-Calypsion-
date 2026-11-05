@@ -1,14 +1,13 @@
 import { useMemo, useEffect } from 'react'
 import * as THREE from 'three'
-import { makeLabelTexture } from './makeLabelTexture'
 import type { Connection3D } from './layout'
 
 interface FlowLineProps {
   connection: Connection3D
 }
 
-export default function FlowLine({ connection }: FlowLineProps) {
-  const { tubeGeometry, midpoint, arrowPositions } = useMemo(() => {
+// The tube along a connection and the arrows on it.
+export function buildFlow(connection: Connection3D) {
     const from = new THREE.Vector3(...connection.from)
     const to = new THREE.Vector3(...connection.to)
 
@@ -35,24 +34,11 @@ export default function FlowLine({ connection }: FlowLineProps) {
       arrows.push({ pos: p, rot })
     }
 
-    return { tubeGeometry: tubeGeo, midpoint: mid, arrowPositions: arrows }
-  }, [connection.from, connection.to])
+    return { tubeGeometry: tubeGeo, arrowPositions: arrows }
+}
 
-  const labelText = `${connection.operation} · ${connection.duration} min`
-  const subtext = `→ ${connection.toStation}`
-
-  const labelTexture = useMemo(
-    () => makeLabelTexture({
-      text: labelText,
-      subtext,
-      fontSize: 11,
-      backgroundColor: 'rgba(255,255,255,0.92)',
-      shadow: true,
-    }),
-    [labelText, subtext],
-  )
-
-  useEffect(() => () => { labelTexture.dispose() }, [labelTexture])
+export default function FlowLine({ connection }: FlowLineProps) {
+  const { tubeGeometry, arrowPositions } = useMemo(() => buildFlow(connection), [connection])
 
   useEffect(() => () => { tubeGeometry.dispose() }, [tubeGeometry])
 
@@ -65,7 +51,7 @@ export default function FlowLine({ connection }: FlowLineProps) {
           roughness={0.5}
           metalness={0.2}
           transparent
-          opacity={0.85}
+          opacity={connection.dim ? 0.2 : 0.85}
         />
       </mesh>
 
@@ -78,18 +64,12 @@ export default function FlowLine({ connection }: FlowLineProps) {
               color="#64748b"
               roughness={0.4}
               metalness={0.3}
+              transparent={!!connection.dim}
+              opacity={connection.dim ? 0.2 : 1}
             />
           </mesh>
         </group>
       ))}
-
-      {/* Flow label */}
-      <sprite
-        position={[midpoint.x, midpoint.y + 0.9, midpoint.z]}
-        scale={[3.2, 1.0, 1]}
-      >
-        <spriteMaterial map={labelTexture} transparent depthTest={false} />
-      </sprite>
     </group>
   )
 }

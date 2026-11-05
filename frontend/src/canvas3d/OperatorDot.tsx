@@ -1,12 +1,15 @@
-import { useRef, useState, useMemo, useEffect } from 'react'
+import { Suspense, useRef, useState, useMemo, useEffect } from 'react'
 import { useFrame } from '@react-three/fiber'
 import * as THREE from 'three'
 import { makeOperatorTooltipTexture } from './makeLabelTexture'
 import type { Operator3D } from './layout'
+import StationModel from './StationModel'
+import type { AnimState } from './stationActivity'
+import { STATION_MODELS } from '@/lib/stationTypes'
 
 interface OperatorDotProps {
   operator: Operator3D
-  onHighlight?: (machineId: string | null) => void
+  getState?: () => AnimState
 }
 
 const SKILL_COLORS: Record<number, string> = {
@@ -17,15 +20,13 @@ const SKILL_COLORS: Record<number, string> = {
   5: '#3b82f6',
 }
 
-function skillColor(skill: number): string {
+export function skillColor(skill: number): string {
   return SKILL_COLORS[Math.min(Math.max(skill, 1), 5)] ?? '#94a3b8'
 }
 
-export default function OperatorDot({ operator, onHighlight }: OperatorDotProps) {
-  const meshRef = useRef<THREE.Mesh>(null)
+export default function OperatorDot({ operator, getState }: OperatorDotProps) {
   const glowRef = useRef<THREE.Mesh>(null)
   const [hovered, setHovered] = useState(false)
-  const targetScale = useRef(new THREE.Vector3(1, 1, 1))
 
   const color = skillColor(operator.skill)
 
@@ -40,12 +41,8 @@ export default function OperatorDot({ operator, onHighlight }: OperatorDotProps)
 
   useEffect(() => () => { tooltipTexture.dispose() }, [tooltipTexture])
 
+  // Hover feedback is the floor glow and the tooltip — the model keeps its size.
   useFrame((_, delta) => {
-    if (!meshRef.current) return
-    const s = hovered ? 1.4 : 1
-    targetScale.current.set(s, s, s)
-    meshRef.current.scale.lerp(targetScale.current, 0.1)
-
     if (glowRef.current) {
       const mat = glowRef.current.material as THREE.MeshBasicMaterial
       mat.opacity += ((hovered ? 0.25 : 0) - mat.opacity) * Math.min(delta * 8, 1)
@@ -70,42 +67,41 @@ export default function OperatorDot({ operator, onHighlight }: OperatorDotProps)
         <meshBasicMaterial color={color} transparent opacity={0} side={THREE.DoubleSide} />
       </mesh>
 
-      {/* Cylinder body */}
-      <mesh
-        ref={meshRef}
-        position={[0, 0.4, 0]}
+      {/* Body: the Worker model, or the skill-colored cylinder while it loads */}
+      <group
         onPointerOver={(e) => {
           e.stopPropagation()
           setHovered(true)
-          onHighlight?.(operator.machineId)
           document.body.style.cursor = 'pointer'
         }}
         onPointerOut={() => {
           setHovered(false)
-          onHighlight?.(null)
           document.body.style.cursor = 'auto'
         }}
-        castShadow
       >
-        <cylinderGeometry args={[0.18, 0.22, 0.8, 12]} />
-        <meshStandardMaterial
-          color={color}
-          roughness={0.35}
-          metalness={0.25}
-          emissive={color}
-          emissiveIntensity={hovered ? 0.3 : 0.08}
-        />
-      </mesh>
-
-      {/* Top cap */}
-      <mesh position={[0, 0.81, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-        <circleGeometry args={[0.18, 12]} />
-        <meshStandardMaterial
-          color={color}
-          roughness={0.3}
-          metalness={0.3}
-        />
-      </mesh>
+        <Suspense
+          fallback={
+            <>
+              <mesh position={[0, 0.4, 0]} castShadow>
+                <cylinderGeometry args={[0.18, 0.22, 0.8, 12]} />
+                <meshStandardMaterial
+                  color={color}
+                  roughness={0.35}
+                  metalness={0.25}
+                  emissive={color}
+                  emissiveIntensity={hovered ? 0.3 : 0.08}
+                />
+              </mesh>
+              <mesh position={[0, 0.81, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+                <circleGeometry args={[0.18, 12]} />
+                <meshStandardMaterial color={color} roughness={0.3} metalness={0.3} />
+              </mesh>
+            </>
+          }
+        >
+          <StationModel url={STATION_MODELS.Worker} getState={getState} inPlace />
+        </Suspense>
+      </group>
 
       {/* Tooltip on hover */}
       {hovered && (

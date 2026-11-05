@@ -1,14 +1,29 @@
-import { Canvas } from '@react-three/fiber'
+import { Canvas, useThree, type GLProps } from '@react-three/fiber'
 import { OrbitControls, Grid } from '@react-three/drei'
-import { useState, useCallback, useRef, useMemo, useEffect } from 'react'
+import { Suspense, useState, useCallback, useRef, useMemo, useEffect } from 'react'
 import MachineBox from './MachineBox'
-import LabelSprite from './LabelSprite'
+import CameraRig from './CameraRig'
+import FactoryShell from './FactoryShell'
+import StationModel from './StationModel'
+import InstancedStations, { type BatchItem } from './InstancedStations'
+import InstancedOperators from './InstancedOperators'
+import InstancedFlow from './InstancedFlow'
+import InstancedMachines from './InstancedMachines'
+import NearShadowLight from './NearShadowLight'
+import { canInstance, instancingOn } from './instancing'
+import { STATION_MODELS } from '@/lib/stationTypes'
+import { TagProjector, TagOverlay, type TagBus } from './StationTags'
+import { buildTagAnchors } from './tags'
+import { CineonToneMapping } from 'three'
+import PerfProbe from './PerfProbe'
+import { createWebGPURenderer, isWebGPU, preferredRenderer } from './renderer'
 import OperatorDot from './OperatorDot'
 import FlowLine from './FlowLine'
-import JobParticle from './JobParticle'
-import QueueStack from './QueueStack'
+import JobMarkers from './JobMarkers'
 import MachineDetail from './MachineDetail'
-import type { Machine3D, Operator3D, Connection3D, StepLabel } from './layout'
+import type { Machine3D, Operator3D, Connection3D, StepLabel, Prop3D } from './layout'
+import { buildStationActivity, activeCount, type AnimState } from './stationActivity'
+import type { AssemblyInfo, DismantleInfo } from './jobTimeline'
 import type { StationConfig, OperatorConfig } from '@/types'
 
 export interface TimelineRefs {
@@ -19,7 +34,12 @@ export interface TimelineRefs {
   totalMs: React.MutableRefObject<number>
   setScrubUI: (pct: number) => void
   setTotalMsUI: (ms: number) => void
+  // Real-world time (ms) of the timeline's zero, for the Day / clock reading.
+  setZeroMsUI: (ms: number) => void
   setPlayingUI: (playing: boolean) => void
+  setCounts: (waiting: number, processing: number, done: number, assembled?: number, dismantled?: number, rejected?: number, scrapped?: number) => void
+  // Jobs waiting at each station right now, written every frame for the tags.
+  queues: React.MutableRefObject<Map<string, number>>
 }
 
 interface SceneProps {
@@ -27,10 +47,49 @@ interface SceneProps {
   operators: Operator3D[]
   connections: Connection3D[]
   stepLabels: StepLabel[]
+  props: Prop3D[]
   stationsData: Record<string, StationConfig>
   operatorsData: Record<string, OperatorConfig>
   isDark: boolean
   completionLog?: Record<string, unknown[]>
+  // simulation_state.assemblies of the run (what each Assembly made, from which parts).
+  assemblies?: Record<string, AssemblyInfo>
+  // simulation_state.dismantles of the run (the pieces each dismantled job split into).
+  dismantles?: Record<string, DismantleInfo>
+  // Each product's colour from Build's Start table: product name -> colour.
+  variantColors?: Record<string, string>
+  // How many jobs the run turned away (rejected) or lost (scrapped); the legend shows them only when there are some.
+  outcomes?: { rejected: number; scrapped: number }
+}
+
+const WEBGL_PROPS = { antialias: true, toneMapping: CineonToneMapping }
+
+// Playback speed is simulated time per real second: N× is N simulated seconds
+// per real second (the same list as the 2D replay bar). "Fit" plays the
+// whole run in a minute, which is the way to watch a run that spans months.
+const SPEEDS: { id: string; label: string; msPerSec: number | null }[] = [
+  { id: '1x', label: '1×', msPerSec: 1_000 },
+  { id: '10x', label: '10×', msPerSec: 10_000 },
+  { id: '30x', label: '30×', msPerSec: 30_000 },
+  { id: '50x', label: '50×', msPerSec: 50_000 },
+  { id: '100x', label: '100×', msPerSec: 100_000 },
+  { id: 'fit', label: 'Fit 1 min', msPerSec: null },
+]
+const FIT_SECONDS = 60
+
+// "Day 3 · 14:25" — the same reading as the 2D replay bar. The log's wall-clock
+// times are parsed as local time, so the local getters give them back.
+function fmtClock(zeroMs: number, minutes: number): string {
+  const d = new Date(zeroMs + minutes * 60000)
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  return `Day ${Math.floor(minutes / 1440) + 1} · ${hh}:${mm}`
+}
+
+// Parts that need WebGL (drei's shader grid) step aside under WebGPU.
+function WebGLOnly({ children }: { children: React.ReactNode }) {
+  const gl = useThree(s => s.gl)
+  return isWebGPU(gl) ? null : <>{children}</>
 }
 
 function Floor({ isDark, size, centerX, centerZ }: { isDark: boolean; size: number; centerX: number; centerZ: number }) {
@@ -60,24 +119,72 @@ export default function Scene({
   machines,
   operators,
   connections,
-  stepLabels,
+  props,
   stationsData,
-  operatorsData,
   isDark,
   completionLog,
+  assemblies,
+  dismantles,
+  variantColors,
+  outcomes,
 }: SceneProps) {
   const [selectedMachine, setSelectedMachine] = useState<Machine3D | null>(null)
-  const [highlightedMachine, setHighlightedMachine] = useState<string | null>(null)
+  const [topView, setTopView] = useState(false)
+  // Factory hall around the line, or the plain floor; remembered between visits.
+  const [factory, setFactory] = useState(() => {
+    try { return localStorage.getItem('linksim.3d.factory') !== 'off' } catch { return true }
+  })
+  const toggleFactory = () => {
+    setFactory(f => {
+      try { localStorage.setItem('linksim.3d.factory', f ? 'off' : 'on') } catch { /* private window */ }
+      return !f
+    })
+  }
+  // WebGPU when the browser has it (and it is switched on in renderer.ts), WebGL otherwise.
+  const [renderer] = useState(preferredRenderer)
+  // Station and flow labels; remembered the same way.
+  const [tags, setTags] = useState(() => {
+    try { return localStorage.getItem('linksim.3d.tags') !== 'off' } catch { return true }
+  })
+  const toggleTags = () => {
+    setTags(t => {
+      try { localStorage.setItem('linksim.3d.tags', t ? 'off' : 'on') } catch { /* private window */ }
+      return !t
+    })
+  }
 
   const playingRef = useRef(false)
-  const speedRef = useRef(10)
+  const speedRef = useRef(60_000) // simulated ms per real second
   const scrubPctRef = useRef(0)
   const simClockMsRef = useRef(0)
   const totalMsRef = useRef(1)
+  const queuesRef = useRef(new Map<string, number>())
+  const tagBus: TagBus = useMemo(() => ({ live: { current: [] }, shown: { current: [] }, els: { current: [] }, bump: { current: null } }), [])
+  const tagAnchors = useMemo(() => buildTagAnchors(machines, props, connections), [machines, props, connections])
   const [scrubUI, setScrubUI] = useState(0)
   const [totalMsUI, setTotalMsUI] = useState(1)
-  const [speedUI, setSpeedUI] = useState(10)
+  const [zeroMsUI, setZeroMsUI] = useState(0)
+  const [speedId, setSpeedId] = useState('fit')
   const [playingUI, setPlayingUI] = useState(false)
+
+  // Legend numbers are written straight into the page so a change in the line
+  // doesn't re-render the whole scene.
+  const waitingEl = useRef<HTMLSpanElement>(null)
+  const processingEl = useRef<HTMLSpanElement>(null)
+  const doneEl = useRef<HTMLSpanElement>(null)
+  const assembledEl = useRef<HTMLSpanElement>(null)
+  const dismantledEl = useRef<HTMLSpanElement>(null)
+  const rejectedEl = useRef<HTMLSpanElement>(null)
+  const scrappedEl = useRef<HTMLSpanElement>(null)
+  const setCounts = useCallback((waiting: number, processing: number, done: number, assembled = 0, dismantled = 0, rejected = 0, scrapped = 0) => {
+    if (waitingEl.current) waitingEl.current.textContent = String(waiting)
+    if (processingEl.current) processingEl.current.textContent = String(processing)
+    if (doneEl.current) doneEl.current.textContent = String(done)
+    if (assembledEl.current) assembledEl.current.textContent = String(assembled)
+    if (dismantledEl.current) dismantledEl.current.textContent = String(dismantled)
+    if (rejectedEl.current) rejectedEl.current.textContent = String(rejected)
+    if (scrappedEl.current) scrappedEl.current.textContent = String(scrapped)
+  }, [])
 
   const timelineRefs: TimelineRefs = useMemo(() => ({
     playing: playingRef,
@@ -87,8 +194,11 @@ export default function Scene({
     totalMs: totalMsRef,
     setScrubUI,
     setTotalMsUI,
+    setZeroMsUI,
     setPlayingUI,
-  }), [])
+    setCounts,
+    queues: queuesRef,
+  }), [setCounts])
 
   useEffect(() => {
     scrubPctRef.current = 0
@@ -98,13 +208,78 @@ export default function Scene({
     setPlayingUI(false)
   }, [completionLog])
 
+  useEffect(() => {
+    const preset = SPEEDS.find(s => s.id === speedId)
+    speedRef.current = preset?.msPerSec ?? Math.max(totalMsUI / FIT_SECONDS, 1)
+  }, [speedId, totalMsUI])
+
   const handleSelectMachine = useCallback((machine: Machine3D | null) => {
     setSelectedMachine(machine)
   }, [])
 
-  const handleHighlight = useCallback((machineId: string | null) => {
-    setHighlightedMachine(machineId)
-  }, [])
+  // Machine search box (top right).
+  const [query, setQuery] = useState('')
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [active, setActive] = useState(0)
+  const matches = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    if (!q) return []
+    return machines
+      .filter(m => m.label.toLowerCase().includes(q) || m.baseName.toLowerCase().includes(q))
+      .slice(0, 8)
+  }, [machines, query])
+  const pickMachine = (m: Machine3D) => {
+    setTopView(false) // the top view can't focus a machine
+    setSelectedMachine(m)
+    setQuery('')
+    setSearchOpen(false)
+  }
+
+  // Running/Waiting for each model at the current timeline position, read
+  // per frame from the sim clock ref. Null until a run is loaded (models then
+  // loop Waiting). The log has no machine index, so a capacity-N station with
+  // k jobs in process runs its first k machines.
+  const anim = useMemo(() => {
+    if (!completionLog) return null
+    const activity = buildStationActivity(completionLog)
+    const busy = (station: string) => activeCount(activity, station, simClockMsRef.current)
+    const state = (running: boolean): AnimState => (running ? 'Running' : 'Waiting')
+    const allStations = Array.from(activity.byStation.keys())
+    return {
+      machine: (m: Machine3D) => () => state(busy(m.baseName) > m.machineIndex),
+      stations: (stations = allStations) => () => state(stations.some(s => busy(s) > 0)),
+    }
+  }, [completionLog])
+
+  const machineById = useMemo(() => new Map(machines.map(m => [m.id, m])), [machines])
+
+  const stateOf = useCallback((m: Machine3D) => anim?.machine(m), [anim])
+  const operatorState = useCallback((op: Operator3D) => { const m = machineById.get(op.machineId); return m && anim?.machine(m) }, [machineById, anim])
+  // The batch's shader patch is for the WebGL renderer, so batching is off under WebGPU.
+  const batching = useMemo(() => instancingOn() && preferredRenderer() === 'webgl', [])
+  // Machines to grow a little while hovered or selected (id → scale), shared by the batch and its click boxes.
+  const emphasis = useRef(new Map<string, number>())
+
+  // Machines whose model is drawn as an instanced batch instead of one by one.
+  const instanced = useMemo(
+    () => (batching ? machines.filter(m => canInstance(m.stationType)) : []),
+    [machines, batching],
+  )
+  // One batch per model file.
+  const instancedGroups = useMemo(() => {
+    const groups = new Map<string, Machine3D[]>()
+    for (const m of instanced) {
+      const url = STATION_MODELS[m.stationType]
+      groups.set(url, [...(groups.get(url) ?? []), m])
+    }
+    return [...groups]
+  }, [instanced])
+  // Each machine stands on the floor under its box.
+  const instancedByModel = useMemo(
+    () => instancedGroups.map(([url, group]) => [url, group.map((m): BatchItem => ({ id: m.id, position: [m.position[0], m.position[1] - m.height / 2, m.position[2]], getState: stateOf(m) }))] as const),
+    [instancedGroups, stateOf],
+  )
+  const instancedIds = useMemo(() => new Set(instanced.map(m => m.id)), [instanced])
 
   const selectedOperators = selectedMachine
     ? operators
@@ -120,8 +295,8 @@ export default function Scene({
     ? stationsData[selectedMachine.baseName]
     : undefined
 
-  const { floorSize, centerZ } = (() => {
-    if (machines.length === 0) return { floorSize: 40, centerZ: 0 }
+  const { floorSize, centerZ, spanX, spanZ, bounds } = (() => {
+    if (machines.length === 0) return { floorSize: 40, centerZ: 0, spanX: 0, spanZ: 0, bounds: { minX: -10, maxX: 10, minZ: -10, maxZ: 10 } }
     let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity
     for (const m of machines) {
       minX = Math.min(minX, m.position[0])
@@ -129,7 +304,7 @@ export default function Scene({
       minZ = Math.min(minZ, m.position[2])
       maxZ = Math.max(maxZ, m.position[2])
     }
-    for (const op of operators) {
+    for (const op of [...operators, ...props]) {
       minX = Math.min(minX, op.position[0])
       maxX = Math.max(maxX, op.position[0])
       minZ = Math.min(minZ, op.position[2])
@@ -139,122 +314,268 @@ export default function Scene({
     const spanZ = maxZ - minZ
     const size = Math.max(spanX, spanZ) + 12
     const cz = (minZ + maxZ) / 2
-    return { floorSize: Math.max(size, 40), centerZ: cz }
+    return { floorSize: Math.max(size, 40), centerZ: cz, spanX, spanZ, bounds: { minX, maxX, minZ, maxZ } }
   })()
 
   const centerX = machines.length > 0
     ? (machines[machines.length - 1].position[0] + machines[0].position[0]) / 2
     : 0
 
-  const totalMinutes = Math.round(totalMsUI / 60000)
-  const curMinutes = Math.round((scrubUI / 100) * totalMinutes)
+  // Top view frames the line itself (the hall walls are cropped) so every
+  // machine gets as many pixels as possible for its tag.
+  const fit = useMemo(
+    () => ({ cx: (bounds.minX + bounds.maxX) / 2, cz: centerZ, w: spanX + 12, d: spanZ + 12 }),
+    [bounds, centerZ, spanX, spanZ],
+  )
+
+  const curMinutes = Math.round(((scrubUI / 100) * totalMsUI) / 60000)
 
   return (
     <div className="relative w-full h-full">
       <Canvas
-        camera={{ position: [centerX + floorSize * 0.35, floorSize * 0.3, centerZ + floorSize * 0.35], fov: 42 }}
-        shadows="pcf"
-        gl={{ antialias: true, toneMapping: 3 }}
+        camera={{ position: [centerX + floorSize * 0.35, floorSize * 0.3, centerZ + floorSize * 0.35], fov: 42, far: Math.max(1000, floorSize * 4) }}
+        shadows="percentage"
+        gl={(renderer === 'webgpu' ? createWebGPURenderer : WEBGL_PROPS) as GLProps}
         onPointerMissed={() => setSelectedMachine(null)}
       >
         <ambientLight intensity={isDark ? 0.35 : 0.55} />
-        <directionalLight
-          position={[centerX + 12, 25, centerZ + 12]}
-          intensity={isDark ? 1.0 : 1.4}
-          castShadow
-          shadow-mapSize-width={2048}
-          shadow-mapSize-height={2048}
-          shadow-camera-far={floorSize * 1.2}
-          shadow-camera-left={centerX - floorSize / 2}
-          shadow-camera-right={centerX + floorSize / 2}
-          shadow-camera-top={centerZ + floorSize / 2}
-          shadow-camera-bottom={centerZ - floorSize / 2}
-          shadow-bias={-0.0005}
-        />
+        {batching ? (
+          <NearShadowLight intensity={isDark ? 1.0 : 1.4} maxRadius={floorSize / 2 + 10} />
+        ) : (
+          <directionalLight
+            position={[centerX + 12, 25, centerZ + 12]}
+            intensity={isDark ? 1.0 : 1.4}
+            castShadow
+            shadow-mapSize-width={2048}
+            shadow-mapSize-height={2048}
+            shadow-camera-far={floorSize * 1.2}
+            shadow-camera-left={centerX - floorSize / 2}
+            shadow-camera-right={centerX + floorSize / 2}
+            shadow-camera-top={centerZ + floorSize / 2}
+            shadow-camera-bottom={centerZ - floorSize / 2}
+            shadow-bias={-0.0005}
+          />
+        )}
         <hemisphereLight
           args={[isDark ? '#334155' : '#e2e8f0', isDark ? '#0f172a' : '#f8fafc', 0.4]}
         />
         <pointLight position={[centerX, 5, centerZ]} intensity={0.3} color="#f59e0b" distance={30} />
 
-        <Floor isDark={isDark} size={floorSize} centerX={centerX} centerZ={centerZ} />
-
-        <Grid
-          args={[floorSize, floorSize]}
-          cellSize={1}
-          cellThickness={0.4}
-          cellColor={isDark ? '#334155' : '#e2e8f0'}
-          sectionSize={5}
-          sectionThickness={0.8}
-          sectionColor={isDark ? '#475569' : '#cbd5e1'}
-          fadeDistance={floorSize * 1.5}
-          infiniteGrid
-          position={[centerX, 0.01, centerZ]}
-        />
+        {factory ? (
+          <>
+            <color attach="background" args={[isDark ? '#0e131a' : '#8791a0']} />
+            <group name="cat:hall"><FactoryShell bounds={bounds} machines={machines} props={props} isDark={isDark} /></group>
+          </>
+        ) : (
+          <>
+            <Floor isDark={isDark} size={floorSize} centerX={centerX} centerZ={centerZ} />
+            <WebGLOnly><Grid
+              args={[floorSize, floorSize]}
+              cellSize={1}
+              cellThickness={0.4}
+              cellColor={isDark ? '#334155' : '#e2e8f0'}
+              sectionSize={5}
+              sectionThickness={0.8}
+              sectionColor={isDark ? '#475569' : '#cbd5e1'}
+              fadeDistance={floorSize * 1.5}
+              infiniteGrid
+              position={[centerX, 0.01, centerZ]}
+            /></WebGLOnly>
+          </>
+        )}
 
         <OrbitControls
+          makeDefault
           enablePan
           enableZoom
           enableRotate
           minDistance={5}
-          maxDistance={floorSize * 1.5}
+          maxDistance={floorSize * 2}
           maxPolarAngle={Math.PI / 2.05}
           target={[centerX, 0, centerZ]}
           enableDamping
           dampingFactor={0.05}
         />
+        <CameraRig focus={selectedMachine} topView={topView} fit={fit} />
 
-        {stepLabels.map((label, i) => (
-          <LabelSprite
-            key={`step-${i}`}
-            position={label.position}
-            text={label.text}
-            scale={0.8}
-          />
-        ))}
+        {import.meta.env.DEV && <PerfProbe />}
+        {tags && <TagProjector anchors={tagAnchors} bus={tagBus} queues={queuesRef} selected={selectedMachine?.id ?? null} />}
 
-        {machines.map(m => (
+        <group name="cat:machine-boxes">
+        {machines.filter(m => !instancedIds.has(m.id)).map(m => (
           <MachineBox
             key={m.id}
             machine={m}
             selected={selectedMachine?.id === m.id}
             onClick={handleSelectMachine}
-            onHover={handleHighlight}
+            getState={anim?.machine(m)}
           />
         ))}
+        </group>
 
-        {machines.map(m => (
-          <LabelSprite
-            key={`label-${m.id}`}
-            position={m.position}
-            text={m.label}
-            utilization={m.utilization}
-            selected={selectedMachine?.id === m.id}
-          />
+        <group name="cat:machine-pads">
+          {instancedGroups.map(([url, group]) => (
+            <Suspense key={url} fallback={null}>
+              <InstancedMachines url={url} machines={group} selectedId={selectedMachine?.id ?? null} onSelect={handleSelectMachine} emphasis={emphasis} />
+            </Suspense>
+          ))}
+        </group>
+        <group name="cat:instanced">
+          {instancedByModel.map(([url, group]) => (
+            <Suspense key={url} fallback={null}>
+              <InstancedStations url={url} items={group} emphasis={emphasis} />
+            </Suspense>
+          ))}
+        </group>
+
+        <group name="cat:operators">
+        {batching ? <InstancedOperators operators={operators} stateOf={operatorState} /> : operators.map(op => {
+          const machine = machineById.get(op.machineId)
+          return (
+            <OperatorDot
+              key={op.id}
+              operator={op}
+              getState={machine && anim?.machine(machine)}
+            />
+          )
+        })}
+        </group>
+
+        <group name="cat:props">
+        {props.map(p => (
+          <group key={p.id}>
+            <group position={p.position}>
+              <Suspense fallback={null}>
+                <StationModel
+                  url={STATION_MODELS[p.stationType]}
+                  getState={anim?.stations(p.stations)}
+                  inPlace={p.stationType === 'Worker'}
+                />
+              </Suspense>
+            </group>
+          </group>
         ))}
+        </group>
 
-        {operators.map(op => (
-          <OperatorDot
-            key={op.id}
-            operator={op}
-            onHighlight={handleHighlight}
-          />
-        ))}
-
-        {machines.filter(m => m.queueDepth > 0).map(m => (
-          <QueueStack key={`queue-${m.id}`} machine={m} />
-        ))}
-
-        {connections.map(c => (
+        <group name="cat:flow">
+        {batching ? (
+          <>
+            <InstancedFlow connections={connections.filter(c => !c.dim)} />
+            {connections.some(c => c.dim) && <InstancedFlow connections={connections.filter(c => c.dim)} faded />}
+          </>
+        ) : connections.map(c => (
           <FlowLine key={c.id} connection={c} />
         ))}
+        </group>
 
-        <JobParticle
-          machines={machines}
-          connections={connections}
-          completionLog={completionLog}
-          timelineRefs={timelineRefs}
-        />
+        <Suspense fallback={null}>
+          <group name="cat:jobs"><JobMarkers
+            machines={machines}
+            endPos={props.find(p => p.id === 'end')?.position}
+            completionLog={completionLog}
+            assemblies={assemblies}
+            dismantles={dismantles}
+            variantColors={variantColors}
+            timelineRefs={timelineRefs}
+          /></group>
+        </Suspense>
       </Canvas>
+
+      {tags && <TagOverlay anchors={tagAnchors} bus={tagBus} selected={selectedMachine?.id ?? null} />}
+
+      <div className="absolute top-4 left-4 z-10 flex gap-2">
+        <button
+          onClick={() => {
+            // Switching views closes any open machine panel, so the camera
+            // doesn't have to serve both at once.
+            setSelectedMachine(null)
+            setTopView(v => !v)
+          }}
+          className={`text-xs px-3 py-1.5 rounded-lg border shadow-sm font-medium transition-colors ${topView ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 bg-white/95 text-gray-600 hover:bg-gray-50'}`}
+        >
+          {topView ? 'Perspective' : 'Top view'}
+        </button>
+
+        <button
+          onClick={toggleTags}
+          className={`text-xs px-3 py-1.5 rounded-lg border shadow-sm font-medium transition-colors ${tags ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 bg-white/95 text-gray-600 hover:bg-gray-50'}`}
+          title="Show or hide the station and flow labels"
+        >
+          Tags
+        </button>
+
+        <button
+          onClick={toggleFactory}
+          className={`text-xs px-3 py-1.5 rounded-lg border shadow-sm font-medium transition-colors ${factory ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 bg-white/95 text-gray-600 hover:bg-gray-50'}`}
+          title="Show the factory hall around the line"
+        >
+          {factory ? 'Factory' : 'Plain floor'}
+        </button>
+      </div>
+
+      <div className={`absolute top-4 z-20 w-56 ${selectedMachine ? 'right-[22rem]' : 'right-4'}`}>
+        <input
+          value={query}
+          onChange={e => { setQuery(e.target.value); setSearchOpen(true); setActive(0) }}
+          onFocus={() => setSearchOpen(true)}
+          onBlur={() => setTimeout(() => setSearchOpen(false), 150)}
+          onKeyDown={e => {
+            if (e.key === 'ArrowDown' && matches.length) { e.preventDefault(); setActive(i => (i + 1) % matches.length) }
+            if (e.key === 'ArrowUp' && matches.length) { e.preventDefault(); setActive(i => (i - 1 + matches.length) % matches.length) }
+            if (e.key === 'Enter' && matches[active]) pickMachine(matches[active])
+            if (e.key === 'Escape') { setQuery(''); setSearchOpen(false) }
+          }}
+          placeholder="Search machines…"
+          className="w-full text-xs px-3 py-1.5 rounded-lg border border-gray-200 bg-white/95 text-gray-700 shadow-sm outline-none focus:border-blue-500"
+        />
+        {searchOpen && query.trim() && (
+          <ul className="mt-1 rounded-lg border border-gray-200 bg-white/95 shadow-md overflow-hidden text-xs">
+            {matches.length === 0 && <li className="px-3 py-1.5 text-gray-400">No machines found</li>}
+            {matches.map((m, i) => (
+              <li key={m.id}>
+                <button
+                  onMouseDown={() => pickMachine(m)}
+                  className={`w-full text-left px-3 py-1.5 text-gray-700 hover:bg-blue-50 ${i === active ? 'bg-blue-50' : ''}`}
+                >
+                  {m.label}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      {completionLog && (
+        <div className="absolute top-14 left-4 z-10 rounded-lg border border-gray-200 bg-white/95 px-3 py-2 text-xs text-gray-600 shadow-sm backdrop-blur-sm">
+          <div className="flex items-center gap-4 font-medium">
+            <span className="flex items-center gap-1.5"><i className="h-2.5 w-2.5 rounded-full bg-[#f5c518]" />Waiting <b ref={waitingEl} className="tabular-nums text-gray-900">0</b></span>
+            <span className="flex items-center gap-1.5"><i className="h-2.5 w-2.5 rounded-full bg-[#32c76a]" />Processing <b ref={processingEl} className="tabular-nums text-gray-900">0</b></span>
+            <span className="flex items-center gap-1.5">Finished <b ref={doneEl} className="tabular-nums text-gray-900">0</b></span>
+            {assemblies && Object.keys(assemblies).length > 0 && (
+              <span className="flex items-center gap-1.5">Assembled <b ref={assembledEl} className="tabular-nums text-gray-900">0</b></span>
+            )}
+            {dismantles && Object.keys(dismantles).length > 0 && (
+              <span className="flex items-center gap-1.5">Dismantled <b ref={dismantledEl} className="tabular-nums text-gray-900">0</b></span>
+            )}
+            {!!outcomes?.rejected && (
+              <span className="flex items-center gap-1.5"><i className="h-2.5 w-2.5 rounded-full bg-[#ef4444]" />Rejected <b ref={rejectedEl} className="tabular-nums text-gray-900">0</b></span>
+            )}
+            {!!outcomes?.scrapped && (
+              <span className="flex items-center gap-1.5"><i className="h-2.5 w-2.5 rounded-full bg-[#ef4444]" />Scrapped <b ref={scrappedEl} className="tabular-nums text-gray-900">0</b></span>
+            )}
+          </div>
+          {variantColors && Object.keys(variantColors).length > 1 && (
+            <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] text-gray-600">
+              {Object.entries(variantColors).map(([name, hex]) => (
+                <span key={name} className="flex items-center gap-1"><i className="h-2 w-2 rounded-sm" style={{ background: hex }} />{name}</span>
+              ))}
+            </div>
+          )}
+          <p className="mt-1 max-w-[19rem] text-[10px] leading-snug text-gray-500">
+            Numbers come from the run's job log. Parts glide between stations for readability; the engine has no travel time.
+          </p>
+        </div>
+      )}
 
       {completionLog && (
         <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-white/95 backdrop-blur-sm rounded-xl shadow-lg border border-gray-200 px-4 py-2 z-10">
@@ -268,21 +589,30 @@ export default function Scene({
             }}
             className="text-xs px-2.5 py-1.5 rounded-lg border border-gray-200 bg-white text-gray-600 hover:bg-gray-50 font-medium"
           >
-            ↩ Reset
+            ⏹ Stop
           </button>
           <button
-            onClick={() => { playingRef.current = !playingRef.current; setPlayingUI(playingRef.current) }}
+            onClick={() => {
+              // Play at the end starts over, as in the 2D bar.
+              if (!playingRef.current && scrubPctRef.current >= 100) {
+                scrubPctRef.current = 0
+                simClockMsRef.current = 0
+                setScrubUI(0)
+              }
+              playingRef.current = !playingRef.current
+              setPlayingUI(playingRef.current)
+            }}
             className="text-xs px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 font-medium"
           >
             {playingUI ? '⏸ Pause' : '▶ Play'}
           </button>
-          {[1, 10, 50].map(s => (
+          {SPEEDS.map(s => (
             <button
-              key={s}
-              onClick={() => { speedRef.current = s; setSpeedUI(s) }}
-              className={`text-xs px-2 py-1.5 rounded-lg border font-medium transition-colors ${speedUI === s ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 text-gray-500 hover:border-blue-300'}`}
+              key={s.id}
+              onClick={() => setSpeedId(s.id)}
+              className={`text-xs px-2 py-1.5 rounded-lg border font-medium transition-colors whitespace-nowrap ${speedId === s.id ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 text-gray-500 hover:border-blue-300'}`}
             >
-              {s}×
+              {s.label}
             </button>
           ))}
           <input
@@ -301,8 +631,8 @@ export default function Scene({
             }}
             className="w-40 accent-blue-600"
           />
-          <span className="text-[10px] text-gray-400 font-medium whitespace-nowrap">
-            {curMinutes}m / {totalMinutes}m
+          <span className="text-[10px] text-gray-500 font-medium whitespace-nowrap">
+            {fmtClock(zeroMsUI, curMinutes)}
           </span>
         </div>
       )}
@@ -316,11 +646,6 @@ export default function Scene({
         />
       )}
 
-      {highlightedMachine && !selectedMachine && (
-        <div className="absolute bottom-4 left-4 bg-white/95 backdrop-blur-sm rounded-xl shadow-lg border border-gray-200 px-4 py-2.5 text-sm text-gray-800 z-10 font-medium">
-          {highlightedMachine}
-        </div>
-      )}
     </div>
   )
 }

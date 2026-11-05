@@ -201,6 +201,19 @@ def fail_run(db: Session, run_id: int, error: str) -> Optional[SimulationRun]:
     return run
 
 
+def fail_unfinished_runs(db: Session) -> int:
+    """On startup: runs still pending/running were cut off when the server
+    last stopped (window closed, restart) — nothing will finish them, so mark
+    them failed instead of leaving them "running" forever."""
+    runs = db.query(SimulationRun).filter(SimulationRun.status.in_(("pending", "running"))).all()
+    for run in runs:
+        run.status = "failed"
+        run.error_message = "LinkSim was closed before this run finished. Please run it again."
+        run.completed_at = datetime.utcnow()
+    db.commit()
+    return len(runs)
+
+
 def get_station_stats(db: Session, run_id: int) -> List[StationStat]:
     return db.query(StationStat).filter(StationStat.run_id == run_id).all()
 

@@ -24,6 +24,8 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import Scene from '@/canvas3d/Scene'
 import { buildScene3D } from '@/canvas3d/layout'
+import { stressLine } from '@/canvas3d/devStress'
+import { inferStationType } from '@/lib/stationTypes'
 import type { StationNodeData, ScenarioCreate, StationConfig, MuRow, AssemblyConfig, AssemblyTableKind, AssemblyTableRow, DismantleConfig, DismantleRow, CanvasLayout, WorkerStat, StationStateStat, BufferStateStat, PartsFlow } from '@/types'
 import { defaultVariantColor, unusedVariantColor, jobPrefix } from '@/lib/variantColors'
 
@@ -471,28 +473,6 @@ const STATION_TYPE_HEX: Record<string, string> = {
 }
 const DEFAULT_STATION_HEX = STATION_TYPE_HEX.Station
 
-/**
- * Infer a station's palette type for color-coding when stationType isn't
- * set — which is EVERY station in a scenario imported from Excel/YAML,
- * since 'Station Type' is a Canvas-only concept never written by the
- * parsers. Falls back to keyword-matching the station's name, the same
- * pattern already used for isAssembly below, extended to Buffer too.
- * Defaults to 'Station' (the common case — a plain
- * processing station) when no special keyword matches, rather than an
- * "unknown" color, since that's what almost every unmatched name actually is.
- */
-function inferStationType(label: string, stationType?: string): string {
-  if (stationType) return stationType
-  const name = label.toLowerCase()
-  if (name.startsWith('assembly')) return 'Assembly'
-  if (/dismantle|disassembl/.test(name)) return 'Dismantle'
-  if (/queue|buffer/.test(name)) return 'Buffer'
-  if (/conveyor|convey/.test(name)) return 'Conveyor'
-  if (/\brobot/.test(name)) return 'Robot'
-  if (/^source|entry/.test(name)) return 'Source'
-  if (/^drain|^exit/.test(name)) return 'Drain'
-  return 'Station'
-}
 
 // Tecnomatix's own toolbox uses ONE consistent 3D-block body for every
 // material-flow object (Station, Buffer, Assembly, Robot, ...) — objects are
@@ -3824,6 +3804,51 @@ function dismantleProblem(d: DismantleConfig, outgoingLines: number): string | u
   return undefined
 }
 
+/**
+ * The boxes and arrows Build draws for a scenario's product: the saved drawing
+ * exactly as it was left — or, for a scenario not saved from the Canvas since
+ * drawings were kept (or imported), every product's route drawn as one
+ * picture. Build loads it onto the canvas and the 3D view builds its scene
+ * from it, so both always show the same thing.
+ */
+function loadScenarioGraph(
+  scenario: { processflow_data: Record<string, FlowStep[]>; stations_data: Record<string, StationConfig>; canvas_layout?: CanvasLayout | null },
+  variant: string,
+): { nodes: Node<StationNodeData>[]; edges: Edge[] } {
+  const { nodes: drawnNodes, edges: finalEdges } = scenario.canvas_layout?.boxes?.length
+    ? graphFromLayout(scenario.canvas_layout, scenario.processflow_data, scenario.stations_data)
+    : wholeScenarioGraph(scenario.processflow_data, scenario.stations_data)
+  // Each box shows the picked product's time at it.
+  const shownTime: Record<string, number> = {}
+  for (const st of scenario.processflow_data[variant] ?? []) {
+    for (const r of stepResourceOptions(st.resource)) shownTime[r] = st.duration
+  }
+  // The Start isn't a route step, so it is drawn fresh — give it back its
+  // saved MU table and Exit Controller.
+  const nodes = drawnNodes.map((drawn) => {
+    const time = shownTime[drawn.data.savedName ?? drawn.data.label]
+    const n = time !== undefined ? { ...drawn, data: { ...drawn.data, cycleTime: time } } : drawn
+    if (inferStationType(n.data.label, n.data.stationType) !== 'Source') return n
+    const cfg = scenario.stations_data?.[n.data.label]
+    if (!cfg) return n
+    return {
+      ...n,
+      data: {
+        ...n.data,
+        ...(cfg['MU Table'] ? { muTable: cfg['MU Table'] } : {}),
+        ...(cfg['MU Strategy'] ? { muStrategy: cfg['MU Strategy'] } : {}),
+        ...(cfg['MU Priorities'] ? { muPriorities: cfg['MU Priorities'] } : {}),
+        ...(cfg['MU Percentages'] ? { muPercentages: cfg['MU Percentages'] } : {}),
+      },
+    }
+  })
+  // Reconstructed/imported edges carry no handle info of their own —
+  // normalized the same way onConnect normalizes new edges, so a reload
+  // renders the same clean right-to-left flow instead of React Flow
+  // picking default (possibly backward-looking) anchor points.
+  return { nodes, edges: finalEdges.map((e) => ({ ...e, sourceHandle: 'right', targetHandle: 'left' })) }
+}
+
 function dismantleSettings(saved?: DismantleConfig): DismantleConfig {
   return { ...DEFAULT_DISMANTLE, ...saved }
 }
@@ -4925,13 +4950,20 @@ export default function Canvas() {
 
   // 3D Scene data — used when viewMode === '3d' inside View mode (see render below)
   const scene3D = useMemo(() => {
-    if (!activeScenario || !selectedVariant) return { machines: [], operators: [], connections: [], stepLabels: [] }
+    if (!activeScenario || !selectedVariant) return { machines: [], operators: [], connections: [], stepLabels: [], props: [] }
+    const { processflow, stations } = stressLine(activeScenario.processflow_data, activeScenario.stations_data, selectedVariant)
+    // The same boxes and arrows Build draws.
+    const graph = loadScenarioGraph({ ...activeScenario, processflow_data: processflow, stations_data: stations }, selectedVariant)
     return buildScene3D(
-      activeScenario.processflow_data,
+      graph.nodes,
+      graph.edges,
+      processflow,
       selectedVariant,
-      activeScenario.stations_data,
+      stations,
       activeScenario.operators_data,
       activeRun?.station_stats ?? [],
+      // A saved drawing is mirrored exactly; only an auto-laid-out one is wrapped.
+      !activeScenario.canvas_layout?.boxes?.length,
     )
   }, [activeScenario, selectedVariant, activeRun])
 
@@ -4942,6 +4974,25 @@ export default function Canvas() {
     (activeRun?.result as Record<string, unknown> | null)?.completion_log as Record<string, unknown[]> | undefined,
     [activeRun]
   )
+  // What each Assembly made in the run (simulation_state.assemblies): the 3D
+  // replay needs it to show parts being used up.
+  const assemblies3D = useMemo(() =>
+    ((activeRun?.result as { simulation_state?: { assemblies?: Record<string, { station: string; main: string; mode: string; parts: string[] }> } } | null)
+      ?.simulation_state?.assemblies),
+    [activeRun]
+  )
+  // The same for Dismantles (simulation_state.dismantles): the pieces each
+  // dismantled job split into.
+  const dismantles3D = useMemo(() =>
+    ((activeRun?.result as { simulation_state?: { dismantles?: Record<string, { station: string; mode: string; pieces: string[] }> } } | null)
+      ?.simulation_state?.dismantles),
+    [activeRun]
+  )
+  // Jobs the run turned away (rejected) or lost (scrapped), from simulation_state.
+  const outcomes3D = useMemo(() => {
+    const st = (activeRun?.result as { simulation_state?: { rejected_jobs?: number; scrapped_jobs?: number } } | null)?.simulation_state
+    return st ? { rejected: st.rejected_jobs ?? 0, scrapped: st.scrapped_jobs ?? 0 } : undefined
+  }, [activeRun])
   // Build-mode job replay: which box each station (and parallel machine,
   // "Station 2 #2" -> machine 2) is drawn at.
   const replayTargets = useMemo<ReplayTarget[]>(() => nodes.map((n) => {
@@ -4994,46 +5045,12 @@ export default function Canvas() {
     // Boxes already on the canvas stay — unless they are another product's
     // line with nothing unsaved (e.g. a different product was picked in View).
     if (nodes.length > 0 && (buildVariant === null || buildVariant === selectedVariant || canvasDirty)) return
-    // The saved drawing exactly as it was left — or, for a scenario not saved
-    // from the Canvas since drawings were kept (or imported), every
-    // product's route drawn as one picture.
-    const { nodes: drawnNodes, edges: finalEdges } = activeScenario.canvas_layout?.boxes?.length
-      ? graphFromLayout(activeScenario.canvas_layout, activeScenario.processflow_data, activeScenario.stations_data)
-      : wholeScenarioGraph(activeScenario.processflow_data, activeScenario.stations_data)
-    if (drawnNodes.length === 0) {
+    const { nodes: finalNodes, edges: loadedEdges } = loadScenarioGraph(activeScenario, selectedVariant)
+    if (finalNodes.length === 0) {
       // No route yet: an empty canvas, saved as that product.
       setBuildVariant(selectedVariant)
       return
     }
-    // Each box shows the picked product's time at it.
-    const shownTime: Record<string, number> = {}
-    for (const st of activeScenario.processflow_data[selectedVariant] ?? []) {
-      for (const r of stepResourceOptions(st.resource)) shownTime[r] = st.duration
-    }
-    // The Start isn't a route step, so it is drawn fresh — give it back its
-    // saved MU table and Exit Controller.
-    const finalNodes = drawnNodes.map((drawn) => {
-      const time = shownTime[drawn.data.savedName ?? drawn.data.label]
-      const n = time !== undefined ? { ...drawn, data: { ...drawn.data, cycleTime: time } } : drawn
-      if (inferStationType(n.data.label, n.data.stationType) !== 'Source') return n
-      const cfg = activeScenario.stations_data?.[n.data.label]
-      if (!cfg) return n
-      return {
-        ...n,
-        data: {
-          ...n.data,
-          ...(cfg['MU Table'] ? { muTable: cfg['MU Table'] } : {}),
-          ...(cfg['MU Strategy'] ? { muStrategy: cfg['MU Strategy'] } : {}),
-          ...(cfg['MU Priorities'] ? { muPriorities: cfg['MU Priorities'] } : {}),
-          ...(cfg['MU Percentages'] ? { muPercentages: cfg['MU Percentages'] } : {}),
-        },
-      }
-    })
-    // Reconstructed/imported edges carry no handle info of their own —
-    // normalized the same way onConnect normalizes new edges, so a reload
-    // renders the same clean right-to-left flow instead of React Flow
-    // picking default (possibly backward-looking) anchor points.
-    const loadedEdges = finalEdges.map((e) => ({ ...e, sourceHandle: 'right', targetHandle: 'left' }))
     assemblyLinesRef.current = null
     setNodes(finalNodes)
     setEdges(loadedEdges)
@@ -6637,10 +6654,15 @@ export default function Canvas() {
                     operators={scene3D.operators}
                     connections={scene3D.connections}
                     stepLabels={scene3D.stepLabels}
+                    props={scene3D.props}
                     stationsData={activeScenario!.stations_data}
                     operatorsData={activeScenario!.operators_data}
                     isDark={isDark}
                     completionLog={completionLog}
+                    assemblies={assemblies3D}
+                    dismantles={dismantles3D}
+                    variantColors={variantColors}
+                    outcomes={outcomes3D}
                   />
                 ) : (
                   <div className="flex items-center justify-center h-full text-gray-400">

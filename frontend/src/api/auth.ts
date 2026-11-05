@@ -19,6 +19,14 @@ export const authApi = {
       return r.data
     }),
 
+  // Tester build only (the server answers 404 in development): sign in
+  // without the login screen.
+  auto: () =>
+    api.post<LoginResponse>('/auth/auto').then((r) => {
+      setToken(r.data.token)
+      return r.data
+    }),
+
   logout: () =>
     api.post('/auth/logout').finally(() => clearToken()),
 }

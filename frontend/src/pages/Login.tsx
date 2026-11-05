@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import { useNavigate, useLocation, Link } from 'react-router-dom'
 import { Cpu, AlertCircle } from 'lucide-react'
 import { authApi } from '@/api/auth'
@@ -16,6 +16,15 @@ export default function Login() {
 
   const from = (location.state as { from?: string })?.from ?? '/'
 
+  // Tester build: sign in automatically and skip this screen. In development
+  // the server answers 404, so the form below shows as usual.
+  const [checkingAuto, setCheckingAuto] = useState(true)
+  useEffect(() => {
+    authApi.auto()
+      .then(() => navigate(from, { replace: true }))
+      .catch(() => setCheckingAuto(false))
+  }, [])
+
   async function handleSubmit(e: FormEvent) {
     e.preventDefault()
     setError(null)
@@ -29,6 +38,8 @@ export default function Login() {
       setLoading(false)
     }
   }
+
+  if (checkingAuto) return null
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-white via-blue-50/30 to-indigo-50/40 p-6">

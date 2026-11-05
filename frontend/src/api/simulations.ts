@@ -1,4 +1,4 @@
-import api from './client'
+import api, { getToken } from './client'
 import type { RunResponse, RunDetail } from '../types'
 
 export interface SimConfigOverride {
@@ -46,6 +46,8 @@ export const simulationsApi = {
   listRuns: (scenarioId: number) =>
     api.get<RunDetail[]>(`/simulations/${scenarioId}/runs`).then(r => r.data),
 
+  // The browser's live-progress connection (EventSource) can't send the
+  // sign-in header, so the session token goes in the address instead.
   streamUrl: (runId: number) =>
-    `/api/simulations/${runId}/stream`,
+    `/api/simulations/${runId}/stream?token=${encodeURIComponent(getToken() ?? '')}`,
 }

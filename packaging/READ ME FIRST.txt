@@ -1,0 +1,56 @@
+LinkSim - Manufacturing Simulation (tester version)
+====================================================
+
+WHAT YOU NEED
+- A Windows 10 or Windows 11 PC (64-bit)
+- About 600 MB free disk space
+- A web browser (Microsoft Edge, which comes with Windows, or Google Chrome)
+- No internet connection and no installation needed
+
+
+HOW TO START
+1. Unzip the whole zip file first (right-click > Extract All...).
+   Do NOT start LinkSim from inside the zip.
+2. Open the "LinkSim" folder and double-click "LinkSim.exe".
+3. The first time, Windows may show a blue box "Windows protected your PC".
+   Click "More info", then "Run anyway". (This appears because the program
+   is not signed. It only appears once.)
+4. A black window opens and, after a few seconds, LinkSim opens in your
+   web browser.
+   If the browser does not open, copy the address shown in the black window
+   (it looks like http://127.0.0.1:8000) into your browser.
+
+Keep the black window open while you use LinkSim.
+To quit LinkSim, close the black window.
+
+If you double-click LinkSim.exe while it is already running, it just opens
+LinkSim in your browser again.
+
+
+IMPORTANT
+- Keep "LinkSim.exe" and the "_internal" folder together. Do not move or
+  delete anything inside the LinkSim folder.
+- If your antivirus blocks or removes LinkSim.exe, please allow it (mark it
+  as safe / add an exception). This is a known false alarm for this type
+  of program.
+- LinkSim runs only on your own PC. Nothing is sent over the internet.
+- Large simulations can take several minutes and use a lot of memory.
+  Use the Stop button if a run takes too long.
+
+
+WHERE YOUR DATA IS SAVED
+Your scenarios and results are saved in this folder:
+    %LOCALAPPDATA%\LinkSim
+(Press Win+R, type  %LOCALAPPDATA%\LinkSim  and press Enter to open it.)
+
+When you get a newer LinkSim version, your data stays there and the new
+version will use it.
+
+To start completely fresh: close LinkSim, then delete that folder.
+
+
+REPORTING A PROBLEM
+Please send:
+1. What you did, and what went wrong (a screenshot helps).
+2. The file "linksim.log" from the %LOCALAPPDATA%\LinkSim folder.
+3. The input file (Excel / YAML) you used, if you can share it.

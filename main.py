@@ -7,18 +7,29 @@ Run with:
 import logging
 import os
 from contextlib import asynccontextmanager
+from logging.handlers import RotatingFileHandler
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 # ── File logger (writes next to the DB so user can always find it) ──
-_LOG_PATH = os.path.join(os.path.dirname(__file__), "linksim.log")
+# LINKSIM_DATA_DIR is set by the tester build (desktop_launcher.py); in
+# development the log stays next to this file.
+_LOG_PATH = os.path.join(os.environ.get("LINKSIM_DATA_DIR") or os.path.dirname(__file__), "linksim.log")
+# Tester build: INFO to the file only, and just warnings/errors in the console
+# window (printing every engine line there slows runs down).
+_DESKTOP = os.environ.get("LINKSIM_DESKTOP") == "1"
+_console = logging.StreamHandler()          # also keep console output
+if _DESKTOP:
+    _console.setLevel(logging.WARNING)
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO if _DESKTOP else logging.DEBUG,
     format="%(asctime)s %(levelname)-8s %(name)s | %(message)s",
     handlers=[
-        logging.FileHandler(_LOG_PATH, encoding="utf-8"),
-        logging.StreamHandler(),          # also keep console output
+        # Tester build: keep the log from growing without limit (20 MB x 3).
+        RotatingFileHandler(_LOG_PATH, maxBytes=20_000_000, backupCount=2, encoding="utf-8")
+        if _DESKTOP else logging.FileHandler(_LOG_PATH, encoding="utf-8"),
+        _console,
     ],
 )
 logger = logging.getLogger("linksim")
@@ -26,7 +37,8 @@ logger.info(f"LinkSim starting — log file: {_LOG_PATH}")
 
 from fastapi import Depends
 
-from backend.storage.database import init_db
+from backend.storage.crud import fail_unfinished_runs
+from backend.storage.database import SessionLocal, init_db
 from backend.api.auth import router as auth_router, require_auth
 from backend.api.routes import (
     scenarios_router,
@@ -41,6 +53,11 @@ from backend.api.routes import (
 async def lifespan(app: FastAPI):
     # Create DB tables on startup (idempotent)
     init_db()
+    # Runs cut off when the server last stopped can never finish now.
+    with SessionLocal() as db:
+        n = fail_unfinished_runs(db)
+    if n:
+        logger.info(f"Marked {n} unfinished run(s) from before the restart as failed")
     yield
 
 
@@ -88,3 +105,32 @@ app.include_router(debug_router, dependencies=_auth_dep)
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "linksim"}
+
+
+# Tester build: serve the built web page (frontend/dist) from this server too,
+# so one program runs everything. LINKSIM_STATIC_DIR is set only by
+# desktop_launcher.py; in development Vite serves the page.
+_STATIC_DIR = os.environ.get("LINKSIM_STATIC_DIR")
+if _STATIC_DIR and os.path.isdir(_STATIC_DIR):
+    import mimetypes
+
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse
+
+    # Python takes file types from the Windows registry, where some PCs list
+    # .js as text/plain — the browser then refuses the page's script (blank
+    # page). Set the types the page needs explicitly.
+    for _type, _ext in (("text/javascript", ".js"), ("text/css", ".css"), ("text/html", ".html"),
+                        ("image/svg+xml", ".svg"), ("application/json", ".json")):
+        mimetypes.add_type(_type, _ext)
+
+    @app.get("/{path:path}", include_in_schema=False)
+    def frontend(path: str):
+        if path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not Found")
+        root = os.path.realpath(_STATIC_DIR)
+        file = os.path.realpath(os.path.join(root, path))
+        if path and file.startswith(root + os.sep) and os.path.isfile(file):
+            return FileResponse(file)
+        # Page routes (/canvas, /run, ...) are handled by the React router.
+        return FileResponse(os.path.join(root, "index.html"))

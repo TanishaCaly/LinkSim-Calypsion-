@@ -17,7 +17,7 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -32,6 +32,11 @@ _TRIAL_DAYS = 30
 # in development — teammates should be able to register/login freely). Flip
 # to "on" once the app is ready to actually gate access.
 _SUBSCRIPTION_ENFORCEMENT = os.getenv("SUBSCRIPTION_ENFORCEMENT", "off").strip().lower() == "on"
+
+# Tester build (desktop_launcher.py sets LINKSIM_DESKTOP=1): no login screen —
+# /auto signs in as one local user. Off in development.
+_DESKTOP = os.getenv("LINKSIM_DESKTOP", "").strip() == "1"
+_DESKTOP_USER = "local"
 
 # token -> user_id. In-memory by design (see module docstring).
 _active_sessions: dict[str, int] = {}
@@ -108,6 +113,24 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     return AuthResponse(token=token, username=user.username, user_id=user.id)
 
 
+@router.post("/auto", response_model=AuthResponse)
+def auto_login(db: Session = Depends(get_db)):
+    """Tester build only: sign in as the local user (created on first use)."""
+    if not _DESKTOP:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+    user = db.query(User).filter(User.username == _DESKTOP_USER).first()
+    if user is None:
+        # A random password nobody knows — this user only signs in via /auto.
+        user = User(username=_DESKTOP_USER, password_hash=_hash_password(secrets.token_urlsafe(32)))
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    token = secrets.token_urlsafe(32)
+    _active_sessions[token] = user.id
+    return AuthResponse(token=token, username=user.username, user_id=user.id)
+
+
 @router.post("/logout")
 def logout(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer)):
     if creds is not None:
@@ -116,6 +139,7 @@ def logout(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer)):
 
 
 def require_auth(
+    request: Request,
     creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
     db: Session = Depends(get_db),
 ) -> int:
@@ -123,10 +147,15 @@ def require_auth(
     or 403 if the token is valid but the account is deactivated / its
     subscription has expired. Returns the current user's id (not username) so
     route handlers can filter their queries by owner."""
-    if creds is None or creds.credentials not in _active_sessions:
+    token = creds.credentials if creds is not None else None
+    # The live-progress stream (browser EventSource) can't send headers, so it
+    # passes the token as ?token=… — accepted on that route only.
+    if token is None and request.url.path.endswith("/stream"):
+        token = request.query_params.get("token")
+    if token is None or token not in _active_sessions:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
 
-    user_id = _active_sessions[creds.credentials]
+    user_id = _active_sessions[token]
 
     if not _SUBSCRIPTION_ENFORCEMENT:
         return user_id

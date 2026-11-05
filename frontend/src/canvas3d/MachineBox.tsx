@@ -1,18 +1,21 @@
-import { useRef, useState } from 'react'
+import { Suspense, useRef, useState } from 'react'
 import { useFrame, type ThreeEvent } from '@react-three/fiber'
 import { RoundedBox } from '@react-three/drei'
 import * as THREE from 'three'
 import type { Machine3D } from './layout'
 import { utilColor } from './layout'
+import StationModel from './StationModel'
+import type { AnimState } from './stationActivity'
+import { STATION_MODELS } from '@/lib/stationTypes'
 
 interface MachineBoxProps {
   machine: Machine3D
   selected?: boolean
   onClick: (machine: Machine3D) => void
-  onHover?: (machineId: string | null) => void
+  getState?: () => AnimState
 }
 
-export default function MachineBox({ machine, selected = false, onClick, onHover }: MachineBoxProps) {
+export default function MachineBox({ machine, selected = false, onClick, getState }: MachineBoxProps) {
   const groupRef = useRef<THREE.Group>(null)
   const glowRef = useRef<THREE.Mesh>(null)
   const [hovered, setHovered] = useState(false)
@@ -24,8 +27,9 @@ export default function MachineBox({ machine, selected = false, onClick, onHover
 
   const w = machine.width
   const h = machine.height
+  const modelUrl = STATION_MODELS[machine.stationType]
 
-  useFrame((state, delta) => {
+  useFrame((_, delta) => {
     if (!groupRef.current) return
     const s = hovered ? 1.05 : selected ? 1.03 : 1
     targetScale.current.set(s, s, s)
@@ -33,46 +37,15 @@ export default function MachineBox({ machine, selected = false, onClick, onHover
 
     if (glowRef.current) {
       const mat = glowRef.current.material as THREE.MeshBasicMaterial
-      targetGlow.current = hovered ? 0.35 : selected ? 0.25 : 0
+      // A model isn't utilization-colored itself, so its floor pad stays
+      // faintly lit in the utilization color.
+      targetGlow.current = hovered ? 0.35 : selected ? 0.25 : modelUrl ? 0.2 : 0
       mat.opacity += (targetGlow.current - mat.opacity) * Math.min(delta * 8, 1)
     }
   })
 
-  return (
-    <group
-      ref={groupRef}
-      position={machine.position}
-      onClick={(e: ThreeEvent<MouseEvent>) => {
-        e.stopPropagation()
-        onClick(machine)
-      }}
-      onPointerOver={(e: ThreeEvent<PointerEvent>) => {
-        e.stopPropagation()
-        setHovered(true)
-        onHover?.(machine.id)
-        document.body.style.cursor = 'pointer'
-      }}
-      onPointerOut={() => {
-        setHovered(false)
-        onHover?.(null)
-        document.body.style.cursor = 'auto'
-      }}
-    >
-      {/* Glow ring under the box */}
-      <mesh
-        ref={glowRef}
-        rotation={[-Math.PI / 2, 0, 0]}
-        position={[0, -0.01, 0]}
-      >
-        <planeGeometry args={[w + 0.7, 2.2]} />
-        <meshBasicMaterial
-          color={selected ? '#f59e0b' : color}
-          transparent
-          opacity={0}
-          side={THREE.DoubleSide}
-        />
-      </mesh>
-
+  const boxBody = (
+    <>
       {/* Main box body */}
       <RoundedBox
         args={[w, h, 1.5]}
@@ -116,6 +89,52 @@ export default function MachineBox({ machine, selected = false, onClick, onHover
           <meshBasicMaterial color="#ffffff" transparent opacity={0.2} />
         </mesh>
       ))}
+    </>
+  )
+
+  return (
+    <group
+      ref={groupRef}
+      position={machine.position}
+      onClick={(e: ThreeEvent<MouseEvent>) => {
+        e.stopPropagation()
+        onClick(machine)
+      }}
+      onPointerOver={(e: ThreeEvent<PointerEvent>) => {
+        e.stopPropagation()
+        setHovered(true)
+        document.body.style.cursor = 'pointer'
+      }}
+      onPointerOut={() => {
+        setHovered(false)
+        document.body.style.cursor = 'auto'
+      }}
+    >
+      {/* Glow pad on the floor under the machine */}
+      <mesh
+        ref={glowRef}
+        rotation={[-Math.PI / 2, 0, 0]}
+        position={[0, -h / 2 + 0.02, 0]}
+        raycast={modelUrl ? () => {} : undefined}
+      >
+        <planeGeometry args={[w + 0.7, 2.2]} />
+        <meshBasicMaterial
+          color={selected ? '#f59e0b' : color}
+          transparent
+          opacity={0}
+          side={THREE.DoubleSide}
+        />
+      </mesh>
+
+      {/* The type's GLB model when it has one (the box shows while it loads),
+          otherwise the plain utilization-colored box. */}
+      {modelUrl ? (
+        <Suspense fallback={boxBody}>
+          <group position={[0, -h / 2, 0]}>
+            <StationModel url={modelUrl} getState={getState} />
+          </group>
+        </Suspense>
+      ) : boxBody}
     </group>
   )
 }
