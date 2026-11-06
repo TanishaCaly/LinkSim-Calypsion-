@@ -675,7 +675,7 @@ export function SimTimerDialog({
   // Shift-1 window/working-days this override actually uses (falls back to
   // the same engine defaults SimConfigDialog uses), so the weekday check and
   // "snap to shift start" below reflect the real config, not a guess.
-  const shift1Start = value.SHIFT_1_START ?? SHIFT_DEFAULTS[1].start
+  const shift1Start = (value.SHIFT_1_START as number | undefined) ?? SHIFT_DEFAULTS[1].start
   const shift1WorkingDays = (value.WORKING_DAYS_1 as number[] | undefined) ?? DEFAULT_WORKING_DAYS[1]
   const shift1Name = (value.SHIFT_1_NAME as string | undefined)?.trim() || 'Shift 1'
 

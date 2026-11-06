@@ -37,7 +37,7 @@ export default function FlowParticle({ connection, count = 2, timelineRefs }: Fl
     return Array.from({ length: count }, (_, i) => i / count)
   }, [count])
 
-  useFrame((state, delta) => {
+  useFrame(() => {
     let globalTime = Date.now() * 0.001
     if (timelineRefs && timelineRefs.simClockMs) {
       globalTime = timelineRefs.simClockMs.current * 0.001

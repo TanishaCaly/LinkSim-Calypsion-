@@ -23,9 +23,6 @@ import { useRunSimulation } from '@/hooks/useRunSimulation'
 import { STATUS_LEGEND } from '@/lib/status'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { Badge } from '@/components/ui/badge'
 import Scene from '@/canvas3d/Scene'
 import { buildScene3D } from '@/canvas3d/layout'
 import { stressLine } from '@/canvas3d/devStress'
@@ -538,7 +535,14 @@ function StationNode({ id, data, selected }: { id: string; data: StationNodeData
 
 // ─── Entry / Exit endpoint node (View mode) ──────────────────────────────────
 
-function EndpointNode({ data }: { data: { label: string; kind: 'entry' | 'exit' } }) {
+// The View-mode Start / End circles (buildFlowGraph adds them when the line
+// has no Start / End node of its own).
+interface EndpointNodeData {
+  label: string
+  kind: 'entry' | 'exit'
+}
+
+function EndpointNode({ data }: { data: EndpointNodeData }) {
   const isEntry = data.kind === 'entry'
   return (
     <div
@@ -616,7 +620,7 @@ function ShiftAvailabilityDropdown({
   useEffect(() => {
     if (!open) return
     const onClickOutside = (e: MouseEvent) => {
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false)
+      if (rootRef.current && !rootRef.current.contains(e.target as globalThis.Node)) setOpen(false)
     }
     document.addEventListener('mousedown', onClickOutside)
     return () => document.removeEventListener('mousedown', onClickOutside)
@@ -699,7 +703,7 @@ function StyledSelect({
   useEffect(() => {
     if (!open) return
     const onClickOutside = (e: MouseEvent) => {
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false)
+      if (rootRef.current && !rootRef.current.contains(e.target as globalThis.Node)) setOpen(false)
     }
     document.addEventListener('mousedown', onClickOutside)
     return () => document.removeEventListener('mousedown', onClickOutside)
@@ -741,76 +745,6 @@ function StyledSelect({
               </button>
             )
           })}
-        </div>
-      )}
-    </div>
-  )
-}
-
-function MultiStyledSelect({
-  values, options, onChange, placeholder = 'Select…',
-}: {
-  values: string[]
-  options: { value: string; label: string }[]
-  onChange: (next: string[]) => void
-  placeholder?: string
-}) {
-  const [open, setOpen] = useState(false)
-  const rootRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    if (!open) return
-    const onClickOutside = (e: MouseEvent) => {
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false)
-    }
-    document.addEventListener('mousedown', onClickOutside)
-    return () => document.removeEventListener('mousedown', onClickOutside)
-  }, [open])
-
-  const selectedLabels = options.filter((o) => values.includes(o.value)).map((o) => o.label)
-  const toggle = (value: string) =>
-    onChange(values.includes(value) ? values.filter((v) => v !== value) : [...values, value])
-
-  return (
-    <div ref={rootRef} className="relative">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="w-full h-8 flex items-center justify-between gap-2 rounded-lg border border-gray-200 bg-gray-50 hover:bg-white px-2.5 text-xs text-gray-900 transition-colors"
-      >
-        <span className="truncate">
-          {selectedLabels.length > 0 ? selectedLabels.join(', ') : placeholder}
-        </span>
-        <ChevronDown className={`h-3 w-3 shrink-0 text-gray-400 transition-transform ${open ? 'rotate-180' : ''}`} />
-      </button>
-      {open && (
-        <div className="absolute left-0 right-0 z-20 mt-1 rounded-lg border border-gray-200 bg-white shadow-lg py-1">
-          {options.length === 0 ? (
-            <p className="px-2.5 py-1.5 text-xs text-gray-400">No tasks yet.</p>
-          ) : (
-            options.map((opt) => {
-              const active = values.includes(opt.value)
-              return (
-                <button
-                  key={opt.value}
-                  type="button"
-                  onClick={() => toggle(opt.value)}
-                  className={`w-full flex items-center gap-2 px-2.5 py-1.5 text-xs text-left transition-colors ${
-                    active ? 'bg-blue-50 hover:bg-blue-100' : 'hover:bg-gray-50'
-                  }`}
-                >
-                  <span
-                    className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors ${
-                      active ? 'border-blue-500 bg-blue-500' : 'border-gray-300'
-                    }`}
-                  >
-                    {active && <Check className="h-3 w-3 text-white" />}
-                  </span>
-                  <span className={active ? 'font-semibold text-blue-700' : 'text-gray-600'}>{opt.label}</span>
-                </button>
-              )
-            })
-          )}
         </div>
       )}
     </div>
@@ -2497,9 +2431,10 @@ function buildFlowGraph(
     utilization: number; jobs: number
     bufferCapacity: number; bufferDiscipline: string
     bufferBlockedRatio: number; bufferBlockedTime: number
+    rackLaneCount?: number | null; rackOccupied?: number | null
   }>,
   stationsData: Record<string, { capacity?: number; 'Station Type'?: string; shifts_per_day?: number | number[]; 'Worker Controller'?: string }> = {},
-): { nodes: Node<FlowNodeData>[]; edges: Edge[] } {
+): { nodes: Node<FlowNodeData | EndpointNodeData>[]; edges: Edge[] } {
   const steps = processflow[variant] ?? []
   // FlowNode is now icon-first (112px icon + name/resource/duration/util rows
   // beneath it, ~200px tall overall) rather than the old compact text card —
@@ -2508,7 +2443,7 @@ function buildFlowGraph(
   const COL_GAP = 260
   const ROW_GAP = 170     // vertical spacing between parallel machines
 
-  const nodes: Node<FlowNodeData>[] = []
+  const nodes: Node<FlowNodeData | EndpointNodeData>[] = []
   // stepNodeIds[i] = list of node ids in column i (one per parallel machine)
   const stepNodeIds: string[][] = []
 
@@ -2590,12 +2525,10 @@ function buildFlowGraph(
     // Skip the synthetic Start/End pill when the first/last column already
     // IS a real Source/Drain station — otherwise the flow shows two "Start"
     // (or "End") nodes stacked back to back for the same entry/exit point.
-    const firstColIsSource = firstCol.some(
-      (id) => nodes.find((n) => n.id === id)?.data.stationType === 'Source'
-    )
-    const lastColIsDrain = lastCol.some(
-      (id) => nodes.find((n) => n.id === id)?.data.stationType === 'Drain'
-    )
+    // (Only station nodes exist yet — the Start/End pills are added below.)
+    const stationTypeOf = (id: string) => (nodes.find((n) => n.id === id)?.data as FlowNodeData | undefined)?.stationType
+    const firstColIsSource = firstCol.some((id) => stationTypeOf(id) === 'Source')
+    const lastColIsDrain = lastCol.some((id) => stationTypeOf(id) === 'Drain')
     const firstColYs = firstCol.map((id) => nodes.find((n) => n.id === id)!.position.y)
     const lastColYs = lastCol.map((id) => nodes.find((n) => n.id === id)!.position.y)
     const entryY = firstColYs.reduce((a, b) => a + b, 0) / firstColYs.length
@@ -2727,7 +2660,7 @@ function buildEditableGraph(
             bufferX: cfg?.['Buffer X'],
             bufferY: cfg?.['Buffer Y'],
             bufferZ: cfg?.['Buffer Z'],
-            bufferOrder: cfg?.['Buffer Discipline'],
+            bufferOrder: cfg?.['Buffer Discipline'] as StationNodeData['bufferOrder'],
             // Worker/Worker Controller/Workplace are never real processflow
             // steps, so they never reach this per-step loop at all — they're
             // reconstructed separately, straight from stationsData, right

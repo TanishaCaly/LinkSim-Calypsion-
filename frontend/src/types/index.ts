@@ -608,4 +608,14 @@ export interface StationNodeData {
   // staffing is the Workplace node/edges it created, same as if a user had
   // dragged one in by hand.
   requiresWorker?: boolean
+  // Buffer only — Build-mode config, saved to the scenario's 'Buffer
+  // Capacity' / 'Buffer Unlimited' / 'Buffer Config Mode' / 'Buffer X/Y/Z' /
+  // 'Buffer Discipline' station fields (see Canvas.tsx's Buffer panel).
+  bufferQuantity?: number
+  bufferUnlimited?: boolean
+  bufferConfigMode?: '2D' | '3D'
+  bufferX?: number
+  bufferY?: number
+  bufferZ?: number
+  bufferOrder?: 'FIFO' | 'LIFO'
 }

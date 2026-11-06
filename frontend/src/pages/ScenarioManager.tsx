@@ -786,7 +786,6 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
   )
   const [quantitiesDirty, setQuantitiesDirty] = useState(false)
   const [quantitiesSaved, setQuantitiesSaved] = useState(false)
-  const quantities = Object.fromEntries(quantityRows.map((r) => [r.variant, r.quantity]))
 
   const saveQuantitiesMutation = useMutation({
     mutationFn: (rows: QuantityRow[]) => {

@@ -2725,7 +2725,7 @@ export default function RunDashboard() {
                         </div>
                       </CardHeader>
                       <CardContent>
-                        <GanttTimeline result={displayRun.result ?? {}} simTime={displayRun.simulation_time} isExpanded={ganttExpanded} onExpandToggle={() => setGanttExpanded(e => !e)} />
+                        <GanttTimeline result={displayRun.result ?? {}} simTime={displayRun.simulation_time ?? undefined} isExpanded={ganttExpanded} onExpandToggle={() => setGanttExpanded(e => !e)} />
                         <ChartKey
                           colors={[
                             { color: 'var(--ls-ok)', label: 'Processing', note: 'a job being worked on' },
