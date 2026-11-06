@@ -1,5 +1,6 @@
 import { Canvas, useThree, type GLProps } from '@react-three/fiber'
 import { OrbitControls, Grid } from '@react-three/drei'
+import { Maximize2, Minimize2 } from 'lucide-react'
 import { Suspense, useState, useCallback, useRef, useMemo, useEffect } from 'react'
 import MachineBox from './MachineBox'
 import CameraRig from './CameraRig'
@@ -25,6 +26,8 @@ import type { Machine3D, Operator3D, Connection3D, StepLabel, Prop3D } from './l
 import { buildStationActivity, activeCount, type AnimState } from './stationActivity'
 import type { AssemblyInfo, DismantleInfo } from './jobTimeline'
 import type { StationConfig, OperatorConfig } from '@/types'
+import SimSettingsMenu, { openSimDialog } from '@/components/run/SimSettingsMenu'
+import ReplayBar, { DEFAULT_REPLAY_SPEED, REPLAY_SPEEDS, fmtReplayClock } from '@/components/run/ReplayBar'
 
 export interface TimelineRefs {
   playing: React.MutableRefObject<boolean>
@@ -60,31 +63,13 @@ interface SceneProps {
   variantColors?: Record<string, string>
   // How many jobs the run turned away (rejected) or lost (scrapped); the legend shows them only when there are some.
   outcomes?: { rejected: number; scrapped: number }
+  // How long the run was set to simulate, in minutes; the replay bar shows it as "Run for".
+  runMinutes?: number
 }
 
 const WEBGL_PROPS = { antialias: true, toneMapping: CineonToneMapping }
 
-// Playback speed is simulated time per real second: N× is N simulated seconds
-// per real second (the same list as the 2D replay bar). "Fit" plays the
-// whole run in a minute, which is the way to watch a run that spans months.
-const SPEEDS: { id: string; label: string; msPerSec: number | null }[] = [
-  { id: '1x', label: '1×', msPerSec: 1_000 },
-  { id: '10x', label: '10×', msPerSec: 10_000 },
-  { id: '30x', label: '30×', msPerSec: 30_000 },
-  { id: '50x', label: '50×', msPerSec: 50_000 },
-  { id: '100x', label: '100×', msPerSec: 100_000 },
-  { id: 'fit', label: 'Fit 1 min', msPerSec: null },
-]
 const FIT_SECONDS = 60
-
-// "Day 3 · 14:25" — the same reading as the 2D replay bar. The log's wall-clock
-// times are parsed as local time, so the local getters give them back.
-function fmtClock(zeroMs: number, minutes: number): string {
-  const d = new Date(zeroMs + minutes * 60000)
-  const hh = String(d.getHours()).padStart(2, '0')
-  const mm = String(d.getMinutes()).padStart(2, '0')
-  return `Day ${Math.floor(minutes / 1440) + 1} · ${hh}:${mm}`
-}
 
 // Parts that need WebGL (drei's shader grid) step aside under WebGPU.
 function WebGLOnly({ children }: { children: React.ReactNode }) {
@@ -98,7 +83,7 @@ function Floor({ isDark, size, centerX, centerZ }: { isDark: boolean; size: numb
       <mesh rotation={[-Math.PI / 2, 0, 0]} position={[centerX, -0.02, centerZ]} receiveShadow>
         <planeGeometry args={[size, size]} />
         <meshStandardMaterial
-          color={isDark ? '#1e293b' : '#f1f5f9'}
+          color={isDark ? '#3b4758' : '#f1f5f9'}
           roughness={0.95}
           metalness={0}
         />
@@ -106,7 +91,7 @@ function Floor({ isDark, size, centerX, centerZ }: { isDark: boolean; size: numb
       <mesh rotation={[-Math.PI / 2, 0, 0]} position={[centerX, -0.01, centerZ]}>
         <ringGeometry args={[size * 0.3, size * 0.6, 64]} />
         <meshBasicMaterial
-          color={isDark ? '#0f172a' : '#e2e8f0'}
+          color={isDark ? '#2a3441' : '#e2e8f0'}
           transparent
           opacity={0.3}
         />
@@ -127,9 +112,18 @@ export default function Scene({
   dismantles,
   variantColors,
   outcomes,
+  runMinutes,
 }: SceneProps) {
   const [selectedMachine, setSelectedMachine] = useState<Machine3D | null>(null)
   const [topView, setTopView] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+  const [full, setFull] = useState(false)
+  useEffect(() => {
+    const on = () => setFull(document.fullscreenElement === rootRef.current)
+    document.addEventListener('fullscreenchange', on)
+    return () => document.removeEventListener('fullscreenchange', on)
+  }, [])
+  const toggleFull = () => (document.fullscreenElement ? document.exitFullscreen() : rootRef.current?.requestFullscreen())?.catch(() => {})
   // Factory hall around the line, or the plain floor; remembered between visits.
   const [factory, setFactory] = useState(() => {
     try { return localStorage.getItem('linksim.3d.factory') !== 'off' } catch { return true }
@@ -164,7 +158,7 @@ export default function Scene({
   const [scrubUI, setScrubUI] = useState(0)
   const [totalMsUI, setTotalMsUI] = useState(1)
   const [zeroMsUI, setZeroMsUI] = useState(0)
-  const [speedId, setSpeedId] = useState('fit')
+  const [speedId, setSpeedId] = useState(DEFAULT_REPLAY_SPEED)
   const [playingUI, setPlayingUI] = useState(false)
 
   // Legend numbers are written straight into the page so a change in the line
@@ -209,8 +203,8 @@ export default function Scene({
   }, [completionLog])
 
   useEffect(() => {
-    const preset = SPEEDS.find(s => s.id === speedId)
-    speedRef.current = preset?.msPerSec ?? Math.max(totalMsUI / FIT_SECONDS, 1)
+    const preset = REPLAY_SPEEDS.find(s => s.id === speedId)
+    speedRef.current = preset?.simSecPerSec != null ? preset.simSecPerSec * 1000 : Math.max(totalMsUI / FIT_SECONDS, 1)
   }, [speedId, totalMsUI])
 
   const handleSelectMachine = useCallback((machine: Machine3D | null) => {
@@ -331,20 +325,20 @@ export default function Scene({
   const curMinutes = Math.round(((scrubUI / 100) * totalMsUI) / 60000)
 
   return (
-    <div className="relative w-full h-full">
+    <div ref={rootRef} className="relative w-full h-full">
       <Canvas
         camera={{ position: [centerX + floorSize * 0.35, floorSize * 0.3, centerZ + floorSize * 0.35], fov: 42, far: Math.max(1000, floorSize * 4) }}
         shadows="percentage"
         gl={(renderer === 'webgpu' ? createWebGPURenderer : WEBGL_PROPS) as GLProps}
         onPointerMissed={() => setSelectedMachine(null)}
       >
-        <ambientLight intensity={isDark ? 0.35 : 0.55} />
+        <ambientLight intensity={isDark ? 0.8 : 0.55} />
         {batching ? (
-          <NearShadowLight intensity={isDark ? 1.0 : 1.4} maxRadius={floorSize / 2 + 10} />
+          <NearShadowLight intensity={isDark ? 1.5 : 1.4} maxRadius={floorSize / 2 + 10} />
         ) : (
           <directionalLight
             position={[centerX + 12, 25, centerZ + 12]}
-            intensity={isDark ? 1.0 : 1.4}
+            intensity={isDark ? 1.5 : 1.4}
             castShadow
             shadow-mapSize-width={2048}
             shadow-mapSize-height={2048}
@@ -357,13 +351,13 @@ export default function Scene({
           />
         )}
         <hemisphereLight
-          args={[isDark ? '#334155' : '#e2e8f0', isDark ? '#0f172a' : '#f8fafc', 0.4]}
+          args={[isDark ? '#64748b' : '#e2e8f0', isDark ? '#334155' : '#f8fafc', isDark ? 0.8 : 0.4]}
         />
         <pointLight position={[centerX, 5, centerZ]} intensity={0.3} color="#f59e0b" distance={30} />
 
         {factory ? (
           <>
-            <color attach="background" args={[isDark ? '#0e131a' : '#8791a0']} />
+            <color attach="background" args={[isDark ? '#2a3441' : '#8791a0']} />
             <group name="cat:hall"><FactoryShell bounds={bounds} machines={machines} props={props} isDark={isDark} /></group>
           </>
         ) : (
@@ -373,10 +367,10 @@ export default function Scene({
               args={[floorSize, floorSize]}
               cellSize={1}
               cellThickness={0.4}
-              cellColor={isDark ? '#334155' : '#e2e8f0'}
+              cellColor={isDark ? '#4b5a70' : '#e2e8f0'}
               sectionSize={5}
               sectionThickness={0.8}
-              sectionColor={isDark ? '#475569' : '#cbd5e1'}
+              sectionColor={isDark ? '#64748b' : '#cbd5e1'}
               fadeDistance={floorSize * 1.5}
               infiniteGrid
               position={[centerX, 0.01, centerZ]}
@@ -471,6 +465,7 @@ export default function Scene({
         <Suspense fallback={null}>
           <group name="cat:jobs"><JobMarkers
             machines={machines}
+            startPos={props.find(p => p.id === 'start')?.position}
             endPos={props.find(p => p.id === 'end')?.position}
             completionLog={completionLog}
             assemblies={assemblies}
@@ -513,7 +508,15 @@ export default function Scene({
         </button>
       </div>
 
-      <div className={`absolute top-4 z-20 w-56 ${selectedMachine ? 'right-[22rem]' : 'right-4'}`}>
+      <button
+        onClick={toggleFull}
+        className={`absolute top-4 z-20 grid h-8 w-8 place-items-center rounded-lg border border-gray-200 bg-white/95 text-gray-600 shadow-sm hover:bg-gray-50 ${selectedMachine ? 'right-[22rem]' : 'right-4'}`}
+        title={full ? 'Exit full screen' : 'Full screen'}
+      >
+        {full ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+      </button>
+
+      <div className={`absolute top-4 z-20 w-56 ${selectedMachine ? 'right-[24.5rem]' : 'right-14'}`}>
         <input
           value={query}
           onChange={e => { setQuery(e.target.value); setSearchOpen(true); setActive(0) }}
@@ -558,10 +561,10 @@ export default function Scene({
               <span className="flex items-center gap-1.5">Dismantled <b ref={dismantledEl} className="tabular-nums text-gray-900">0</b></span>
             )}
             {!!outcomes?.rejected && (
-              <span className="flex items-center gap-1.5"><i className="h-2.5 w-2.5 rounded-full bg-[#ef4444]" />Rejected <b ref={rejectedEl} className="tabular-nums text-gray-900">0</b></span>
+              <span className="flex items-center gap-1.5"><i className="h-2.5 w-2.5 rounded-full bg-[#F04438]" />Rejected <b ref={rejectedEl} className="tabular-nums text-gray-900">0</b></span>
             )}
             {!!outcomes?.scrapped && (
-              <span className="flex items-center gap-1.5"><i className="h-2.5 w-2.5 rounded-full bg-[#ef4444]" />Scrapped <b ref={scrappedEl} className="tabular-nums text-gray-900">0</b></span>
+              <span className="flex items-center gap-1.5"><i className="h-2.5 w-2.5 rounded-full bg-[#F04438]" />Scrapped <b ref={scrappedEl} className="tabular-nums text-gray-900">0</b></span>
             )}
           </div>
           {variantColors && Object.keys(variantColors).length > 1 && (
@@ -578,21 +581,17 @@ export default function Scene({
       )}
 
       {completionLog && (
-        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-white/95 backdrop-blur-sm rounded-xl shadow-lg border border-gray-200 px-4 py-2 z-10">
-          <button
-            onClick={() => {
+        <div className="absolute bottom-4 left-1/2 z-10 w-[min(900px,calc(100%-28px))] -translate-x-1/2">
+          <ReplayBar
+            playing={playingUI}
+            onRestart={() => {
               scrubPctRef.current = 0
               simClockMsRef.current = 0
               playingRef.current = false
               setPlayingUI(false)
               setScrubUI(0)
             }}
-            className="text-xs px-2.5 py-1.5 rounded-lg border border-gray-200 bg-white text-gray-600 hover:bg-gray-50 font-medium"
-          >
-            ⏹ Stop
-          </button>
-          <button
-            onClick={() => {
+            onToggle={() => {
               // Play at the end starts over, as in the 2D bar.
               if (!playingRef.current && scrubPctRef.current >= 100) {
                 scrubPctRef.current = 0
@@ -602,38 +601,22 @@ export default function Scene({
               playingRef.current = !playingRef.current
               setPlayingUI(playingRef.current)
             }}
-            className="text-xs px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 font-medium"
-          >
-            {playingUI ? '⏸ Pause' : '▶ Play'}
-          </button>
-          {SPEEDS.map(s => (
-            <button
-              key={s.id}
-              onClick={() => setSpeedId(s.id)}
-              className={`text-xs px-2 py-1.5 rounded-lg border font-medium transition-colors whitespace-nowrap ${speedId === s.id ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 text-gray-500 hover:border-blue-300'}`}
-            >
-              {s.label}
-            </button>
-          ))}
-          <input
-            type="range"
-            min={0}
-            max={100}
-            step={0.1}
-            value={scrubUI}
-            onChange={e => {
+            speedId={speedId}
+            onSpeed={setSpeedId}
+            pct={scrubUI}
+            onScrub={pct => {
               playingRef.current = false
               setPlayingUI(false)
-              const pct = Number(e.target.value)
               scrubPctRef.current = pct
               simClockMsRef.current = (pct / 100) * totalMsRef.current
               setScrubUI(pct)
             }}
-            className="w-40 accent-blue-600"
+            clock={fmtReplayClock(zeroMsUI, curMinutes)}
+            elapsedMin={curMinutes}
+            startMs={zeroMsUI}
+            runMin={runMinutes ?? totalMsUI / 60000}
+            settings={<SimSettingsMenu compact up onConfig={() => openSimDialog('config')} onTimer={() => openSimDialog('timer')} />}
           />
-          <span className="text-[10px] text-gray-500 font-medium whitespace-nowrap">
-            {fmtClock(zeroMsUI, curMinutes)}
-          </span>
         </div>
       )}
 

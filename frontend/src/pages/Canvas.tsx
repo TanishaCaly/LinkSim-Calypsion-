@@ -11,12 +11,16 @@ import JobReplay, { type AssemblyRecord, type DismantleRecord, type ReplayTarget
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import {
-  Save, Plus, Trash2, Settings, Eye, Edit3, Play, ChevronLeft, ChevronRight, Box, Layout as LayoutIcon, X,
+  Save, Plus, Trash2, Eye, Play, ChevronLeft, ChevronRight, X, RefreshCw, Square,
   ChevronDown, Check,
 } from 'lucide-react'
 import { scenariosApi } from '@/api/scenarios'
 import { simulationsApi } from '@/api/simulations'
 import { useAppStore } from '@/store/useAppStore'
+import SimDialogsHost from '@/components/run/SimDialogsHost'
+import SimSettingsMenu, { openSimDialog } from '@/components/run/SimSettingsMenu'
+import { useRunSimulation } from '@/hooks/useRunSimulation'
+import { STATUS_LEGEND } from '@/lib/status'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -323,17 +327,17 @@ const ISO_ICON_BODY: Record<string, (color: string) => React.ReactNode> = {
 // ─── Colour helpers ───────────────────────────────────────────────────────────
 
 function utilColor(u: number) {
-  if (u >= 85) return '#ef4444'
-  if (u >= 70) return '#f59e0b'
-  if (u >= 40) return '#22c55e'
-  return '#94a3b8'
+  if (u >= 85) return '#F04438'
+  if (u >= 70) return '#F59E0B'
+  if (u >= 40) return '#12B76A'
+  return '#3E8BF5'
 }
 
 function utilBorder(u: number) {
-  if (u >= 85) return '#ef4444'
-  if (u >= 70) return '#f59e0b'
-  if (u >= 40) return '#22c55e'
-  return '#d1d5db'
+  if (u >= 85) return '#F04438'
+  if (u >= 70) return '#F59E0B'
+  if (u >= 40) return '#12B76A'
+  return '#9CC0F8'
 }
 
 // ─── VIEW MODE node ───────────────────────────────────────────────────────────
@@ -593,55 +597,6 @@ function NumericField({ value, onCommit, className, disabled }: { value: number;
   )
 }
 
-// Read-only "Shifts available" display (View-mode station panel) — a plain
-// row of pills, one per shift, stops being readable once a scenario defines
-// more than a handful (wraps into several messy lines). Caps the pills shown
-// and folds the rest behind a "+N more" toggle instead, same idea as
-// ShiftAvailabilityDropdown below but for a static list, not an editor.
-function ShiftPillList({
-  shiftNums, shiftNames, maxVisible = 4,
-}: {
-  shiftNums: number[]
-  shiftNames: Record<number, string | undefined>
-  maxVisible?: number
-}) {
-  const [expanded, setExpanded] = useState(false)
-  const shiftLabel = (n: number) => shiftNames[n]?.trim() || `Shift ${n}`
-  const visible = expanded ? shiftNums : shiftNums.slice(0, maxVisible)
-  const hiddenCount = shiftNums.length - visible.length
-
-  return (
-    <div className="flex flex-wrap gap-1">
-      {visible.map((n) => (
-        <span
-          key={n}
-          className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200"
-        >
-          {shiftLabel(n)}
-        </span>
-      ))}
-      {hiddenCount > 0 && (
-        <button
-          type="button"
-          onClick={() => setExpanded(true)}
-          className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-gray-100 text-gray-500 hover:bg-gray-200 transition-colors"
-        >
-          +{hiddenCount} more
-        </button>
-      )}
-      {expanded && shiftNums.length > maxVisible && (
-        <button
-          type="button"
-          onClick={() => setExpanded(false)}
-          className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-gray-100 text-gray-500 hover:bg-gray-200 transition-colors"
-        >
-          Show less
-        </button>
-      )}
-    </div>
-  )
-}
-
 // A multi-select dropdown for which shifts a station runs — a button-grid
 // with one cell per shift stops being usable once a scenario defines more
 // than ~6 shifts (wraps into an unreadable multi-row mess), so this instead
@@ -865,7 +820,7 @@ function MultiStyledSelect({
 // ─── Property editor ─────────────────────────────────────────────────────────
 
 function PropertyEditor({
-  node, nodes, edges, allEdges, onChange, onDelete, onSaveStation, onAddParallel, onOpenMuTable, startProducts, products, onAddWorkplace, onRemoveWorkplace, onToggleWire, onAssignOperator, onUnassignOperator, numShifts, shiftNames, operatorsData, workerResults, stationStates, bufferStates, partsFlow,
+  node, nodes, edges, allEdges, onChange, onDelete, onSaveStation, onAddParallel, onOpenMuTable, startProducts, productColors, onProductColor, products, onAddWorkplace, onRemoveWorkplace, onToggleWire, onAssignOperator, onUnassignOperator, numShifts, shiftNames, operatorsData, workerResults, stationStates, bufferStates, partsFlow,
 }: {
   node: Node<StationNodeData>
   nodes: Node<StationNodeData>[]
@@ -879,6 +834,9 @@ function PropertyEditor({
   onOpenMuTable: (id: string) => void
   // Start only: its products (MU table), for its Exit Controller.
   startProducts: string[]
+  // Each product's job colour, and a change of it (Start only).
+  productColors: Record<string, string>
+  onProductColor: (id: string, mu: string, color: string) => void
   // The scenario's products, for Route by product.
   products: string[]
   onAddWorkplace: (id: string) => void
@@ -1120,14 +1078,14 @@ function PropertyEditor({
   return (
     <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 bg-blue-50 border-b border-blue-100">
-        <div className="flex items-center gap-2">
-          <div className="w-7 h-7 rounded-lg bg-blue-600 flex items-center justify-center">
-            <Settings className="h-3.5 w-3.5 text-white" />
+      <div className="flex items-center justify-between px-4 py-3 bg-ls-soft border-b border-ls-line">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <div className="w-10 h-10 shrink-0 rounded-[10px] bg-ls-card shadow-sm flex items-center justify-center">
+            <IsoIcon type={nodeType} color={(nodeType && STATION_TYPE_HEX[nodeType]) || DEFAULT_STATION_HEX} />
           </div>
-          <div>
-            <p className="text-xs font-bold text-blue-900 leading-none">{node.data.label}</p>
-            <p className="text-[10px] text-blue-400 mt-0.5">Station properties</p>
+          <div className="min-w-0">
+            <p className="truncate font-display text-sm font-bold text-ls-ink leading-none">{node.data.label}</p>
+            <p className="text-[10.5px] text-ls-mute mt-1">{nodeType === 'Source' ? 'Start' : nodeType === 'Drain' ? 'End' : nodeType} properties</p>
           </div>
         </div>
         <button
@@ -1278,6 +1236,23 @@ function PropertyEditor({
             >
               Open MU table{node.data.muTable ? ` (${node.data.muTable.length})` : ''}
             </button>
+            {startProducts.length > 0 && (
+              <div className="mt-2.5 space-y-1.5">
+                <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Job colour</p>
+                {startProducts.map((mu) => (
+                  <label key={mu} className="flex items-center gap-2 text-xs text-gray-700">
+                    <input
+                      type="color"
+                      value={productColors[mu] || '#3b82f6'}
+                      onChange={(e) => onProductColor(node.id, mu, e.target.value)}
+                      title={`Colour of ${mu}'s jobs`}
+                      className="h-6 w-8 cursor-pointer rounded-md border border-gray-200 bg-gray-50 p-0.5"
+                    />
+                    <span className="truncate">{mu}</span>
+                  </label>
+                ))}
+              </div>
+            )}
           </div>
         )}
 
@@ -2449,7 +2424,7 @@ function PropertyEditor({
       <div className="px-4 pb-4">
         <button
           onClick={onSaveStation}
-          className="w-full py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl transition-colors"
+          className="w-full py-2 text-xs font-semibold text-ls-card bg-ls-dark hover:opacity-90 rounded-xl transition-colors"
         >
           Save
         </button>
@@ -3741,7 +3716,7 @@ function AssemblyPanel({ assembly, products, incoming, lineProducts, onChange }:
               type="button"
               onClick={() => set({ mode: value })}
               className={`h-8 text-xs font-semibold transition-all ${assembly.mode === value
-                ? 'bg-blue-600 text-white'
+                ? 'bg-ls-dark text-ls-card'
                 : 'text-gray-500 hover:bg-gray-50'}`}
             >
               {text}
@@ -4606,19 +4581,20 @@ export default function Canvas() {
   const queryClient = useQueryClient()
   const { activeScenario, activeRun, setActiveScenario, setActiveRun, showToast, setJustReset } = useAppStore()
   const isDark = useAppStore(s => s.theme) === 'dark'
+  // One run state for the whole page: the Run button (top bar in Build) and the bottom bar share it.
+  const sim = useRunSimulation()
 
   // Memoized so React Flow always sees the same object reference across renders/HMR —
   // an unstable nodeTypes reference makes React Flow re-init internally on every
   // render, which breaks node dragging (clicks fall through to the pane instead).
   const stableNodeTypes = useMemo(() => nodeTypes, [])
-  const stableEdgeTypes = useMemo(() => ({}), [])
 
   // Mode: 'view' shows scenario flow; 'build' is free-canvas builder
-  const [mode, setMode] = useState<'view' | 'build'>(activeScenario ? 'view' : 'build')
+  const [mode, setMode] = useState<'view' | 'build'>('build')
 
-  // Within View mode: '2d' is the existing ReactFlow diagram, '3d' is the new Scene
-  const [viewMode, setViewMode] = useState<'3d' | '2d'>('3d')
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  // On a narrow window the side panel starts collapsed so the canvas keeps the room
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => typeof window !== 'undefined' && window.innerWidth < 900)
+  const [paletteQuery, setPaletteQuery] = useState('')
   const [selectedVariant, setSelectedVariant] = useState<string>('')
 
   // Build mode state
@@ -4820,7 +4796,7 @@ export default function Canvas() {
     return out
   }, [activeRun])
 
-  const { nodes: viewNodesBase, edges: viewEdges } = useMemo(() => {
+  const { nodes: viewNodesBase } = useMemo(() => {
     if (!activeScenario || !selectedVariant) return { nodes: [], edges: [] }
     return buildFlowGraph(activeScenario.processflow_data, selectedVariant, stationStats, activeScenario.stations_data)
   }, [activeScenario, selectedVariant, stationStats])
@@ -4831,12 +4807,10 @@ export default function Canvas() {
   // tracked separately so switching variants/re-deriving viewNodesBase doesn't
   // wipe them out unnecessarily (keyed by node id, reset when variant changes).
   const [endpointPositions, setEndpointPositions] = useState<Record<string, { x: number; y: number }>>({})
-  const [selectedEndpoint, setSelectedEndpoint] = useState<'entry' | 'exit' | null>(null)
   // Regular station ("flow") nodes are still non-draggable, but they ARE
   // clickable — clicking one opens a right panel with that station's stats.
-  const [selectedFlowNodeId, setSelectedFlowNodeId] = useState<string | null>(null)
 
-  useEffect(() => { setEndpointPositions({}); setSelectedEndpoint(null); setSelectedFlowNodeId(null) }, [selectedVariant])
+  useEffect(() => { setEndpointPositions({}) }, [selectedVariant])
 
   const viewNodes = useMemo(() => {
     return viewNodesBase.map((n) => {
@@ -4851,39 +4825,6 @@ export default function Canvas() {
     })
   }, [viewNodesBase, endpointPositions])
 
-  const selectedFlowNode = useMemo(
-    () => viewNodes.find((n) => n.id === selectedFlowNodeId && n.type === 'flow') as Node<FlowNodeData> | undefined,
-    [viewNodes, selectedFlowNodeId]
-  )
-
-  // The View-mode panel needs the *inferred* type (queue/buffer name-matching
-  // included), not just the raw stations_data "Station Type" field — a lot of
-  // Buffer nodes (e.g. "Welding_Queue2") have no explicit Station Type set and
-  // are only recognised as Buffer via inferStationType's name heuristics.
-  const selectedFlowNodeType = useMemo(
-    () => selectedFlowNode ? inferStationType(baseStationName(selectedFlowNode.data.resource), selectedFlowNode.data.stationType) : undefined,
-    [selectedFlowNode]
-  )
-
-  // Per-station completion-log breakdown (job_id + status) for the clicked
-  // station, from the active run — same completion_log source as the Exit
-  // panel's per-variant calc, just filtered to a single station.
-  const selectedFlowNodeJobs = useMemo(() => {
-    if (!selectedFlowNode || activeRun?.status !== 'completed') return []
-    const log = (activeRun.result?.['completion_log'] as Record<string, { job_id?: string; status?: string; duration?: number }[]> | undefined) ?? {}
-    return log[selectedFlowNode.data.resource] ?? []
-  }, [selectedFlowNode, activeRun])
-
-  // Opening/closing the right-hand panel resizes the flow container, but
-  // ReactFlow's `fitView` prop only runs once on mount — without re-fitting,
-  // the graph appears to have scrolled out of view once the panel toggles.
-  const [viewFlowInstance, setViewFlowInstance] = useState<ReactFlowInstance | null>(null)
-  const viewPanelOpen = selectedEndpoint !== null || selectedFlowNodeId !== null
-  useEffect(() => {
-    if (!viewFlowInstance) return
-    const id = requestAnimationFrame(() => viewFlowInstance.fitView({ padding: 0.2 }))
-    return () => cancelAnimationFrame(id)
-  }, [viewFlowInstance, viewPanelOpen])
 
   // Build-mode canvas instance — needed to convert a drag-and-drop's screen
   // (clientX/clientY) coordinates into flow-space coordinates, so a palette
@@ -4891,64 +4832,7 @@ export default function Canvas() {
   // an auto-computed "rightmost + offset" spot.
   const [buildFlowInstance, setBuildFlowInstance] = useState<ReactFlowInstance | null>(null)
 
-  // ── Entry panel: read-only per-variant Quantity/Interval display — editing
-  // happens in Build mode instead. Re-seeded whenever the underlying scenario
-  // data actually changes (not on every render) via the id/updated_at.
-  interface EntryRow { variant: string; quantity: number; interval: number | null }
-  const [entryRows, setEntryRows] = useState<EntryRow[]>([])
-  const entrySeedKey = activeScenario ? `${activeScenario.id}-${activeScenario.updated_at}` : ''
-  useEffect(() => {
-    if (!activeScenario) return
-    setEntryRows(
-      Object.entries(activeScenario.variant_quantities ?? {}).map(([variant, qty]) => ({
-        variant, quantity: qty, interval: activeScenario.variant_intervals?.[variant] ?? null,
-      }))
-    )
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [entrySeedKey])
-
-  const entryCount = useMemo(() => entryRows.reduce((a, r) => a + (r.quantity || 0), 0), [entryRows])
-
-  // ── Exit panel: per-station completed-job breakdown from the active run,
-  // plus overall completed/in-progress/still-waiting split.
-  const exitCount = activeRun?.status === 'completed' ? (activeRun.completed_jobs ?? 0) : 0
-  const exitInProgress = activeRun?.in_progress_jobs ?? 0
-  const exitScrapped = Number((activeRun?.result?.simulation_state as { scrapped_jobs?: number } | undefined)?.scrapped_jobs ?? 0)
-  const exitStillWaiting = Math.max(0, entryCount - exitCount - exitInProgress - exitScrapped)
-  const exitPct = entryCount > 0 ? Math.round((exitCount / entryCount) * 100) : 0
-  const exitPerStation = useMemo(
-    () => [...(activeRun?.station_stats ?? [])]
-      .sort((a, b) => b.completed_jobs - a.completed_jobs),
-    [activeRun]
-  )
-
-  // Per-variant exit counts: a job "exits" once it completes the LAST step
-  // of its own variant's process flow. Job IDs are formatted as
-  // "<AlnumVariantName><id>" (see backend _format_job_id), so we match the
-  // completion_log entries at that variant's final station(s) whose job_id
-  // starts with the variant's alnum-stripped name, same convention the
-  // engine itself uses to build the id.
-  const exitPerVariant = useMemo(() => {
-    if (!activeScenario || activeRun?.status !== 'completed') return []
-    const log = (activeRun.result?.['completion_log'] as Record<string, { job_id?: string; status?: string }[]> | undefined) ?? {}
-    return Object.entries(activeScenario.processflow_data ?? {}).map(([variant, steps]) => {
-      // Every station of the last column — a flow ending in a split finishes
-      // at whichever one each job went to.
-      const columns = stepColumns(steps)
-      const finalStations = (columns[columns.length - 1] ?? []).flatMap((s) => stepResourceOptions(s.resource))
-      const alnumPrefix = variant.replace(/[^a-zA-Z0-9]/g, '')
-      let completed = 0
-      for (const station of finalStations) {
-        for (const e of log[station] ?? []) {
-          if (e.job_id?.startsWith(alnumPrefix) && (e.status ?? 'Completed') === 'Completed') completed++
-        }
-      }
-      const total = activeScenario.variant_quantities?.[variant] ?? 0
-      return { variant, completed, total }
-    })
-  }, [activeScenario, activeRun])
-
-  // 3D Scene data — used when viewMode === '3d' inside View mode (see render below)
+  // 3D Scene data (View mode)
   const scene3D = useMemo(() => {
     if (!activeScenario || !selectedVariant) return { machines: [], operators: [], connections: [], stepLabels: [], props: [] }
     const { processflow, stations } = stressLine(activeScenario.processflow_data, activeScenario.stations_data, selectedVariant)
@@ -6103,6 +5987,22 @@ export default function Canvas() {
     }))
   }
 
+  // A product's job colour set from the Start's properties: written into that
+  // Start's own MU table (the product's row is added when it has none yet).
+  const setProductColor = (id: string, mu: string, color: string) => {
+    const start = nodes.find((n) => n.id === id)
+    if (!start) return
+    const table = startTableOf(start)
+    const next = table.some((x) => x.mu === mu)
+      ? table.map((x) => (x.mu === mu ? { ...x, color } : x))
+      : [...table, {
+          mu, name: '', color,
+          number: activeScenario?.variant_quantities?.[mu] ?? 0,
+          interval: activeScenario?.variant_intervals?.[mu] ?? null,
+        }]
+    updateNode(id, { muTable: next })
+  }
+
   // Each product's colour (Start's MU table, else the defaults) for the
   // moving jobs. Kept stable while the colours don't change, so the replay
   // doesn't re-read the run on every canvas edit.
@@ -6353,10 +6253,72 @@ export default function Canvas() {
     }
   }
 
+  const onBuild = mode === 'build'
+  // Run (and Stop while running) sit in the top bar next to the other actions, in Build and in 3D alike.
+  const replayShown = !!completionLog && (mode === 'view' || activeRun?.status === 'completed')
+  const runButtons = (
+    <>
+      {/* The replay bar carries Sim setting once there is a run to replay; until then it sits here. */}
+      {!replayShown && <SimSettingsMenu pill onConfig={() => openSimDialog('config')} onTimer={() => openSimDialog('timer')} />}
+      <Button
+        onClick={() => sim.start()}
+        disabled={sim.isRunning || canvasDirty || !activeScenario}
+        title={canvasDirty ? 'Save the scenario first — a run uses the saved version' : 'Run the saved scenario'}
+        className="rounded-full px-4"
+      >
+        {sim.isRunning ? <><RefreshCw className="h-3.5 w-3.5 mr-1.5 animate-spin" />Running{sim.progress ? ` ${Math.round(sim.progress.pct)}%` : '…'}</> : <><Play className="h-3.5 w-3.5 mr-1.5" />Run</>}
+      </Button>
+      {(sim.isRunning || sim.displayRun?.status === 'running') && (
+        <Button
+          variant="outline"
+          onClick={sim.stop}
+          disabled={sim.stopPending || !sim.canStop}
+          className="rounded-full border-red-200 px-4 text-red-600 hover:bg-red-50"
+          title="Stop this run at its next checkpoint — partial results are kept"
+        >
+          <Square className="h-3.5 w-3.5 mr-1.5" />
+          {sim.stopPending ? 'Stopping…' : 'Stop'}
+        </Button>
+      )}
+    </>
+  )
+  const on3d = mode === 'view'
+  const segBtn = (active: boolean, disabled?: boolean) =>
+    `h-7 rounded-full px-4 text-[12.5px] font-bold font-display transition-colors disabled:opacity-40 ${active ? 'bg-ls-card text-ls-ink shadow-md' : 'text-ls-ink2 hover:text-ls-ink'}${disabled ? '' : ''}`
   return (
-    <div className="flex h-screen overflow-hidden">
-      {/* Sidebar */}
-      <aside className={`relative border-r border-gray-100 bg-white flex flex-col shadow-sm transition-all duration-300 ${sidebarCollapsed ? 'w-10' : 'w-56'}`}>
+    <div className="flex h-full flex-col overflow-hidden">
+      {/* Sub bar: how to look at the line, and what the colours mean */}
+      <div className="no-print flex h-[50px] shrink-0 items-center justify-between gap-3 border-b border-ls-line bg-ls-card px-4">
+        <div className="flex min-w-0 items-center gap-3">
+          <div className="flex rounded-full bg-ls-chip p-[3px]">
+            <button onClick={() => setMode('build')} className={segBtn(onBuild)}>Build</button>
+            <button
+              onClick={() => { setMode('view') }}
+              disabled={!activeScenario}
+              className={segBtn(on3d)}
+            >3D</button>
+          </div>
+          {activeRun?.status === 'completed' && (
+            <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-ls-page px-2.5 py-1 text-[11.5px] font-semibold text-ls-ink2">
+              <span className="h-1.5 w-1.5 rounded-full bg-ls-ok" />Run #{activeRun.id} completed
+            </span>
+          )}
+        </div>
+        {activeRun?.status === 'completed' && (
+          <div className="flex shrink-0 items-center gap-2 max-lg:hidden">
+            {STATUS_LEGEND.map((st) => (
+              <span key={st.key} className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-semibold" style={{ background: st.tint, color: st.ink }}>
+                <span className="h-1.5 w-1.5 rounded-full" style={{ background: st.color }} />
+                {st.label} {st.range}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="flex min-h-0 flex-1 overflow-hidden">
+      {/* Sidebar (Build only) */}
+      {mode !== 'view' && <aside className={`relative border-r border-gray-100 bg-white flex flex-col shadow-sm transition-all duration-300 ${sidebarCollapsed ? 'w-10' : 'w-56'}`}>
         {/* Collapse toggle */}
         <button
           onClick={() => setSidebarCollapsed(c => !c)}
@@ -6369,170 +6331,60 @@ export default function Canvas() {
           }
         </button>
 
-        {!sidebarCollapsed && <>{/* Mode toggle */}
-        <div className="px-4 pt-4 pb-3 border-b border-gray-100">
-          <div className="flex rounded-xl border border-gray-200 overflow-hidden">
-            <button
-              onClick={() => setMode('view')}
-              disabled={!activeScenario}
-              className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-semibold transition-all ${
-                mode === 'view' ? 'bg-blue-600 text-white' : 'text-gray-500 hover:bg-gray-50'
-              } disabled:opacity-40`}
-            >
-              <Eye className="h-3 w-3" /> View
-            </button>
-            <button
-              onClick={() => setMode('build')}
-              className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-semibold transition-all ${
-                mode === 'build' ? 'bg-blue-600 text-white' : 'text-gray-500 hover:bg-gray-50'
-              }`}
-            >
-              <Edit3 className="h-3 w-3" /> Build
-            </button>
-          </div>
-        </div>
-
-        {mode === 'view' ? (
-          <div className="flex-1 p-4 space-y-4 overflow-auto">
-            {activeScenario ? (
-              <>
-                {/* Scenario name */}
-                <div>
-                  <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1">Scenario</p>
-                  <p className="text-sm font-semibold text-gray-800 truncate">{activeScenario.name}</p>
-                </div>
-
-                {/* Variant selector */}
-                <div>
-                  <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Variant</p>
-                  <div className="space-y-1.5">
-                    {variants.map((v) => (
-                      <button
-                        key={v}
-                        onClick={() => setSelectedVariant(v)}
-                        className={`w-full text-left px-3 py-2 rounded-xl text-xs font-medium transition-all border ${
-                          selectedVariant === v
-                            ? 'bg-blue-50 text-blue-700 border-blue-200'
-                            : 'text-gray-600 hover:bg-gray-50 border-gray-100'
-                        }`}
-                      >
-                        {v}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* 2D / 3D view toggle (only meaningful in View mode) */}
-                <div>
-                  <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">View</p>
-                  <div className="flex rounded-xl border border-gray-200 overflow-hidden">
-                    <button
-                      onClick={() => { setViewMode('3d'); setSelectedFlowNodeId(null) }}
-                      className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-semibold transition-all ${
-                        viewMode === '3d' ? 'bg-blue-600 text-white' : 'text-gray-500 hover:bg-gray-50'
-                      }`}
-                    >
-                      <Box className="h-3 w-3" /> 3D
-                    </button>
-                    <button
-                      onClick={() => setViewMode('2d')}
-                      className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-semibold transition-all ${
-                        viewMode === '2d' ? 'bg-blue-600 text-white' : 'text-gray-500 hover:bg-gray-50'
-                      }`}
-                    >
-                      <LayoutIcon className="h-3 w-3" /> 2D
-                    </button>
-                  </div>
-                </div>
-
-                {/* Util overlay legend */}
-                {activeRun?.status === 'completed' && (
-                  <div className="pt-3 border-t border-gray-100">
-                    <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Util. Overlay</p>
-                    <div className="space-y-1.5">
-                      {[
-                        { color: '#94a3b8', label: '< 40% — Idle' },
-                        { color: '#22c55e', label: '40–69% — Healthy' },
-                        { color: '#f59e0b', label: '70–84% — High load' },
-                        { color: '#ef4444', label: '≥ 85% — Bottleneck' },
-                      ].map(({ color, label }) => (
-                        <div key={label} className="flex items-center gap-2">
-                          <div className="w-2 h-2 rounded-full" style={{ background: color }} />
-                          <span className="text-[11px] text-gray-500">{label}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {/* Operator skill legend */}
-                <div className="pt-3 border-t border-gray-100">
-                  <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Operator Skill</p>
-                  <div className="space-y-1.5">
-                    {[
-                      { color: '#3b82f6', label: '5 — Expert' },
-                      { color: '#22c55e', label: '4 — High' },
-                      { color: '#f59e0b', label: '3 — Medium' },
-                      { color: '#f97316', label: '2 — Low' },
-                      { color: '#ef4444', label: '1 — Beginner' },
-                    ].map(({ color, label }) => (
-                      <div key={label} className="flex items-center gap-2">
-                        <div className="w-2 h-3 rounded-sm" style={{ background: color }} />
-                        <span className="text-[11px] text-gray-500">{label}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="pt-3 border-t border-gray-100">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs text-gray-400">{viewNodes.length} steps</span>
-                    {activeRun?.status === 'completed' && (
-                      <span className="text-[10px] font-semibold text-blue-500 bg-blue-50 px-2 py-0.5 rounded-full">
-                        Run #{activeRun.id} overlaid
-                      </span>
-                    )}
-                  </div>
-                </div>
-
-              </>
-            ) : (
-              <p className="text-xs text-gray-400 mt-2">No scenario loaded. Go to Scenarios and open one first.</p>
-            )}
-          </div>
-        ) : (
+        {!sidebarCollapsed && <>{(
           <div className="flex-1 p-4 overflow-auto">
-            <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1">Object Palette</p>
-            <p className="text-[10px] text-gray-400 mb-3">Drag onto the canvas, or click to drop it in</p>
-            <div className="space-y-2">
-              {PALETTE_ITEMS.map((item) => {
-                const [bgColor, , borderColor] = item.color.split(' ')
-                return (
-                  <button
-                    key={item.label}
-                    draggable
-                    onDragStart={(e) => {
-                      e.dataTransfer.setData('application/linksim-palette-item', item.label)
-                      e.dataTransfer.effectAllowed = 'move'
-                    }}
-                    onClick={() => addNode(item.label, undefined, item.displayLabel)}
-                    className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl border border-l-4 border-gray-100 hover:shadow-sm text-left transition-all group cursor-grab active:cursor-grabbing ${borderColor}`}
-                  >
-                    <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${bgColor}`}>
-                      <IsoIcon type={item.label} color={STATION_TYPE_HEX[item.label] ?? DEFAULT_STATION_HEX} />
-                    </div>
-                    <div>
-                      <div className="text-xs font-semibold text-gray-800">{item.displayLabel ?? item.label}</div>
-                      <div className="text-[10px] text-gray-400 mt-0.5">{item.description}</div>
-                    </div>
-                  </button>
-                )
-              })}
-            </div>
+            <p className="font-display text-sm font-bold text-ls-ink mb-2.5">Object library</p>
+            <Input
+              value={paletteQuery}
+              onChange={(e) => setPaletteQuery(e.target.value)}
+              placeholder="Search objects…"
+              className="h-9 mb-1"
+            />
+            {[
+              { group: 'Flow', labels: ['Source', 'Drain', 'Connector'] },
+              { group: 'Processing', labels: ['Station', 'Parallel Station', 'Assembly', 'Dismantle', 'Robot'] },
+              { group: 'Material', labels: ['Buffer', 'Conveyor', 'Movable Part'] },
+              { group: 'People', labels: ['Workplace', 'Worker', 'Worker Controller'] },
+            ].map(({ group, labels }) => {
+              const q = paletteQuery.trim().toLowerCase()
+              const items = labels
+                .map((l) => PALETTE_ITEMS.find((it) => it.label === l))
+                .filter((it): it is (typeof PALETTE_ITEMS)[number] => !!it
+                  && (!q || (it.displayLabel ?? it.label).toLowerCase().includes(q) || it.description.toLowerCase().includes(q)))
+              if (items.length === 0) return null
+              return (
+                <div key={group}>
+                  <div className="mt-3.5 mb-1 flex justify-between text-[11px] font-bold uppercase tracking-wider text-ls-mute">
+                    <span>{group}</span><span>{items.length}</span>
+                  </div>
+                  {items.map((item) => (
+                    <button
+                      key={item.label}
+                      draggable
+                      onDragStart={(e) => {
+                        e.dataTransfer.setData('application/linksim-palette-item', item.label)
+                        e.dataTransfer.effectAllowed = 'move'
+                      }}
+                      onClick={() => addNode(item.label, undefined, item.displayLabel)}
+                      className="w-full flex items-center gap-2.5 rounded-[10px] px-2 py-1.5 text-left transition-colors hover:bg-ls-soft cursor-grab active:cursor-grabbing"
+                    >
+                      <span className="w-10 h-10 shrink-0 rounded-[10px] bg-ls-soft flex items-center justify-center">
+                        <IsoIcon type={item.label} color={STATION_TYPE_HEX[item.label] ?? DEFAULT_STATION_HEX} />
+                      </span>
+                      <span className="min-w-0">
+                        <span className="block text-[13px] font-medium text-ls-ink leading-tight">{item.displayLabel ?? item.label}</span>
+                        <span className="block text-[10.5px] text-ls-mute leading-tight mt-0.5">{item.description}</span>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )
+            })}
+            <p className="mt-4 border-t border-ls-line pt-3 text-[11px] text-ls-mute">Drag onto the canvas, or click to drop it in</p>
           </div>
         )}
         </>}
-      </aside>
+      </aside>}
 
       {/* Canvas */}
       <div className="flex-1 flex flex-col min-h-0">
@@ -6543,9 +6395,19 @@ export default function Canvas() {
               <div className="flex items-center gap-3">
                 <span className="text-sm font-semibold text-gray-900">{activeScenario?.name ?? 'No scenario'}</span>
                 {selectedVariant && (
-                  <span className="text-xs font-medium text-blue-600 bg-blue-50 border border-blue-100 px-2.5 py-0.5 rounded-full">
-                    {selectedVariant}
-                  </span>
+                  <div className="flex items-center gap-1 bg-gray-100 rounded-lg p-1">
+                    {variants.map((v) => (
+                      <button
+                        key={v}
+                        onClick={() => setSelectedVariant(v)}
+                        className={`px-3 py-1 text-xs font-semibold rounded-md transition-colors ${
+                          v === selectedVariant ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+                        }`}
+                      >
+                        {v}
+                      </button>
+                    ))}
+                  </div>
                 )}
                 <span className="text-xs text-gray-400">{viewNodes.length} operations</span>
               </div>
@@ -6555,8 +6417,8 @@ export default function Canvas() {
                     Run #{activeRun.id} overlaid
                   </span>
                 )}
-                <Button onClick={() => navigate('/run')} className="bg-blue-600 hover:bg-blue-700 rounded-full px-4 shadow-sm">
-                  <Play className="h-3.5 w-3.5 mr-1.5" />
+                {activeScenario && runButtons}
+                <Button variant="outline" onClick={() => navigate('/run')} className="rounded-full px-4">
                   Go to Results
                 </Button>
               </div>
@@ -6631,14 +6493,40 @@ export default function Canvas() {
                   onClose={() => setSwitchTarget(null)}
                 />
               )}
+              <div className="flex items-center gap-2">
+              {activeScenario && (
+                <Button
+                  variant="outline"
+                  title="Checks the saved scenario: every process-flow step must name a real station"
+                  onClick={async () => {
+                    try {
+                      const v = await scenariosApi.validate(activeScenario.id)
+                      const first = v.issues[0]
+                      showToast(
+                        v.issue_count === 0
+                          ? 'Flow valid — every step has its station'
+                          : `${v.issue_count} issue${v.issue_count === 1 ? '' : 's'}: ${first.variant} · "${first.resource}" ${first.type === 'case_mismatch' ? `should be "${first.resolved_to}"` : 'is not a station'}`,
+                        v.issue_count === 0 ? 'success' : 'error',
+                      )
+                    } catch (err) {
+                      showToast((err as Error).message, 'error')
+                    }
+                  }}
+                  className="rounded-full px-4"
+                >
+                  Check flow
+                </Button>
+              )}
+              {runButtons}
               <Button
                 disabled={saveMutation.isPending}
                 onClick={() => handleSave(true)}
-                className="bg-blue-600 hover:bg-blue-700 rounded-full px-4 shadow-sm"
+                className="rounded-full px-4"
               >
                 <Save className="h-3.5 w-3.5 mr-1.5" />
                 {saveMutation.isPending ? 'Saving…' : 'Save Scenario'}
               </Button>
+              </div>
             </>
           )}
         </div>
@@ -6647,7 +6535,6 @@ export default function Canvas() {
         <div className="flex-1 flex min-h-0">
           <div className="flex-1 min-h-0" style={{ height: '100%' }}>
             {mode === 'view' ? (
-              viewMode === '3d' ? (
                 scene3D.machines.length > 0 ? (
                   <Scene
                     machines={scene3D.machines}
@@ -6663,6 +6550,7 @@ export default function Canvas() {
                     dismantles={dismantles3D}
                     variantColors={variantColors}
                     outcomes={outcomes3D}
+                    runMinutes={activeRun?.simulation_time ?? undefined}
                   />
                 ) : (
                   <div className="flex items-center justify-center h-full text-gray-400">
@@ -6674,48 +6562,6 @@ export default function Canvas() {
                     </div>
                   </div>
                 )
-              ) : (
-                viewNodes.length > 0 ? (
-                  <ReactFlow
-                    nodes={viewNodes}
-                    edges={viewEdges}
-                    nodeTypes={stableNodeTypes}
-                    edgeTypes={stableEdgeTypes}
-                    fitView
-                    fitViewOptions={{ padding: 0.2 }}
-                    nodesConnectable={false}
-                    zoomOnDoubleClick={false}
-                    onInit={setViewFlowInstance}
-                    onNodeDragStop={(_, node) => {
-                      if (node.type !== 'endpoint') return
-                      setEndpointPositions((p) => ({ ...p, [node.id]: node.position }))
-                    }}
-                    onNodeClick={(_, node) => {
-                      if (node.type === 'endpoint') {
-                        setSelectedEndpoint(node.id as 'entry' | 'exit')
-                        setSelectedFlowNodeId(null)
-                      } else if (node.type === 'flow') {
-                        setSelectedFlowNodeId(node.id)
-                        setSelectedEndpoint(null)
-                      }
-                    }}
-                    onPaneClick={() => { setSelectedEndpoint(null); setSelectedFlowNodeId(null) }}
-                  >
-                    <Background color={isDark ? '#334155' : '#e5e7eb'} gap={20} />
-                    <Controls showInteractive={false} />
-                    <MiniMap nodeColor={(n) => utilColor((n.data as FlowNodeData).utilization ?? 0)} maskColor={isDark ? 'rgba(15,23,42,0.7)' : 'rgba(240,244,255,0.7)'} />
-                  </ReactFlow>
-                ) : (
-                  <div className="flex items-center justify-center h-full text-gray-400">
-                    <div className="text-center">
-                      <LayoutIcon className="h-12 w-12 text-gray-200 mx-auto mb-3" />
-                      <p className="text-sm font-medium text-gray-500">
-                        {activeScenario ? 'Select a variant to view the process flow' : 'No scenario loaded'}
-                      </p>
-                    </div>
-                  </div>
-                )
-              )
             ) : (
               <div
                 className="w-full h-full"
@@ -6806,406 +6652,13 @@ export default function Canvas() {
                     dismantles={replayState?.dismantles}
                     targets={replayTargets}
                     variantColors={variantColors}
+                    runMinutes={activeRun?.simulation_time ?? undefined}
                   />
                 )}
               </ReactFlow>
               </div>
             )}
           </div>
-
-          {/* Entry / Exit endpoint panel (View mode) */}
-          {mode === 'view' && selectedEndpoint === 'entry' && (
-            <div className="w-72 border-l border-gray-200 bg-white p-4 overflow-y-auto">
-              <div className="flex items-center justify-between mb-1">
-                <p className="text-xs font-bold text-green-700 uppercase tracking-widest">Start Station</p>
-                <button
-                  onClick={() => setSelectedEndpoint(null)}
-                  className="w-6 h-6 flex items-center justify-center rounded-lg text-gray-400 hover:bg-gray-50 transition-colors"
-                >
-                  ✕
-                </button>
-              </div>
-              <p className="text-3xl font-bold text-gray-900">{entryCount}</p>
-              <p className="text-[11px] text-gray-500 mb-4">jobs entered the system (all variants)</p>
-
-              <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Per-variant arrivals</p>
-              <div className="space-y-2 mb-3">
-                {entryRows.map((row, i) => (
-                  <div key={i} className="border border-gray-100 rounded-lg p-2">
-                    <p className="text-xs font-semibold text-gray-800 truncate mb-1.5">{row.variant || '(unnamed)'}</p>
-                    <div className="flex items-center gap-4">
-                      <div>
-                        <p className="text-[9px] text-gray-400">Quantity</p>
-                        <p className="text-sm font-semibold text-gray-800">{row.quantity}</p>
-                      </div>
-                      <div>
-                        <p className="text-[9px] text-gray-400">Interval (min)</p>
-                        <p className="text-sm font-semibold text-gray-800">{row.interval ?? 'all at once'}</p>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-                {entryRows.length === 0 && (
-                  <p className="text-[11px] text-gray-400">No variants defined for this scenario.</p>
-                )}
-              </div>
-              <p className="text-[10px] text-gray-400 mt-2">
-                To change job counts/intervals, switch to Build mode.
-              </p>
-            </div>
-          )}
-
-          {mode === 'view' && selectedEndpoint === 'exit' && (
-            <div className="w-72 border-l border-gray-200 bg-white p-4 overflow-y-auto">
-              <div className="flex items-center justify-between mb-1">
-                <p className="text-xs font-bold text-red-700 uppercase tracking-widest">End Station</p>
-                <button
-                  onClick={() => setSelectedEndpoint(null)}
-                  className="w-6 h-6 flex items-center justify-center rounded-lg text-gray-400 hover:bg-gray-50 transition-colors"
-                >
-                  ✕
-                </button>
-              </div>
-              <p className="text-3xl font-bold text-gray-900">{exitCount}</p>
-              <p className="text-[11px] text-gray-500 mb-1">jobs exited (completed)</p>
-
-              {!activeRun && (
-                <p className="text-[11px] text-gray-400 mt-3">Run a simulation to see exit data.</p>
-              )}
-
-              {activeRun && activeRun.status !== 'completed' && (
-                <p className="text-[11px] text-gray-400 mt-3">Run #{activeRun.id} is {activeRun.status}…</p>
-              )}
-
-              {activeRun?.status === 'completed' && (
-                <>
-                  <div className="grid grid-cols-3 gap-2 my-3">
-                    <div className="bg-green-50 border border-green-100 rounded-lg p-2 text-center">
-                      <p className="text-sm font-bold text-green-700">{exitCount}</p>
-                      <p className="text-[9px] text-gray-500">Completed</p>
-                    </div>
-                    <div className="bg-amber-50 border border-amber-100 rounded-lg p-2 text-center">
-                      <p className="text-sm font-bold text-amber-700">{exitInProgress}</p>
-                      <p className="text-[9px] text-gray-500">In progress</p>
-                    </div>
-                    <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
-                      <p className="text-sm font-bold text-gray-600">{exitStillWaiting}</p>
-                      <p className="text-[9px] text-gray-500">Still waiting</p>
-                    </div>
-                  </div>
-                  {exitScrapped > 0 && (
-                    <p className="text-[11px] text-red-600 -mt-1 mb-3">{exitScrapped} scrapped (machine failed mid-operation)</p>
-                  )}
-                  <div className="mb-3">
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="text-[10px] text-gray-400">Completion rate</span>
-                      <span className="text-[10px] font-bold text-gray-700">{exitPct}%</span>
-                    </div>
-                    <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
-                      <div className="h-full rounded-full bg-green-500" style={{ width: `${Math.min(exitPct, 100)}%` }} />
-                    </div>
-                  </div>
-
-                  <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Completed jobs by station</p>
-                  <div className="space-y-1.5 mb-4">
-                    {exitPerStation.map((s) => (
-                      <div key={s.station_name} className="flex items-center justify-between text-xs">
-                        <span className="text-gray-600 truncate">{s.station_name}</span>
-                        <span className="font-semibold text-gray-800">{s.completed_jobs}</span>
-                      </div>
-                    ))}
-                    {exitPerStation.length === 0 && (
-                      <p className="text-[11px] text-gray-400">No station data available.</p>
-                    )}
-                  </div>
-
-                  <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Per-variant exits</p>
-                  <div className="space-y-2">
-                    {exitPerVariant.map((v) => {
-                      const pct = v.total > 0 ? Math.round((v.completed / v.total) * 100) : 0
-                      return (
-                        <div key={v.variant} className="border border-gray-100 rounded-lg p-2">
-                          <div className="flex items-center justify-between mb-1">
-                            <p className="text-xs font-semibold text-gray-800 truncate">{v.variant}</p>
-                            <p className="text-xs font-semibold text-gray-700">{v.completed} / {v.total}</p>
-                          </div>
-                          <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
-                            <div className="h-full rounded-full bg-red-400" style={{ width: `${Math.min(pct, 100)}%` }} />
-                          </div>
-                        </div>
-                      )
-                    })}
-                    {exitPerVariant.length === 0 && (
-                      <p className="text-[11px] text-gray-400">No variant data available.</p>
-                    )}
-                  </div>
-                </>
-              )}
-            </div>
-          )}
-
-          {/* Station panel (View mode) — clicking a regular process-flow box */}
-          {mode === 'view' && selectedFlowNode && (
-            <div className="w-72 border-l border-gray-200 bg-white p-4 overflow-y-auto">
-              <div className="flex items-center justify-between mb-1">
-                <p className="text-xs font-bold text-indigo-700 uppercase tracking-widest">
-                  {selectedFlowNodeType === 'Buffer' ? 'Buffer' : 'Station'}
-                </p>
-                <button
-                  onClick={() => setSelectedFlowNodeId(null)}
-                  className="w-6 h-6 flex items-center justify-center rounded-lg text-gray-400 hover:bg-gray-50 transition-colors"
-                >
-                  ✕
-                </button>
-              </div>
-              <p className="text-lg font-bold text-gray-900 truncate">{selectedFlowNode.data.label}</p>
-              <p className="text-[11px] text-gray-500 mb-4">{selectedFlowNode.data.resource}</p>
-
-              {selectedFlowNodeType === 'Buffer' ? (
-                <>
-                  {/* A Buffer just holds jobs between stations — it has no cycle
-                      time, parallel machines, or shifts of its own, so it shows
-                      capacity/discipline/blocking instead of Station-only stats.
-                      A 3D rack buffer (rackLaneCount set) ignores the plain
-                      Buffer Capacity number entirely at run time (see backend's
-                      _init_rack_buffers), so showing that stale number here
-                      without saying so would be misleading — show the real
-                      lane count/occupancy and an explicit "3D" tag instead. */}
-                  {selectedFlowNode.data.rackLaneCount != null ? (
-                    <div className="grid grid-cols-2 gap-2 mb-3">
-                      <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
-                        <p className="text-sm font-bold text-gray-800">
-                          {selectedFlowNode.data.rackOccupied ?? 0} jobs
-                        </p>
-                        <p className="text-[9px] text-gray-500">in 3D rack at end · {selectedFlowNode.data.rackLaneCount} lanes</p>
-                      </div>
-                      <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
-                        <p className="text-sm font-bold text-gray-800">{selectedFlowNode.data.bufferDiscipline ?? 'FIFO'}</p>
-                        <p className="text-[9px] text-gray-500">Discipline</p>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="grid grid-cols-2 gap-2 mb-3">
-                      <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
-                        <p className="text-sm font-bold text-gray-800">{selectedFlowNode.data.bufferCapacity ?? '—'}</p>
-                        <p className="text-[9px] text-gray-500">Buffer capacity</p>
-                      </div>
-                      <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
-                        <p className="text-sm font-bold text-gray-800">{selectedFlowNode.data.bufferDiscipline ?? 'FIFO'}</p>
-                        <p className="text-[9px] text-gray-500">Discipline</p>
-                      </div>
-                    </div>
-                  )}
-
-                  {selectedFlowNode.data.bufferBlockedRatio !== undefined ? (
-                    <div className="mb-4">
-                      <div className="flex items-center justify-between mb-1">
-                        <span className="text-[10px] text-gray-400">Blocked (full) time</span>
-                        <span
-                          className="text-[10px] font-bold px-2 py-0.5 rounded-full"
-                          style={{ color: utilColor(selectedFlowNode.data.bufferBlockedRatio), background: utilColor(selectedFlowNode.data.bufferBlockedRatio) + '20' }}
-                        >
-                          {selectedFlowNode.data.bufferBlockedRatio.toFixed(0)}%
-                        </span>
-                      </div>
-                      <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
-                        <div
-                          className="h-full rounded-full"
-                          style={{ width: `${Math.min(selectedFlowNode.data.bufferBlockedRatio, 100)}%`, background: utilColor(selectedFlowNode.data.bufferBlockedRatio) }}
-                        />
-                      </div>
-                      {selectedFlowNode.data.bufferBlockedTime !== undefined && (
-                        <p className="text-[10px] text-gray-500 mt-1">
-                          Total blocked: <span className="font-semibold text-gray-700">{selectedFlowNode.data.bufferBlockedTime.toFixed(1)} min</span>
-                        </p>
-                      )}
-                    </div>
-                  ) : (
-                    <p className="text-[11px] text-gray-400 mb-4">Run a simulation to see blocking data.</p>
-                  )}
-                </>
-              ) : (
-                <>
-                  <div className="grid grid-cols-2 gap-2 mb-3">
-                    <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
-                      <p className="text-sm font-bold text-gray-800">{selectedFlowNode.data.duration} min</p>
-                      <p className="text-[9px] text-gray-500">Cycle time</p>
-                    </div>
-                    <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
-                      <p className="text-sm font-bold text-gray-800">{selectedFlowNode.data.machineCount ?? 1}</p>
-                      <p className="text-[9px] text-gray-500">Machines</p>
-                    </div>
-                  </div>
-
-                  {/* A station dispatched by a Worker Controller pool looks
-                      identical to one using the plain static shift1/2/3
-                      assignment unless flagged — this is that flag. Not shown on
-                      the Controller's own panel (redundant with its Worker Pool
-                      stats section just below). */}
-                  {selectedFlowNode.data.workerController && selectedFlowNode.data.stationType !== 'Worker Controller' && (
-                    <div className="mb-3">
-                      <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-violet-50 text-violet-700 border border-violet-200">
-                        Staffed by {selectedFlowNode.data.workerController}
-                      </span>
-                    </div>
-                  )}
-
-                  <div className="mb-3">
-                    <p className="text-[10px] text-gray-400 mb-1">Shifts available</p>
-                    {(selectedFlowNode.data.shiftsPerDay ?? []).length > 0 ? (
-                      <ShiftPillList shiftNums={selectedFlowNode.data.shiftsPerDay ?? []} shiftNames={shiftNames} />
-                    ) : (
-                      <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-50 text-amber-600 border border-amber-200">
-                        No shifts selected
-                      </span>
-                    )}
-                  </div>
-                </>
-              )}
-
-              {/* Worker Controller pool stats — from worker_pool.py's
-                  WorkerPool.get_stats(), reached via activeRun.result.
-                  worker_pool_stats (see types/index.ts's WorkerPoolStat).
-                  Only meaningful once a run has actually completed; a
-                  Controller with no pool wired (no Workers connected) simply
-                  has no entry here at all. */}
-              {selectedFlowNode.data.stationType === 'Worker Controller' && (
-                <div className="mb-4">
-                  <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1.5">
-                    Worker Pool
-                  </p>
-                  {(() => {
-                    const stats = activeRun?.result?.worker_pool_stats?.[baseStationName(selectedFlowNode.data.resource)]
-                    if (!stats) {
-                      return (
-                        <p className="text-[11px] text-gray-400">
-                          {activeRun ? 'No pool data — no Workers wired to this Controller.' : 'Run a simulation to see pool stats.'}
-                        </p>
-                      )
-                    }
-                    return (
-                      <div className="space-y-2">
-                        <div className="grid grid-cols-2 gap-2">
-                          <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
-                            <p className="text-sm font-bold text-gray-800">{stats.workers_busy} / {stats.workers_busy + stats.workers_idle}</p>
-                            <p className="text-[9px] text-gray-500">Workers busy</p>
-                          </div>
-                          <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
-                            <p className="text-sm font-bold text-gray-800">{stats.queue_length}</p>
-                            <p className="text-[9px] text-gray-500">Queue length</p>
-                          </div>
-                          <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
-                            <p className="text-sm font-bold text-gray-800">{stats.jobs_completed}</p>
-                            <p className="text-[9px] text-gray-500">Jobs completed</p>
-                          </div>
-                          <div className="bg-gray-50 border border-gray-100 rounded-lg p-2 text-center">
-                            <p className="text-sm font-bold text-gray-800">{stats.jobs_rejected}</p>
-                            <p className="text-[9px] text-gray-500">Jobs rejected</p>
-                          </div>
-                        </div>
-                        <div className="bg-gray-50 border border-gray-100 rounded-lg p-2">
-                          <div className="flex items-center justify-between mb-1">
-                            <span className="text-[10px] text-gray-400">Worker utilization</span>
-                            <span
-                              className="text-[10px] font-bold px-2 py-0.5 rounded-full"
-                              style={{ color: utilColor(stats.worker_utilization), background: utilColor(stats.worker_utilization) + '20' }}
-                            >
-                              {stats.worker_utilization.toFixed(0)}%
-                            </span>
-                          </div>
-                          <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
-                            <div
-                              className="h-full rounded-full"
-                              style={{ width: `${Math.min(stats.worker_utilization, 100)}%`, background: utilColor(stats.worker_utilization) }}
-                            />
-                          </div>
-                        </div>
-                        <p className="text-[10px] text-gray-500">
-                          Average wait: <span className="font-semibold text-gray-700">{stats.avg_wait_time.toFixed(1)} min</span>
-                        </p>
-                      </div>
-                    )
-                  })()}
-                </div>
-              )}
-
-              {selectedFlowNodeType !== 'Buffer' && (
-                selectedFlowNode.data.utilization !== undefined ? (
-                  <div className="mb-4">
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="text-[10px] text-gray-400">Utilization</span>
-                      <span
-                        className="text-[10px] font-bold px-2 py-0.5 rounded-full"
-                        style={{ color: utilColor(selectedFlowNode.data.utilization), background: utilColor(selectedFlowNode.data.utilization) + '20' }}
-                      >
-                        {selectedFlowNode.data.utilization.toFixed(0)}%
-                      </span>
-                    </div>
-                    <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
-                      <div
-                        className="h-full rounded-full"
-                        style={{ width: `${Math.min(selectedFlowNode.data.utilization, 100)}%`, background: utilColor(selectedFlowNode.data.utilization) }}
-                      />
-                    </div>
-                  </div>
-                ) : (
-                  <p className="text-[11px] text-gray-400 mb-4">Run a simulation to see utilization data.</p>
-                )
-              )}
-
-              {activeRun && selectedFlowNode.data.jobs !== undefined && selectedFlowNodeType !== 'Buffer' && (
-                <div className="bg-blue-50 border border-blue-100 rounded-lg p-2 text-center mb-4">
-                  <p className="text-sm font-bold text-blue-700">{selectedFlowNode.data.jobs}</p>
-                  <p className="text-[9px] text-blue-600">
-                    Jobs completed{activeRun.status !== 'completed' ? ' so far' : ''}
-                  </p>
-                </div>
-              )}
-
-              {activeRun?.status === 'completed' && (
-                <>
-                  <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">
-                    Jobs processed ({selectedFlowNodeJobs.length})
-                  </p>
-                  {selectedFlowNodeJobs.length > 0 && (
-                    <div className="grid grid-cols-2 gap-2 mb-3">
-                      <div className="bg-green-50 border border-green-100 rounded-lg p-2 text-center">
-                        <p className="text-sm font-bold text-green-700">
-                          {selectedFlowNodeJobs.filter(j => (j.status ?? 'Completed') === 'Completed').length}
-                        </p>
-                        <p className="text-[9px] text-green-600">Completed</p>
-                      </div>
-                      <div className="bg-amber-50 border border-amber-100 rounded-lg p-2 text-center">
-                        <p className="text-sm font-bold text-amber-700">
-                          {selectedFlowNodeJobs.filter(j => j.status === 'In Progress').length}
-                        </p>
-                        <p className="text-[9px] text-amber-600">In progress</p>
-                      </div>
-                    </div>
-                  )}
-                  <div className="space-y-1.5 max-h-80 overflow-y-auto pr-1">
-                    {selectedFlowNodeJobs.map((j, i) => (
-                      <div key={i} className="flex items-center justify-between text-xs border border-gray-100 rounded-lg px-2 py-1.5">
-                        <span className="text-gray-600 truncate">{j.job_id ?? '—'}</span>
-                        <span
-                          className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full shrink-0 ml-2 ${
-                            j.status === 'Completed' ? 'bg-green-50 text-green-700'
-                            : j.status === 'In Progress' ? 'bg-amber-50 text-amber-700'
-                            : 'bg-gray-50 text-gray-500'
-                          }`}
-                        >
-                          {j.status ?? 'Completed'}
-                        </span>
-                      </div>
-                    ))}
-                    {selectedFlowNodeJobs.length === 0 && (
-                      <p className="text-[11px] text-gray-400">No jobs recorded at this station.</p>
-                    )}
-                  </div>
-                </>
-              )}
-            </div>
-          )}
 
           {/* Routes panel — from the Routes button in the top bar. */}
           {mode === 'build' && routesOpen && !selectedNode && !selectedEdgeId && (
@@ -7235,6 +6688,8 @@ export default function Canvas() {
                 onSaveStation={() => { setSelectedNode(null); handleSave(false) }}
                 onAddParallel={addParallelMachine}
                 onOpenMuTable={setMuDialogNodeId}
+                productColors={variantColors}
+                onProductColor={setProductColor}
                 products={variants}
                 startProducts={inferStationType(selectedNode.data.label, selectedNode.data.stationType) === 'Source'
                   ? muTableRows(selectedNode).filter((r) => r.start === stationKey(selectedNode)).map((r) => r.mu)
@@ -7299,7 +6754,7 @@ export default function Canvas() {
                 <div className="px-4 pb-4 space-y-2">
                   <button
                     onClick={() => setSelectedEdgeId(null)}
-                    className="w-full py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl transition-colors"
+                    className="w-full py-2 text-xs font-semibold text-ls-card bg-ls-dark hover:opacity-90 rounded-xl transition-colors"
                   >
                     Done
                   </button>
@@ -7314,6 +6769,10 @@ export default function Canvas() {
             </div>
           )}
         </div>
+
+        {/* Run + settings, shared with the Analysis page */}
+        {activeScenario && <SimDialogsHost sim={sim} />}
+      </div>
       </div>
     </div>
   )

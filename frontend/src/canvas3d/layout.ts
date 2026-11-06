@@ -87,10 +87,10 @@ const baseOf = (n: Node<StationNodeData>) => n.data.savedName ?? n.data.label.re
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
 
 function utilColor(u: number): string {
-  if (u >= 85) return '#ef4444'
-  if (u >= 70) return '#f59e0b'
-  if (u >= 40) return '#22c55e'
-  return '#94a3b8'
+  if (u >= 85) return '#F04438'
+  if (u >= 70) return '#F59E0B'
+  if (u >= 40) return '#12B76A'
+  return '#3E8BF5'
 }
 
 export { utilColor }

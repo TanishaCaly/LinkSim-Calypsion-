@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import Layout from '@/components/layout/Layout'
 import RequireAuth from '@/components/RequireAuth'
@@ -34,7 +34,8 @@ export default function App() {
             <Route index element={<ScenarioManager />} />
             <Route path="run" element={<RunDashboard />} />
             <Route path="canvas" element={<Canvas />} />
-            <Route path="insights" element={<Insights />} />
+            <Route path="interfaces" element={<Insights />} />
+            <Route path="insights" element={<Navigate to="/interfaces" replace />} />
           </Route>
         </Routes>
       </BrowserRouter>

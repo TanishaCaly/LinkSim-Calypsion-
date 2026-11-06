@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Panel, useStore } from 'reactflow'
 import { jobPrefix } from '@/lib/variantColors'
+import ReplayBar, { DEFAULT_REPLAY_SPEED, REPLAY_SPEEDS, fmtReplayClock } from '@/components/run/ReplayBar'
+import SimSettingsMenu, { openSimDialog } from '@/components/run/SimSettingsMenu'
 
 /**
  * Build-mode job replay: plays a finished run's completion_log back on the
@@ -46,7 +48,6 @@ export interface AssemblyRecord { station: string; main: string; mode: string; p
 /** A job dismantled in the run (simulation_state.dismantles, keyed by that job): its pieces, one per next station. */
 export interface DismantleRecord { station: string; mode: string; pieces: string[] }
 
-const SPEEDS = [1, 10, 30, 50, 100]
 const CIRCLE = 30
 // Hover card: at most this many jobs listed (the rest counted).
 const MAX_LISTED = 200
@@ -78,6 +79,13 @@ function jobLook(id: string, variants: Map<string, number>, byPrefix: Record<str
 }
 
 /** "2025-01-01 06:02:00" -> minutes since the epoch (timezone-free). */
+// The log's wall-clock time (parsed above as if it were UTC) as an ordinary local date, so the shared replay
+// bar, which reads local time like the 3D view, shows the same hours.
+function wallMs(minutes: number): number {
+  const d = new Date(minutes * 60000)
+  return new Date(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds()).getTime()
+}
+
 function toMinutes(stamp: unknown): number | null {
   if (typeof stamp !== 'string') return null
   const m = stamp.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/)
@@ -229,15 +237,7 @@ function parseLog(
   return { jobs: list, t0, total: tEnd - t0 }
 }
 
-function formatClock(t0: number, t: number): string {
-  const d = new Date((t0 + t) * 60000)
-  const day = Math.floor(t / 1440) + 1
-  const hh = String(d.getUTCHours()).padStart(2, '0')
-  const mm = String(d.getUTCMinutes()).padStart(2, '0')
-  return `Day ${day} · ${hh}:${mm}`
-}
-
-export default function JobReplay({ completionLog, releaseTimes, finishTimes, assemblies, dismantles, targets, variantColors }: {
+export default function JobReplay({ completionLog, releaseTimes, finishTimes, assemblies, dismantles, targets, variantColors, runMinutes }: {
   completionLog: Record<string, unknown[]>
   releaseTimes?: Record<string, unknown>
   finishTimes?: Record<string, unknown>
@@ -248,6 +248,8 @@ export default function JobReplay({ completionLog, releaseTimes, finishTimes, as
   targets: ReplayTarget[]
   // Product (variant) -> its colour, from the Start's MU table.
   variantColors?: Record<string, string>
+  // How long the run was set to simulate, in minutes; the replay bar shows it as "Run for".
+  runMinutes?: number
 }) {
   const { jobs, t0, total } = useMemo(
     () => parseLog(completionLog, releaseTimes ?? {}, finishTimes ?? {}, variantColors ?? {}, assemblies ?? {}, dismantles ?? {}),
@@ -256,8 +258,10 @@ export default function JobReplay({ completionLog, releaseTimes, finishTimes, as
 
   const [time, setTime] = useState(0)          // simulated minutes since t0
   const [playing, setPlaying] = useState(false)
-  const [speed, setSpeed] = useState(10)
+  const [speedId, setSpeedId] = useState(DEFAULT_REPLAY_SPEED)
   const timeRef = useRef(0)
+  // Simulated seconds per real second; Fit plays the whole run in a minute.
+  const speed = REPLAY_SPEEDS.find((s) => s.id === speedId)?.simSecPerSec ?? Math.max(total, 1)
   const speedRef = useRef(speed)
   speedRef.current = speed
 
@@ -387,7 +391,7 @@ export default function JobReplay({ completionLog, releaseTimes, finishTimes, as
 
   if (total <= 0) return null
 
-  const clock = (t: number) => (Number.isFinite(t) ? formatClock(t0, t) : '—')
+  const clock = (t: number) => (Number.isFinite(t) ? fmtReplayClock(wallMs(t0), t) : '—')
   const boxName = (t: ReplayTarget) => (t.machine > 1 ? `${t.station} #${t.machine}` : t.station)
   const card = (() => {
     const n = hoveredGroup && nodeInternals.get(hoveredGroup.nodeId)
@@ -470,43 +474,24 @@ export default function JobReplay({ completionLog, releaseTimes, finishTimes, as
       </div>
 
       <Panel position="bottom-center">
-        <div className="flex items-center gap-2 bg-white/95 backdrop-blur-sm rounded-xl shadow-lg border border-gray-200 px-4 py-2">
-          <button
-            onClick={() => {
+        <div className="w-[min(900px,calc(100vw-80px))]">
+          <ReplayBar
+            playing={playing}
+            onToggle={() => {
               if (timeRef.current >= total) { timeRef.current = 0; setTime(0) }
               setPlaying((p) => !p)
             }}
-            className="text-xs px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 font-medium"
-          >
-            {playing ? '⏸ Pause' : '▶ Play'}
-          </button>
-          <button
-            onClick={() => { setPlaying(false); timeRef.current = 0; setTime(0) }}
-            className="text-xs px-2.5 py-1.5 rounded-lg border border-gray-200 bg-white text-gray-600 hover:bg-gray-50 font-medium"
-          >
-            ⏹ Stop
-          </button>
-          {SPEEDS.map((s) => (
-            <button
-              key={s}
-              onClick={() => setSpeed(s)}
-              className={`text-xs px-2 py-1.5 rounded-lg border font-medium transition-colors ${speed === s ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 text-gray-500 hover:border-blue-300'}`}
-            >
-              {s}×
-            </button>
-          ))}
-          <input
-            type="range"
-            min={0}
-            max={total}
-            step={total / 1000}
-            value={time}
-            onChange={(e) => { setPlaying(false); timeRef.current = Number(e.target.value); setTime(timeRef.current) }}
-            className="w-40 accent-blue-600"
+            onRestart={() => { setPlaying(false); timeRef.current = 0; setTime(0) }}
+            speedId={speedId}
+            onSpeed={setSpeedId}
+            pct={total > 0 ? (time / total) * 100 : 0}
+            onScrub={(pct) => { setPlaying(false); timeRef.current = (pct / 100) * total; setTime(timeRef.current) }}
+            clock={fmtReplayClock(wallMs(t0), time)}
+            elapsedMin={time}
+            startMs={wallMs(t0)}
+            runMin={runMinutes ?? total}
+            settings={<SimSettingsMenu compact up onConfig={() => openSimDialog('config')} onTimer={() => openSimDialog('timer')} />}
           />
-          <span className="text-[10px] text-gray-500 font-medium whitespace-nowrap tabular-nums">
-            {formatClock(t0, time)}
-          </span>
         </div>
       </Panel>
     </>

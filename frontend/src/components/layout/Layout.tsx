@@ -1,27 +1,21 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect } from 'react'
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
-import { LayoutDashboard, FolderOpen, GitBranch, Lightbulb, Cpu, ChevronLeft, ChevronRight, Sun, Moon, LogOut } from 'lucide-react'
+import { BarChart3, FolderOpen, GitBranch, Sparkles, Cpu, Sun, Moon, LogOut } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAppStore } from '@/store/useAppStore'
 import { authApi } from '@/api/auth'
 
 const nav = [
+  { to: '/canvas', icon: GitBranch, label: 'Workspace' },
+  { to: '/run', icon: BarChart3, label: 'Analysis' },
   { to: '/', icon: FolderOpen, label: 'Scenarios' },
-  { to: '/run', icon: LayoutDashboard, label: 'Run & Results' },
-  { to: '/canvas', icon: GitBranch, label: 'Visual Canvas' },
-  { to: '/insights', icon: Lightbulb, label: 'AI Insights' },
+  { to: '/interfaces', icon: Sparkles, label: 'Interfaces & AI' },
 ]
 
-const DEFAULT_SIDEBAR_WIDTH = 256
-const MIN_SIDEBAR_WIDTH = 200
 const TOAST_MS = 3000
 
 export default function Layout() {
-  const { toast, clearToast, theme, toggleTheme } = useAppStore()
-  const [collapsed, setCollapsed] = useState(true)
-  const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH)
-  const [resizing, setResizing] = useState(false)
-  const asideRef = useRef<HTMLElement>(null)
+  const { toast, clearToast, theme, toggleTheme, activeScenario } = useAppStore()
   const navigate = useNavigate()
 
   // Notifications close by themselves after 3 s. Each new one (a fresh
@@ -37,171 +31,71 @@ export default function Layout() {
     navigate('/login', { replace: true })
   }
 
-  const startResize = useCallback((e: React.MouseEvent) => {
-    e.preventDefault()
-    setResizing(true)
-    const startX = e.clientX
-    const startWidth = asideRef.current?.getBoundingClientRect().width ?? sidebarWidth
-
-    function onMouseMove(ev: MouseEvent) {
-      const raw = startWidth + (ev.clientX - startX)
-      if (raw <= 96) {
-        setCollapsed(true)
-        return
-      }
-      setCollapsed(false)
-      setSidebarWidth(Math.min(420, Math.max(MIN_SIDEBAR_WIDTH, raw)))
-    }
-    function onMouseUp() {
-      setResizing(false)
-      window.removeEventListener('mousemove', onMouseMove)
-      window.removeEventListener('mouseup', onMouseUp)
-    }
-    window.addEventListener('mousemove', onMouseMove)
-    window.addEventListener('mouseup', onMouseUp)
-  }, [sidebarWidth])
+  const iconButton =
+    'flex h-9 w-9 items-center justify-center rounded-full bg-ls-page text-ls-ink2 transition-colors hover:bg-ls-chip'
 
   return (
-    <div className="flex h-screen bg-gray-50">
-      {/* Sidebar */}
-      <aside
-        ref={asideRef}
-        style={{ width: collapsed ? 64 : sidebarWidth }}
-        className={cn(
-          'no-print relative bg-white border-r border-gray-100 flex flex-col shadow-sm',
-          !resizing && 'transition-all duration-300'
-        )}
+    <div className="flex h-screen flex-col bg-ls-page text-ls-ink">
+      {/* Top bar */}
+      <header
+        className="no-print relative z-10 flex h-[60px] shrink-0 items-center gap-5 bg-ls-card px-5"
+        style={{ boxShadow: '0 1px 0 var(--ls-line2), 0 4px 14px -8px rgba(16,24,40,0.10)' }}
       >
-        {/* Logo */}
-        <div className="px-6 py-6 border-b border-gray-100">
-          <div className={cn('flex items-center gap-3', collapsed && 'justify-center')}>
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center shadow-sm shrink-0">
-              <Cpu className="h-5 w-5 text-white" />
-            </div>
-            {!collapsed && (
-              <div>
-                <span className="text-lg font-bold text-gray-900 leading-none">LinkSim</span>
-                <p className="text-xs text-gray-400 mt-0.5 leading-none">Manufacturing DES</p>
-              </div>
-            )}
+        <div className="flex items-center gap-3">
+          <div className="flex h-8 w-8 items-center justify-center rounded-[10px] bg-ls-dark">
+            <Cpu className="h-[18px] w-[18px] text-ls-card" />
+          </div>
+          <div className="leading-none">
+            <span className="font-display text-lg font-bold tracking-tight">LinkSim</span>
+            <p className="mt-0.5 text-[10.5px] text-ls-mute max-[1060px]:hidden">Manufacturing DES</p>
           </div>
         </div>
 
-        {/* Collapse toggle — floats on the right edge, below the logo */}
-        <button
-          onClick={() => setCollapsed(c => !c)}
-          className="group/toggle absolute -right-3 top-20 w-6 h-6 rounded-full bg-white border border-gray-200 shadow-sm flex items-center justify-center hover:bg-gray-50 transition-colors z-30"
-        >
-          {collapsed
-            ? <ChevronRight className="h-3 w-3 text-gray-500" />
-            : <ChevronLeft className="h-3 w-3 text-gray-500" />
-          }
-          <span className="pointer-events-none absolute left-full ml-2 whitespace-nowrap rounded-lg bg-white text-gray-700 text-xs font-medium px-3 py-2 shadow-lg border border-gray-100 opacity-0 scale-95 origin-left transition-all duration-150 group-hover/toggle:opacity-100 group-hover/toggle:scale-100 z-30">
-            {collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+        {/* The scenario that is open (opened from Scenarios, or built in Workspace) */}
+        <div className="hidden min-w-0 items-center border-l border-ls-line pl-5 font-display text-[15px] font-semibold md:flex">
+          <span className={cn('truncate', !activeScenario && 'font-normal text-ls-mute')}>
+            {activeScenario?.name ?? 'No scenario open'}
           </span>
-        </button>
+        </div>
 
-        {/* Nav */}
-        <nav className="flex-1 p-4 space-y-1">
+        <nav className="ml-auto flex items-center gap-2">
           {nav.map(({ to, icon: Icon, label }) => (
             <NavLink
               key={to}
               to={to}
               end={to === '/'}
+              title={label}
               className={({ isActive }) =>
                 cn(
-                  'group relative flex items-center gap-3 py-3 rounded-xl text-sm font-medium transition-all duration-150',
-                  collapsed ? 'justify-center px-0' : 'px-4',
+                  'flex h-[38px] items-center gap-2 whitespace-nowrap rounded-full px-4 text-[13.5px] font-semibold transition-colors max-[1060px]:px-3',
                   isActive
-                    ? 'bg-blue-50 text-blue-700'
-                    : 'text-gray-500 hover:bg-gray-50 hover:text-gray-800'
+                    ? 'bg-ls-dark text-ls-card shadow-md'
+                    : 'bg-ls-card text-ls-ink2 hover:bg-ls-soft'
                 )
               }
             >
-              {({ isActive }) => (
-                <>
-                  {isActive && !collapsed && (
-                    <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-blue-600" />
-                  )}
-                  <Icon className={cn('h-4 w-4 shrink-0', isActive ? 'text-blue-600' : 'text-gray-400')} />
-                  {!collapsed && label}
-                  {collapsed && (
-                    <span className="pointer-events-none absolute left-full ml-3 whitespace-nowrap rounded-lg bg-white text-gray-700 text-xs font-medium px-3 py-2 shadow-lg border border-gray-100 opacity-0 scale-95 origin-left transition-all duration-150 group-hover:opacity-100 group-hover:scale-100 z-20">
-                      {label}
-                    </span>
-                  )}
-                </>
-              )}
+              <Icon className="h-[15px] w-[15px] shrink-0" />
+              <span className="max-[1060px]:hidden">{label}</span>
             </NavLink>
           ))}
         </nav>
 
-        {/* Theme toggle */}
-        <div className="px-4 pb-2">
+        <div className="flex items-center gap-2">
           <button
             onClick={toggleTheme}
             title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-            className={cn(
-              'flex items-center gap-3 w-full py-3 rounded-xl text-sm font-medium transition-all duration-150 text-gray-500 hover:bg-gray-50 hover:text-gray-800',
-              collapsed ? 'justify-center px-0' : 'px-4'
-            )}
+            className={iconButton}
           >
-            {theme === 'dark'
-              ? <Sun className="h-4 w-4 shrink-0 text-amber-400" />
-              : <Moon className="h-4 w-4 shrink-0 text-gray-400" />
-            }
-            {!collapsed && (theme === 'dark' ? 'Light mode' : 'Dark mode')}
+            {theme === 'dark' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
           </button>
-          <button
-            onClick={handleLogout}
-            title="Log out"
-            className={cn(
-              'flex items-center gap-3 w-full py-3 rounded-xl text-sm font-medium transition-all duration-150 text-gray-500 hover:bg-red-50 hover:text-red-600',
-              collapsed ? 'justify-center px-0' : 'px-4'
-            )}
-          >
-            <LogOut className="h-4 w-4 shrink-0" />
-            {!collapsed && 'Log out'}
+          <button onClick={handleLogout} title="Log out" className={cn(iconButton, 'hover:bg-ls-bad-t hover:text-ls-bad-i')}>
+            <LogOut className="h-4 w-4" />
           </button>
         </div>
-
-        {/* Footer */}
-        {!collapsed && (
-          <div className="p-4 border-t border-gray-100">
-            <div className="flex items-center gap-2">
-              <div className="w-1.5 h-1.5 rounded-full bg-green-400" />
-              <p className="text-xs text-gray-400">v0.1.0 · Phase 1</p>
-            </div>
-          </div>
-        )}
-
-        {/* Resize handle — drag to set a custom width. Split around the collapse-toggle button (top-20 to ~104px) so it stays clickable. Available even when collapsed so it can be dragged back open. */}
-        <div
-          onMouseDown={startResize}
-          draggable={false}
-          className="absolute top-0 -right-1.5 w-3 cursor-col-resize z-20 select-none"
-          style={{ height: 80 }}
-        />
-        <div
-          onMouseDown={startResize}
-          draggable={false}
-          className="absolute -right-1.5 bottom-0 w-3 cursor-col-resize z-20 flex items-center justify-center group/handle select-none"
-          style={{ top: 104 }}
-        >
-          <div
-            className={cn(
-              'w-1 h-10 rounded-full bg-gray-200 group-hover/handle:bg-blue-300 transition-colors',
-              resizing && 'bg-blue-400'
-            )}
-          />
-          <span className="pointer-events-none absolute left-full ml-2 whitespace-nowrap rounded-lg bg-white text-gray-700 text-xs font-medium px-3 py-2 shadow-lg border border-gray-100 opacity-0 scale-95 origin-left transition-all duration-150 group-hover/handle:opacity-100 group-hover/handle:scale-100 z-30">
-            Drag to resize
-          </span>
-        </div>
-      </aside>
+      </header>
 
       {/* Main */}
-      <main className="flex-1 overflow-auto">
+      <main className="min-h-0 flex-1 overflow-auto">
         <Outlet />
       </main>
 
@@ -210,8 +104,8 @@ export default function Layout() {
         <div
           onClick={clearToast}
           className={cn(
-            'fixed bottom-4 right-4 z-50 px-4 py-3 rounded-lg shadow-lg text-sm cursor-pointer max-w-sm',
-            toast.type === 'error' ? 'bg-red-600 text-white' : 'bg-green-600 text-white'
+            'fixed left-1/2 top-[76px] z-50 max-w-sm -translate-x-1/2 cursor-pointer rounded-xl px-4 py-2.5 text-[13px] shadow-lg',
+            toast.type === 'error' ? 'bg-red-600 text-white' : 'bg-ls-dark text-ls-card'
           )}
         >
           {toast.message}

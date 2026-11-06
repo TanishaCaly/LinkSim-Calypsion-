@@ -1,10 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { useNavigate, useLocation, Link } from 'react-router-dom'
-import { Cpu, AlertCircle } from 'lucide-react'
 import { authApi } from '@/api/auth'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
+import AuthShell from '@/components/auth/AuthShell'
 
 export default function Login() {
   const navigate = useNavigate()
@@ -13,8 +10,11 @@ export default function Login() {
   const [password, setPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  const [show, setShow] = useState(false)
 
-  const from = (location.state as { from?: string })?.from ?? '/'
+  // Land on the Workspace unless the user was heading to a specific page
+  const wanted = (location.state as { from?: string })?.from
+  const from = wanted && wanted !== '/' ? wanted : '/canvas'
 
   // Tester build: sign in automatically and skip this screen. In development
   // the server answers 404, so the form below shows as usual.
@@ -42,59 +42,28 @@ export default function Login() {
   if (checkingAuto) return null
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-white via-blue-50/30 to-indigo-50/40 p-6">
-      <div className="w-full max-w-sm">
-        <div className="flex flex-col items-center mb-8">
-          <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center shadow-sm mb-3">
-            <Cpu className="h-6 w-6 text-white" />
-          </div>
-          <h1 className="text-xl font-bold text-gray-900">LinkSim</h1>
-          <p className="text-sm text-gray-400 mt-0.5">Manufacturing DES</p>
+    <AuthShell eyebrow="Welcome back" title="Sign in to LinkSim" sub="Pick up where your last run left off.">
+      <form onSubmit={handleSubmit}>
+        <div className="field">
+          <label htmlFor="username">Username</label>
+          <input id="username" autoFocus value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="username" placeholder="Enter your username" />
+        </div>
+        <div className="field">
+          <label htmlFor="password">Password</label>
+          <input id="password" type={show ? 'text' : 'password'} value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" placeholder="Enter your password" />
+          <button type="button" className="show" onClick={() => setShow((v) => !v)}>{show ? 'Hide' : 'Show'}</button>
         </div>
 
-        <form onSubmit={handleSubmit} className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 space-y-4">
-          <div>
-            <Label htmlFor="username">Username</Label>
-            <Input
-              id="username"
-              autoFocus
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              className="mt-1.5"
-              autoComplete="username"
-            />
-          </div>
-          <div>
-            <Label htmlFor="password">Password</Label>
-            <Input
-              id="password"
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              className="mt-1.5"
-              autoComplete="current-password"
-            />
-          </div>
+        {error && <div className="err">{error}</div>}
 
-          {error && (
-            <div className="flex items-center gap-2 text-sm text-red-600 bg-red-50 border border-red-100 rounded-lg px-3 py-2">
-              <AlertCircle className="h-4 w-4 shrink-0" />
-              {error}
-            </div>
-          )}
+        <button type="submit" disabled={loading || !username || !password} className="go">
+          {loading ? 'Signing in…' : 'Sign in'} <span aria-hidden="true">→</span>
+        </button>
 
-          <Button type="submit" disabled={loading || !username || !password} className="w-full bg-blue-600 hover:bg-blue-700">
-            {loading ? 'Signing in…' : 'Sign in'}
-          </Button>
-
-          <p className="text-sm text-center text-gray-500">
-            Don't have an account?{' '}
-            <Link to="/signup" className="text-blue-600 hover:underline font-medium">
-              Sign up
-            </Link>
-          </p>
-        </form>
-      </div>
-    </div>
+        <p className="alt">
+          Don't have an account? <Link to="/signup">Sign up</Link>
+        </p>
+      </form>
+    </AuthShell>
   )
 }

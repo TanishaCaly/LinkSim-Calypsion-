@@ -13,11 +13,11 @@ interface OperatorDotProps {
 }
 
 const SKILL_COLORS: Record<number, string> = {
-  1: '#ef4444',
+  1: '#F04438',
   2: '#f97316',
-  3: '#f59e0b',
-  4: '#22c55e',
-  5: '#3b82f6',
+  3: '#F59E0B',
+  4: '#12B76A',
+  5: '#3E8BF5',
 }
 
 export function skillColor(skill: number): string {

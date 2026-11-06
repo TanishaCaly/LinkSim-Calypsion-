@@ -1,18 +1,18 @@
-import { useState, useRef } from 'react'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMemo, useState, useRef } from 'react'
+import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { Plus, Upload, Trash2, Play, FileText, Clock, Eye, X, Save, PlusCircle } from 'lucide-react'
+import { Plus, Upload, Trash2, FileText, X, Save, PlusCircle, Search } from 'lucide-react'
 import { scenariosApi } from '@/api/scenarios'
 import { useAppStore } from '@/store/useAppStore'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
-import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
 } from '@/components/ui/dialog'
-import { formatDate } from '@/lib/utils'
+import ScenarioCard, { STATUS_LABEL } from '@/components/scenarios/ScenarioCard'
+import { fetchScenarioSummary, type CardStatus } from '@/lib/scenarioSummary'
+import { cn } from '@/lib/utils'
 import type { Scenario, ScenarioListItem } from '@/types'
 
 // ─── Upload dialog ────────────────────────────────────────────────────────────
@@ -131,7 +131,7 @@ function AvailabilityPctField({
   )
 }
 
-function UploadDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+export function UploadDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [mode, setMode] = useState<UploadMode>('single')
 
   // single / flat mode
@@ -2107,87 +2107,17 @@ function ScenarioViewModal({ scenario, onClose }: { scenario: Scenario; onClose:
   )
 }
 
-// ─── Scenario card ────────────────────────────────────────────────────────────
-
-function ScenarioCard({
-  scenario,
-  onSelect,
-  onDelete,
-  onViewFile,
-}: {
-  scenario: ScenarioListItem
-  onSelect: () => void
-  onDelete: () => void
-  onViewFile: () => void
-}) {
-  return (
-    <div
-      onClick={onSelect}
-      className="group relative bg-white rounded-2xl shadow-sm hover:shadow-lg transition-all duration-200 cursor-pointer border border-gray-100 hover:border-blue-200 overflow-hidden"
-    >
-      {/* Top gradient stripe */}
-      <div className="h-1 w-full bg-gradient-to-r from-blue-500 via-blue-400 to-indigo-400" />
-
-      <div className="p-5">
-        {/* Header row */}
-        <div className="flex items-start justify-between gap-2 mb-4">
-          <div className="min-w-0 flex-1">
-            <h3 className="text-base font-bold text-gray-900 truncate group-hover:text-blue-700 transition-colors">
-              {scenario.name}
-            </h3>
-            {scenario.description && (
-              <p className="text-xs text-gray-400 mt-0.5 truncate">{scenario.description}</p>
-            )}
-          </div>
-          <span className="flex items-center gap-1 text-xs font-medium text-blue-600 bg-blue-50 px-2 py-1 rounded-full shrink-0">
-            <FileText className="h-3 w-3" />
-            Scenario
-          </span>
-        </div>
-
-        {/* Footer row */}
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-1.5 text-xs text-gray-400">
-            <Clock className="h-3 w-3 shrink-0" />
-            <div className="flex flex-col leading-tight">
-              <span>{new Date(scenario.updated_at).toLocaleDateString()}</span>
-              <span className="text-[10px] text-gray-300">{new Date(scenario.updated_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-            </div>
-          </div>
-          <div className="flex gap-2" onClick={(e) => e.stopPropagation()}>
-            <button
-              onClick={onViewFile}
-              className="p-1.5 rounded-lg text-gray-300 hover:text-blue-500 hover:bg-blue-50 transition-colors"
-              title="View source file"
-            >
-              <Eye className="h-4 w-4" />
-            </button>
-            <Button
-              size="sm"
-              onClick={onSelect}
-              className="bg-blue-600 hover:bg-blue-700 text-white shadow-sm"
-            >
-              <Play className="h-3 w-3 mr-1" />
-              Open
-            </Button>
-            <button
-              onClick={onDelete}
-              className="p-1.5 rounded-lg text-gray-300 hover:text-red-500 hover:bg-red-50 transition-colors"
-            >
-              <Trash2 className="h-4 w-4" />
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
 // ─── Page ─────────────────────────────────────────────────────────────────────
+
+type StatusFilter = 'all' | CardStatus
+const FILTERS: StatusFilter[] = ['all', 'completed', 'running', 'stopped', 'failed', 'none']
 
 export default function ScenarioManager() {
   const [uploadOpen, setUploadOpen] = useState(false)
   const [viewScenario, setViewScenario] = useState<Scenario | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<ScenarioListItem | null>(null)
+  const [search, setSearch] = useState('')
+  const [filter, setFilter] = useState<StatusFilter>('all')
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { setActiveScenario, setActiveRun, showToast, setJustReset } = useAppStore()
@@ -2216,11 +2146,38 @@ export default function ScenarioManager() {
 
   const hasMore = scenarios.length < totalCount
 
+  // Search runs on what is loaded; the status chips and card details come
+  // from each scenario's summary (counts + newest run), fetched once and cached.
+  const searched = useMemo(() => {
+    const q = search.trim().toLowerCase()
+    const list = scenarios.filter((s) => !q || s.name.toLowerCase().includes(q) || (s.description ?? '').toLowerCase().includes(q))
+    return [...list].sort((a, b) => +new Date(b.updated_at) - +new Date(a.updated_at))
+  }, [scenarios, search])
+
+  const summaries = useQueries({
+    queries: searched.map((s) => ({
+      queryKey: ['scenario-summary', s.id, s.updated_at],
+      queryFn: () => fetchScenarioSummary(s.id),
+      staleTime: 60_000,
+    })),
+  })
+  const summaryOf = new Map(searched.map((s, i) => [s.id, summaries[i]?.data]))
+  const counts: Record<StatusFilter, number> = { all: searched.length, completed: 0, running: 0, stopped: 0, failed: 0, none: 0 }
+  summaryOf.forEach((sm) => { if (sm) counts[sm.status] += 1 })
+  const shown = filter === 'all' ? searched : searched.filter((s) => summaryOf.get(s.id)?.status === filter)
+
+  const refresh = () => {
+    queryClient.invalidateQueries({ queryKey: ['scenarios'] })
+    queryClient.invalidateQueries({ queryKey: ['scenarios-count'] })
+    queryClient.invalidateQueries({ queryKey: ['scenario-summary'] })
+  }
+
   const deleteMutation = useMutation({
     mutationFn: (id: number) => scenariosApi.delete(id),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['scenarios'] })
-      queryClient.invalidateQueries({ queryKey: ['scenarios-count'] })
+    onSuccess: (_data, id) => {
+      queryClient.removeQueries({ queryKey: ['scenario-summary', id] })
+      refresh()
+      setDeleteTarget(null)
       showToast('Scenario deleted')
     },
     onError: (err: Error) => showToast(err.message, 'error'),
@@ -2234,76 +2191,97 @@ export default function ScenarioManager() {
   }
 
   return (
-    <div className="min-h-full bg-gradient-to-br from-white via-blue-50/30 to-indigo-50/40 p-8">
-      <div className="max-w-5xl mx-auto">
+    <div className="min-h-full p-7">
+      <div className="mx-auto max-w-[1280px]">
 
         {/* Header */}
-        <div className="flex items-center justify-between mb-8">
+        <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h1 className="text-2xl font-semibold text-gray-900">Scenarios</h1>
-            <p className="text-sm text-gray-400 mt-0.5">
+            <h1 className="text-2xl font-semibold text-ls-ink">Scenarios</h1>
+            <p className="mt-0.5 text-[12.5px] text-ls-mute">
               {totalCount} scenario{totalCount !== 1 ? 's' : ''} saved
             </p>
           </div>
-          <div className="flex gap-2">
-            <Button
-              variant="outline"
-              onClick={() => setUploadOpen(true)}
-              className="border-gray-300 text-gray-600 hover:border-blue-400 hover:text-blue-600 hover:bg-blue-50 transition-all rounded-full px-5"
-            >
-              <Upload className="h-4 w-4 mr-2" />
+          <div className="flex flex-wrap items-center gap-2.5">
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ls-mute" />
+              <Input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search scenarios…"
+                className="h-[38px] w-56 pl-9"
+              />
+            </div>
+            <Button variant="outline" onClick={() => setUploadOpen(true)} className="h-[38px]">
+              <Upload className="h-4 w-4" />
               Import
             </Button>
             <Button
               onClick={() => { setActiveScenario(null); setActiveRun(null); setJustReset(false); navigate('/canvas') }}
-              className="bg-blue-600 hover:bg-blue-700 text-white shadow-md hover:shadow-blue-200 hover:shadow-lg transition-all rounded-full px-5"
+              className="h-[38px]"
             >
-              <Plus className="h-4 w-4 mr-2" />
-              New Canvas
+              <Plus className="h-4 w-4" />
+              New canvas
             </Button>
           </div>
         </div>
 
+        {/* Status filter chips (counts cover what is loaded) */}
+        {scenarios.length > 0 && (
+          <div className="mb-4 flex flex-wrap gap-2">
+            {FILTERS.map((f) => (
+              <button
+                key={f}
+                onClick={() => setFilter(f)}
+                className={cn(
+                  'h-8 rounded-full px-3.5 text-[12.5px] font-semibold shadow-sm transition-colors',
+                  filter === f ? 'bg-ls-dark text-ls-card' : 'bg-ls-card text-ls-ink2 hover:bg-ls-soft'
+                )}
+              >
+                {f === 'all' ? 'All' : STATUS_LABEL[f]} · {counts[f]}
+              </button>
+            ))}
+          </div>
+        )}
+
         {/* Grid */}
         {isLoading ? (
-          <div className="text-center py-16 text-gray-400">Loading…</div>
+          <div className="py-16 text-center text-ls-mute">Loading…</div>
         ) : scenarios.length === 0 ? (
-          <div className="text-center py-24 rounded-2xl bg-white/70 border border-blue-100 shadow-sm">
-            <div className="w-16 h-16 bg-blue-50 rounded-2xl flex items-center justify-center mx-auto mb-4">
-              <FileText className="h-8 w-8 text-blue-400" />
+          <div className="rounded-2xl bg-ls-card py-24 text-center shadow-md">
+            <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-ls-accent-soft">
+              <FileText className="h-8 w-8 text-ls-accent" />
             </div>
-            <p className="text-gray-700 font-semibold text-lg">No scenarios yet</p>
-            <p className="text-sm text-gray-400 mt-1 mb-6">
+            <p className="text-lg font-semibold text-ls-ink">No scenarios yet</p>
+            <p className="mb-6 mt-1 text-sm text-ls-mute">
               Import a YAML/XLSX file or build one on the visual canvas.
             </p>
-            <Button
-              onClick={() => setUploadOpen(true)}
-              className="bg-blue-600 hover:bg-blue-700 shadow-sm"
-            >
-              <Upload className="h-4 w-4 mr-2" />
+            <Button onClick={() => setUploadOpen(true)}>
+              <Upload className="h-4 w-4" />
               Import scenario
             </Button>
           </div>
+        ) : shown.length === 0 ? (
+          <div className="rounded-2xl bg-ls-card py-16 text-center text-sm text-ls-mute shadow-md">
+            No scenarios match{search ? ` “${search}”` : ''}{filter !== 'all' ? ` with status “${STATUS_LABEL[filter]}”` : ''}.
+          </div>
         ) : (
           <>
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-              {scenarios.map((s) => (
+            <div className="grid grid-cols-[repeat(auto-fill,minmax(270px,1fr))] gap-[18px]">
+              {shown.map((s) => (
                 <ScenarioCard
                   key={s.id}
                   scenario={s}
-                  onSelect={() => handleSelect(s.id)}
-                  onDelete={() => deleteMutation.mutate(s.id)}
-                  onViewFile={() => handleViewFile(s.id)}
+                  summary={summaryOf.get(s.id)}
+                  onOpen={() => handleSelect(s.id)}
+                  onView={() => handleViewFile(s.id)}
+                  onDelete={() => setDeleteTarget(s)}
                 />
               ))}
             </div>
             {hasMore && (
-              <div className="flex justify-center mt-8">
-                <Button
-                  variant="outline"
-                  onClick={() => setPage(p => p + 1)}
-                  className="border-gray-300 text-gray-600 hover:border-blue-400 hover:text-blue-600 hover:bg-blue-50 rounded-full px-6"
-                >
+              <div className="mt-6 flex justify-center">
+                <Button variant="outline" onClick={() => setPage((p) => p + 1)}>
                   Load more ({totalCount - scenarios.length} remaining)
                 </Button>
               </div>
@@ -2313,6 +2291,29 @@ export default function ScenarioManager() {
 
       </div>
       <UploadDialog open={uploadOpen} onClose={() => setUploadOpen(false)} />
+
+      <Dialog open={deleteTarget !== null} onOpenChange={(o) => { if (!o) setDeleteTarget(null) }}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Delete scenario?</DialogTitle>
+            <DialogDescription>
+              “{deleteTarget?.name}” and its runs will be removed. This cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setDeleteTarget(null)}>Cancel</Button>
+            <Button
+              variant="destructive"
+              disabled={deleteMutation.isPending}
+              onClick={() => deleteTarget && deleteMutation.mutate(deleteTarget.id)}
+            >
+              <Trash2 className="h-4 w-4" />
+              Delete
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {viewScenario && (
         // key forces a fresh mount (and fresh useState initializers) whenever
         // the scenario's data actually changed — e.g. reopening the same

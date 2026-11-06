@@ -25,6 +25,9 @@ const QUEUE_GAP = 2.4 // from a station's centre to the first queue row
 const TOKEN_SIZE = 0.42
 const GLIDE = 10 // easing rate, 1/s
 const EXIT_SECONDS = 0.6
+const PILE_SHOWN = 60 // finished jobs kept in the pile at the End; the Finished count carries the rest
+const PILE_COLS = 6
+const PILE_GAP = 1.8 // from the End to the first row of the pile
 
 const HOVER_COLOR = new THREE.Color('#ffffff')
 const OUTCOME_COLOR = new THREE.Color('#ef4444') // a job turned away or scrapped
@@ -53,6 +56,7 @@ interface JobUI {
 
 interface JobMarkersProps {
   machines: Machine3D[]
+  startPos?: [number, number, number]
   endPos?: [number, number, number]
   completionLog?: Record<string, unknown[]>
   // simulation_state.assemblies: which parts went into which assembly.
@@ -73,6 +77,15 @@ interface JobProduct {
 
 const MIN_MS = 60_000
 
+// With no colour set for a product, each job gets its own from this palette (as in Build's replay), and a
+// second variant's jobs are shifted so its job 1 doesn't look like the first variant's job 1.
+const JOB_COLORS = [
+  '#ef4444', '#3b82f6', '#22c55e', '#f59e0b', '#a855f7', '#06b6d4', '#ec4899', '#84cc16',
+  '#f97316', '#6366f1', '#14b8a6', '#e11d48', '#0ea5e9', '#8b5cf6', '#ca8a04', '#10b981',
+]
+// "variant1-012" -> 12 (a Dismantle's piece shows its source job's number, see jobNumber below).
+const idNumber = (id: string) => Number(id.match(/^(.*?)-?(\d+)$/)?.[2] ?? 0)
+
 // Put the tooltip at its marker's screen position, but keep the whole card
 // (about 256 x 240 px) inside the canvas so it isn't cut off at an edge.
 const tipPoint = new THREE.Vector3()
@@ -92,9 +105,100 @@ function fmtMin(m: number): string {
   return `${Math.floor(m / 1440)}d ${Math.floor((m % 1440) / 60)}h`
 }
 
+// "Day 1 · 06:00" for a time on the timeline (ms from its zero).
+function fmtClock(zeroAbs: number, ms: number): string {
+  const d = new Date(zeroAbs + ms)
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  return `Day ${Math.floor(ms / 86_400_000) + 1} · ${hh}:${mm}`
+}
+
+const MAX_LISTED = 50 // jobs listed in a spot's card (the rest counted)
+
+// The card for a spot where jobs wait: every job there, the one leaving next first, as in Build's replay.
+function SpotCard({ tl, title, items, products, madeFrom, onEnter, onLeave }: {
+  tl: Timeline
+  title: string
+  items: JobState[]
+  products: (JobProduct | null)[]
+  madeFrom: Map<string, string[]>
+  onEnter: () => void
+  onLeave: () => void
+}) {
+  const rows = [...items].sort((a, b) => tl.jobs[a.job].visits[a.visit].release - tl.jobs[b.job].visits[b.visit].release || a.job - b.job)
+  const shown = rows.slice(0, MAX_LISTED)
+  // The scene's controls zoom on the mouse wheel; over this card the wheel scrolls the list instead.
+  const card = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const el = card.current
+    if (!el) return
+    const stop = (e: WheelEvent) => e.stopPropagation()
+    el.addEventListener('wheel', stop)
+    return () => el.removeEventListener('wheel', stop)
+  }, [])
+  return (
+    <div
+      ref={card}
+      onMouseEnter={onEnter}
+      onMouseLeave={onLeave}
+      className="w-64 rounded-xl border border-gray-200 bg-white/95 text-[11px] text-gray-700 shadow-lg backdrop-blur-sm"
+      style={{ pointerEvents: 'auto' }}
+    >
+      <div className="border-b border-gray-100 px-3 py-2 font-semibold text-gray-900">
+        {title}
+        {rows.length > 1 && <span className="font-normal text-gray-500"> · {rows.length} jobs</span>}
+      </div>
+      <div className="max-h-64 divide-y divide-gray-100 overflow-y-auto">
+        {shown.map((st) => {
+          const job = tl.jobs[st.job]
+          const v = job.visits[st.visit]
+          const from = madeFrom.get(job.id)
+          return (
+            <div key={job.id} className="space-y-0.5 px-3 py-1.5">
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="font-semibold text-gray-900">{job.id}</span>
+                <span className="truncate text-gray-500">{products[st.job]?.name ?? ''}</span>
+              </div>
+              <div>{st.visit === 0 ? 'Released — waiting for its first station' : 'Waiting to move on'}</div>
+              <div className="tabular-nums text-gray-500">Came {fmtClock(tl.zeroAbs, v.arrival)} · Leaves {fmtClock(tl.zeroAbs, v.release)}</div>
+              {from && <div className="text-gray-500">Made from {from.join(' + ')}</div>}
+            </div>
+          )
+        })}
+        {rows.length > shown.length && <div className="px-3 py-1.5 text-gray-400">and {rows.length - shown.length} more</div>}
+      </div>
+    </div>
+  )
+}
+
 // What the log says about the job under the cursor. Every number is the
 // engine's; per-visit totals are for the whole visit, not just the part so far.
-function JobTip({ tl, state, t, queueSize, product }: { tl: Timeline; state: JobState; t: number; queueSize: number; product: JobProduct | null }) {
+// A finished job in the End pile: when it finished and how long it spent in the line.
+function DoneTip({ tl, job, product, madeFrom }: { tl: Timeline; job: number; product: JobProduct | null; madeFrom?: string[] }) {
+  const j = tl.jobs[job]
+  const end = j.visits[j.visits.length - 1].end
+  return (
+    <div className="pointer-events-none w-64 rounded-lg border border-gray-200 bg-white/95 p-3 text-xs text-gray-700 shadow-lg backdrop-blur-sm">
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-semibold text-gray-900">{j.id}</span>
+        <span className="rounded-full bg-green-100 px-2 py-0.5 text-[10px] font-medium text-green-800">Finished</span>
+      </div>
+      {product && (
+        <div className="mt-0.5 flex items-center gap-1.5 text-gray-500">
+          <i className="h-2 w-2 rounded-sm" style={{ background: product.hex }} />{product.name}
+        </div>
+      )}
+      {madeFrom && <div className="mt-0.5 text-gray-500">Made from {madeFrom.join(' + ')}</div>}
+      <div className="mt-2 space-y-0.5">
+        <div className="flex justify-between"><span>Finished</span><b className="tabular-nums">{fmtClock(tl.zeroAbs, end)}</b></div>
+        <div className="flex justify-between"><span>Time in the line</span><b className="tabular-nums">{fmtMin(Math.max(0, (end - j.visits[0].arrival) / MIN_MS))}</b></div>
+        <div className="flex justify-between"><span>Stations visited</span><b className="tabular-nums">{j.visits.length}</b></div>
+      </div>
+    </div>
+  )
+}
+
+function JobTip({ tl, state, t, queueSize, product, madeFrom }: { tl: Timeline; state: JobState; t: number; queueSize: number; product: JobProduct | null; madeFrom?: string[] }) {
   const job = tl.jobs[state.job]
   const visit = job.visits[state.visit]
   const known = visit.status === 'Completed' // the other statuses have no per-visit totals yet
@@ -134,6 +238,7 @@ function JobTip({ tl, state, t, queueSize, product }: { tl: Timeline; state: Job
           <i className="h-2 w-2 rounded-sm" style={{ background: product.hex }} />{product.name}
         </div>
       )}
+      {madeFrom && <div className="mt-0.5 text-gray-500">Made from {madeFrom.join(' + ')}</div>}
       <div className="mt-2 space-y-0.5">
         {inRoom ? (
           <>
@@ -181,7 +286,7 @@ function glowTexture(): THREE.CanvasTexture {
   return new THREE.CanvasTexture(c)
 }
 
-export default function JobMarkers({ machines, endPos, completionLog, assemblies, dismantles, variantColors, timelineRefs }: JobMarkersProps) {
+export default function JobMarkers({ machines, startPos, endPos, completionLog, assemblies, dismantles, variantColors, timelineRefs }: JobMarkersProps) {
   // The soft glow is a point sprite, which WebGPU cannot size; it is left out there for now.
   const showGlow = !isWebGPU(useThree(s => s.gl))
   const gltf = useGLTF(MODEL)
@@ -189,7 +294,7 @@ export default function JobMarkers({ machines, endPos, completionLog, assemblies
   // The part itself: the Movable Part's cube, standing on y = 0, scaled to a small marker.
   // The material is made white and each job's cube is tinted per instance, so a
   // job with no product colour keeps the cube's own colour (baseColor).
-  const { tokenGeo, tokenMat, tokenScale, baseColor } = useMemo(() => {
+  const { tokenGeo, tokenMat, tokenScale, tokenH, baseColor } = useMemo(() => {
     let cube: THREE.Mesh | null = null
     gltf.scene.traverse((o) => { if ((o as THREE.Mesh).isMesh && !cube && o.name === 'cube') cube = o as THREE.Mesh })
     if (!cube) gltf.scene.traverse((o) => { if ((o as THREE.Mesh).isMesh && !cube) cube = o as THREE.Mesh })
@@ -202,7 +307,8 @@ export default function JobMarkers({ machines, endPos, completionLog, assemblies
     const mat = (mesh ? (mesh.material as THREE.Material).clone() : new THREE.MeshStandardMaterial({ color: '#dd0a17' })) as THREE.MeshStandardMaterial
     const base = mat.color ? mat.color.clone() : new THREE.Color('#dd0a17')
     mat.color?.set('#ffffff')
-    return { tokenGeo: geo, tokenMat: mat, tokenScale: TOKEN_SIZE / Math.max(size.x, size.z), baseColor: base }
+    const scale = TOKEN_SIZE / Math.max(size.x, size.z)
+    return { tokenGeo: geo, tokenMat: mat, tokenScale: scale, tokenH: size.y * scale, baseColor: base }
   }, [gltf])
 
   const ringGeo = useMemo(() => new THREE.RingGeometry(0.3, 0.44, 40).rotateX(-Math.PI / 2), [])
@@ -218,10 +324,51 @@ export default function JobMarkers({ machines, endPos, completionLog, assemblies
     return { geo, mat }
   }, [])
 
+  // Job numbers: one flat quad per digit lying on the cube's top, each showing its digit from a strip texture.
+  const digits = useMemo(() => {
+    const c = document.createElement('canvas')
+    c.width = 640
+    c.height = 64
+    const g = c.getContext('2d')!
+    g.font = 'bold 50px sans-serif'
+    g.textAlign = 'center'
+    g.textBaseline = 'middle'
+    g.lineWidth = 7
+    g.strokeStyle = 'rgba(15,23,42,0.9)'
+    g.fillStyle = '#ffffff'
+    for (let d = 0; d < 10; d++) { g.strokeText(String(d), d * 64 + 32, 34); g.fillText(String(d), d * 64 + 32, 34) }
+    const map = new THREE.CanvasTexture(c)
+    map.colorSpace = THREE.SRGBColorSpace
+    const geo = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2)
+    const attr = new THREE.InstancedBufferAttribute(new Float32Array(MAX * 3), 1)
+    geo.setAttribute('aDigit', attr)
+    const mat = new THREE.MeshBasicMaterial({ map, transparent: true, depthWrite: false })
+    mat.onBeforeCompile = (sh) => {
+      sh.vertexShader = sh.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute float aDigit;')
+        .replace('#include <uv_vertex>', '#include <uv_vertex>\n#ifdef USE_MAP\nvMapUv = vec2((vMapUv.x + aDigit) * 0.1, vMapUv.y);\n#endif')
+    }
+    return { geo, mat, attr }
+  }, [])
+  const digitsRef = useRef<THREE.InstancedMesh>(null)
+
   const tokens = useRef<THREE.InstancedMesh>(null)
   const rings = useRef<THREE.InstancedMesh>(null)
+  const slices = useRef<THREE.InstancedMesh>(null) // the other colours of a mixed job, laid over its cube
 
   const tl = useMemo(() => (completionLog ? buildTimeline(completionLog, assemblies, dismantles) : null), [completionLog, assemblies, dismantles])
+  // Finished jobs stay at the End: job index -> place in the pile, in the order they finished.
+  const pile = useMemo(() => {
+    const m = new Map<number, number>()
+    if (!tl) return m
+    const done: { j: number; end: number }[] = []
+    tl.jobs.forEach((job, j) => {
+      const end = job.visits[job.visits.length - 1]?.end
+      if (!job.outcome && job.group === undefined && !job.absorbed && Number.isFinite(end)) done.push({ j, end })
+    })
+    done.sort((a, b) => a.end - b.end).slice(0, PILE_SHOWN).forEach((x, i) => m.set(x.j, i))
+    return m
+  }, [tl])
   const ui = useMemo<JobUI[]>(
     () => (tl ? tl.jobs.map(() => ({ pos: new THREE.Vector3(), shown: false, exit: 0 })) : []),
     [tl],
@@ -234,7 +381,6 @@ export default function JobMarkers({ machines, endPos, completionLog, assemblies
   const products = useMemo<(JobProduct | null)[]>(() => {
     if (!tl) return []
     const entries = Object.entries(variantColors ?? {}).filter(([, hex]) => !!hex)
-    if (entries.length < 2) return tl.jobs.map(() => null)
     const byPrefix = new Map(entries.map(([name, hex]) => [jobPrefix(name), { name, hex, color: new THREE.Color(hex) }]))
     const index = new Map(tl.jobs.map((j, i) => [j.id, i]))
     const made = new Map<string, string>() // what an Assembly made -> its main part
@@ -251,8 +397,60 @@ export default function JobMarkers({ machines, endPos, completionLog, assemblies
       cache.set(i, found)
       return found
     }
-    return tl.jobs.map((_, i) => find(i, 0))
+    const shifts = new Map<string, number>()
+    return tl.jobs.map((job, i) => {
+      const found = find(i, 0)
+      if (found) return found
+      const prefix = job.id.match(/^(.*?)-?(\d+)$/)?.[1] ?? job.id
+      if (!shifts.has(prefix)) shifts.set(prefix, shifts.size * 5)
+      const hex = JOB_COLORS[(Math.max(idNumber(job.id), 1) - 1 + shifts.get(prefix)!) % JOB_COLORS.length]
+      return { name: prefix, hex, color: new THREE.Color(hex) }
+    })
   }, [tl, variantColors, assemblies])
+
+  // What an Assembly set to attach all parts makes shows every part type's colour, one slice each (main
+  // part first), as in Build's replay; a Dismantle's pieces keep the mix of the job they came from.
+  const mixes = useMemo(() => {
+    const m = new Map<number, { from: number; colors: THREE.Color[] }>()
+    if (!tl) return m
+    const index = new Map(tl.jobs.map((j, i) => [j.id, i]))
+    for (const [out, rec] of Object.entries(assemblies ?? {})) {
+      if (rec.mode !== 'attach') continue
+      const oi = index.get(out)
+      if (oi === undefined) continue
+      const seen = new Set<string>()
+      const colors: THREE.Color[] = []
+      for (const id of [rec.main, ...rec.parts]) {
+        const pr = products[index.get(id) ?? -1]
+        if (pr && !seen.has(pr.hex)) { seen.add(pr.hex); colors.push(pr.color) }
+      }
+      if (colors.length < 2) continue
+      const job = tl.jobs[oi]
+      const from = out === rec.main ? (job.visits.filter((v) => v.station === rec.station).at(-1)?.end ?? 0) : (job.visits[0]?.start ?? 0)
+      m.set(oi, { from, colors })
+    }
+    for (const [id, rec] of Object.entries(dismantles ?? {})) {
+      const wi = index.get(id)
+      const whole = wi !== undefined ? m.get(wi) : undefined
+      if (!whole) continue
+      for (const pid of rec.pieces) {
+        const pi = pid === id ? undefined : index.get(pid)
+        if (pi !== undefined) m.set(pi, { from: Math.max(whole.from, tl.jobs[pi].piece?.at ?? 0), colors: whole.colors })
+      }
+    }
+    return m
+  }, [tl, products, assemblies, dismantles])
+
+  // What each assembled job or dismantle piece was made from, for the hover cards.
+  const madeFrom = useMemo(() => {
+    const m = new Map<string, string[]>()
+    for (const [out, rec] of Object.entries(assemblies ?? {})) if (rec.mode === 'attach') m.set(out, [rec.main, ...rec.parts])
+    for (const [id, rec] of Object.entries(dismantles ?? {})) for (const pid of rec.pieces) if (pid !== id) m.set(pid, [id])
+    return m
+  }, [assemblies, dismantles])
+
+  // The number painted on each job's cube; a Dismantle's piece shows the number of the job it came from.
+  const numbers = useMemo(() => (tl ? tl.jobs.map((j) => idNumber(j.piece ? j.piece.of : j.id)) : []), [tl])
 
   const stations = useMemo(() => {
     const map = new Map<string, StationInfo>()
@@ -267,6 +465,9 @@ export default function JobMarkers({ machines, endPos, completionLog, assemblies
     for (const s of map.values()) s.zc = s.machines.reduce((a, m) => a + m.position[2], 0) / s.machines.length
     return map
   }, [machines])
+
+  // Where a job first shows up: the line's Start, from which it glides to its first station.
+  const entryPoint = useMemo(() => (startPos ? new THREE.Vector3(startPos[0], 0.3, startPos[2]) : null), [startPos])
 
   const exitTarget = useMemo(() => {
     if (endPos) return new THREE.Vector3(endPos[0], 0.3, endPos[2])
@@ -286,16 +487,29 @@ export default function JobMarkers({ machines, endPos, completionLog, assemblies
   const tip = useRef<THREE.Group>(null)
   const [hoverJob, setHoverJob] = useState<number | null>(null)
   const [, setTick] = useState(0)
+  // The spot whose list card is open (hovering its count or its cube); it stays open while the mouse is on the card.
+  const [openSpot, setOpenSpot] = useState<string | null>(null)
+  const openRef = useRef<string | null>(null)
+  const closeTimer = useRef<number | undefined>(undefined)
+  const spotOn = (k: string) => { window.clearTimeout(closeTimer.current); openRef.current = k; setOpenSpot(k) }
+  const spotOff = () => { closeTimer.current = window.setTimeout(() => { openRef.current = null; setOpenSpot(null) }, 150) }
+  const [spots, setSpots] = useState<{ key: string; x: number; z: number; n: number }[]>([]) // where jobs wait, with how many
 
   const scratch = useRef({
     instJob: new Int32Array(MAX), // which job each drawn marker is
     lastTick: 0,
     hoverState: null as JobState | null,
+    hoverDone: null as number | null, // a finished job in the End pile under the cursor
     hoverQueue: 0,
     hoverT: 0,
     states: [] as JobState[],
     lastT: 0,
     lastUI: 0,
+    lastSpot: 0,
+    spotSig: '',
+    lastCard: 0,
+    holdLists: new Map<string, { title: string; items: JobState[] }>(),
+    frontSpot: new Map<number, string>(),
     counts: { waiting: -1, processing: -1, done: -1, assembled: -1, dismantled: -1, rejected: -1, scrapped: -1 },
     present: new Uint8Array(0),
     dummy: new THREE.Object3D(),
@@ -311,6 +525,7 @@ export default function JobMarkers({ machines, endPos, completionLog, assemblies
   useFrame((state, delta) => {
     const tokensMesh = tokens.current
     const ringsMesh = rings.current
+    const slicesMesh = slices.current
     if (!tl || !tokensMesh || !ringsMesh) return
     const sc = scratch.current
     const { playing, speed, scrubPct, simClockMs, totalMs, setScrubUI, setPlayingUI, setCounts } = timelineRefs
@@ -391,6 +606,9 @@ export default function JobMarkers({ machines, endPos, completionLog, assemblies
     const glowCol = glow.geo.attributes.color as THREE.BufferAttribute
     let n = 0
 
+    let sn = 0 // slices drawn this frame
+    let dn = 0 // digits drawn this frame
+    const digitsMesh = digitsRef.current
     const hovered = hover.current
     const put = (j: number, pos: THREE.Vector3, color: THREE.Color, scale: number, spin: number, ringPulse: number) => {
       if (n >= MAX) return
@@ -411,11 +629,64 @@ export default function JobMarkers({ machines, endPos, completionLog, assemblies
       glowCol.setXYZ(n, color.r, color.g, color.b)
       sc.instJob[n] = j
       n++
+      if (digitsMesh) {
+        const str = String(numbers[j] ?? 0)
+        const dw = Math.min(TOKEN_SIZE * scale * 0.85 / str.length, TOKEN_SIZE * scale * 0.6)
+        for (let i = 0; i < str.length && dn < MAX * 3; i++) {
+          const off = (i - (str.length - 1) / 2) * dw
+          dummy.position.set(pos.x + Math.cos(spin) * off, pos.y + tokenH * scale * 1.06 + 0.012, pos.z - Math.sin(spin) * off)
+          dummy.rotation.set(0, spin, 0)
+          dummy.scale.set(dw, 1, dw)
+          dummy.updateMatrix()
+          digitsMesh.setMatrixAt(dn, dummy.matrix)
+          digits.attr.setX(dn, str.charCodeAt(i) - 48)
+          dn++
+        }
+      }
+      const mix = mixes.get(j)
+      if (slicesMesh && mix && t >= mix.from) {
+        const k = mix.colors.length
+        tokensMesh.setColorAt(n - 1, mix.colors[0])
+        const w = TOKEN_SIZE * scale
+        for (let i = 1; i < k && sn < MAX; i++) {
+          const off = ((i + 0.5) / k - 0.5) * w
+          dummy.position.set(pos.x + Math.cos(spin) * off, pos.y, pos.z - Math.sin(spin) * off)
+          dummy.rotation.set(0, spin, 0)
+          dummy.scale.set((tokenScale * scale) / k, tokenScale * scale * 1.04, tokenScale * scale * 1.04)
+          dummy.updateMatrix()
+          slicesMesh.setMatrixAt(sn, dummy.matrix)
+          slicesMesh.setColorAt(sn, mix.colors[i])
+          sn++
+        }
+      }
     }
 
     const elapsed = state.clock.elapsedTime
     // Several held jobs on one machine (a Dismantle holding all its pieces) sit side by side.
     const crowd = new Map<string, number>()
+    // Jobs waiting for their next station stay where they are — at the Start, or at the output of the
+    // station they just left. Each such spot shows one cube, the job that leaves next, and counts the rest.
+    const holdOf = (s: JobState, info: StationInfo): { key: string; x: number; z: number; dir: number } | null => {
+      const job = tl.jobs[s.job]
+      if (job.visits[s.visit].status === 'Assembled' || job.piece) return null
+      const prev = s.visit > 0 ? stations.get(job.visits[s.visit - 1].station) : undefined
+      if (prev) return { key: job.visits[s.visit - 1].station, x: prev.x, z: prev.zc, dir: prev.dir }
+      return s.visit === 0 && startPos ? { key: 'start', x: startPos[0], z: startPos[2], dir: info.dir } : null
+    }
+    const holds = new Map<string, { x: number; z: number; dir: number; n: number; front: number; frontRank: number; states: JobState[] }>()
+    for (const s of states) {
+      if (s.phase !== 'waiting') continue
+      const info = stations.get(s.station)
+      const h = info && holdOf(s, info)
+      if (!h) continue
+      const e = holds.get(h.key)
+      if (!e) holds.set(h.key, { x: h.x, z: h.z, dir: h.dir, n: 1, front: s.job, frontRank: s.rank, states: [s] })
+      else {
+        e.n++
+        e.states.push(s)
+        if (s.rank < e.frontRank || (s.rank === e.frontRank && s.job < e.front)) { e.front = s.job; e.frontRank = s.rank }
+      }
+    }
     for (const s of states) {
       const info = stations.get(s.station)
       if (!info) continue
@@ -423,10 +694,16 @@ export default function JobMarkers({ machines, endPos, completionLog, assemblies
       sc.present[j] = 1
       const u = ui[j]
       if (s.phase === 'waiting') {
-        if (s.rank >= QUEUE_SHOWN) { u.shown = false; continue } // the badge carries the count
-        const row = Math.floor(s.rank / QUEUE_COLS)
-        const col = s.rank % QUEUE_COLS
-        target.set(info.x - info.dir * (QUEUE_GAP + row * SPACING), 0.02, info.zc + (col - (QUEUE_COLS - 1) / 2) * SPACING)
+        const h = holdOf(s, info)
+        if (h) {
+          if (holds.get(h.key)!.front !== j) { u.shown = false; continue } // counted in the badge
+          target.set(h.x + h.dir * QUEUE_GAP, 0.02, h.z)
+        } else {
+          if (s.rank >= QUEUE_SHOWN) { u.shown = false; continue }
+          const row = Math.floor(s.rank / QUEUE_COLS)
+          const col = s.rank % QUEUE_COLS
+          target.set(info.x - info.dir * (QUEUE_GAP + row * SPACING), 0.02, info.zc + (col - (QUEUE_COLS - 1) / 2) * SPACING)
+        }
       } else {
         const m = info.machines[Math.min(s.machine, info.machines.length - 1)] ?? info.machines[0]
         target.set(m.position[0], topOf(info) + 0.02, m.position[2] + 0.25)
@@ -437,7 +714,8 @@ export default function JobMarkers({ machines, endPos, completionLog, assemblies
           target.x += n * 0.55
         }
       }
-      if (!u.shown || snap) u.pos.copy(target)
+      if (snap) u.pos.copy(target)
+      else if (!u.shown) u.pos.copy(entryPoint && s.visit === 0 && !tl.jobs[j].piece ? entryPoint : target)
       else u.pos.lerp(target, ease)
       u.shown = true
       u.exit = 0
@@ -445,8 +723,39 @@ export default function JobMarkers({ machines, endPos, completionLog, assemblies
       put(j, u.pos, COLORS[s.phase], 1, s.phase === 'processing' ? elapsed * 1.8 + j : 0, pulse)
     }
 
+    sc.holdLists = new Map([...holds].map(([k, e]) => [k, { title: k === 'start' ? 'After Start' : `After ${k}`, items: e.states }]))
+    sc.frontSpot = new Map([...holds].map(([k, e]) => [e.front, k]))
+    const crowded = [...holds]
+    const sig = crowded.map(([k, e]) => `${k}:${e.n}`).join('|')
+    if (sig !== sc.spotSig && state.clock.elapsedTime - sc.lastSpot > 0.1) {
+      sc.spotSig = sig
+      sc.lastSpot = state.clock.elapsedTime
+      setSpots(crowded.map(([key, e]) => ({ key, x: e.x + e.dir * QUEUE_GAP, z: e.z, n: e.n })))
+    }
+    // An open card keeps its times current.
+    if (openRef.current && state.clock.elapsedTime - sc.lastCard > 0.25) { sc.lastCard = state.clock.elapsedTime; setTick((k) => k + 1) }
+
+    // Finished jobs glide to the End and stay there, in rows behind it.
+    const endDir = machines[machines.length - 1]?.flowDir ?? 1
+    for (const [j, rank] of pile) {
+      const job = tl.jobs[j]
+      if (t < job.visits[job.visits.length - 1].end) continue
+      const u = ui[j]
+      sc.present[j] = 1
+      target.set(
+        exitTarget.x + endDir * (PILE_GAP + Math.floor(rank / PILE_COLS) * SPACING),
+        0.02,
+        exitTarget.z + ((rank % PILE_COLS) - (PILE_COLS - 1) / 2) * SPACING,
+      )
+      if (snap || !u.shown) u.pos.copy(target)
+      else u.pos.lerp(target, ease)
+      u.shown = true
+      u.exit = 0
+      put(j, u.pos, COLORS.processing, 1, 0, 1)
+    }
+
     // Jobs that just left their last station fly off to the End and shrink away;
-    // a part used in an Assembly shrinks into that Assembly instead.
+    // a part used in an Assembly shrinks into that Assembly instead (and so does any job past the pile).
     for (let j = 0; j < ui.length; j++) {
       const u = ui[j]
       if (sc.present[j] || !u.shown) continue
@@ -463,6 +772,16 @@ export default function JobMarkers({ machines, endPos, completionLog, assemblies
 
     tokensMesh.count = n
     ringsMesh.count = n
+    if (digitsMesh) {
+      digitsMesh.count = dn
+      digitsMesh.instanceMatrix.needsUpdate = true
+      digits.attr.needsUpdate = true
+    }
+    if (slicesMesh) {
+      slicesMesh.count = sn
+      slicesMesh.instanceMatrix.needsUpdate = true
+      if (slicesMesh.instanceColor) slicesMesh.instanceColor.needsUpdate = true
+    }
     tokensMesh.computeBoundingSphere() // picking tests this first, and the markers move
     tokensMesh.instanceMatrix.needsUpdate = true
     if (tokensMesh.instanceColor) tokensMesh.instanceColor.needsUpdate = true
@@ -481,6 +800,8 @@ export default function JobMarkers({ machines, endPos, completionLog, assemblies
       if (state.clock.elapsedTime - sc.lastTick > 0.25) {
         sc.lastTick = state.clock.elapsedTime
         sc.hoverState = states.find((s) => s.job === hover.current) ?? null
+        const hj = hover.current
+        sc.hoverDone = !sc.hoverState && pile.has(hj) && t >= tl.jobs[hj].visits[tl.jobs[hj].visits.length - 1].end ? hj : null
         sc.hoverQueue = sc.hoverState ? (queueLen.get(sc.hoverState.station) ?? 0) : 0
         sc.hoverT = t
         setTick((k) => k + 1)
@@ -492,7 +813,12 @@ export default function JobMarkers({ machines, endPos, completionLog, assemblies
     if (e.instanceId === undefined) return
     const j = scratch.current.instJob[e.instanceId]
     e.stopPropagation()
-    document.body.style.cursor = 'help'
+    const spot = scratch.current.frontSpot.get(j) // the cube standing for a waiting spot: its card lists every job there
+    if (spot) {
+      spotOn(spot)
+      if (hover.current !== -1) { hover.current = -1; setHoverJob(null) }
+      return
+    }
     if (hover.current !== j) {
       hover.current = j
       scratch.current.lastTick = 0 // refresh the tooltip on the next frame
@@ -500,6 +826,7 @@ export default function JobMarkers({ machines, endPos, completionLog, assemblies
     }
   }
   const onOut = () => {
+    spotOff()
     hover.current = -1
     document.body.style.cursor = 'auto'
     setHoverJob(null)
@@ -516,11 +843,42 @@ export default function JobMarkers({ machines, endPos, completionLog, assemblies
         onPointerOut={onOut}
       />
       <instancedMesh ref={rings} args={[ringGeo, ringMat, MAX]} frustumCulled={false} raycast={() => {}} />
+      <instancedMesh ref={slices} args={[tokenGeo, tokenMat, MAX]} frustumCulled={false} raycast={() => {}} />
+      {showGlow && <instancedMesh ref={digitsRef} args={[digits.geo, digits.mat, MAX * 3]} frustumCulled={false} raycast={() => {}} />}
       {showGlow && <points geometry={glow.geo} material={glow.mat} frustumCulled={false} raycast={() => {}} />}
+      {spots.map((sp) => {
+        const list = scratch.current.holdLists.get(sp.key)
+        return (
+          <Html key={sp.key} position={[sp.x, 0.9, sp.z]} center zIndexRange={[openSpot === sp.key ? 40 : 20, 0]} style={{ pointerEvents: 'none' }}>
+            <div style={{ position: 'relative' }}>
+              {sp.n > 1 && (
+                <span
+                  onMouseEnter={() => spotOn(sp.key)}
+                  onMouseLeave={spotOff}
+                  className="rounded-full bg-amber-500 px-2 py-0.5 text-[11px] font-bold text-white shadow"
+                  style={{ pointerEvents: 'auto' }}
+                >
+                  {sp.n}
+                </span>
+              )}
+              {openSpot === sp.key && tl && list && (
+                <div style={{ position: 'absolute', left: '50%', top: '100%', transform: 'translateX(-50%)', paddingTop: 4 }}>
+                  <SpotCard tl={tl} title={list.title} items={list.items} products={products} madeFrom={madeFrom} onEnter={() => spotOn(sp.key)} onLeave={spotOff} />
+                </div>
+              )}
+            </div>
+          </Html>
+        )
+      })}
       <group ref={tip}>
+        {tl && hoverJob !== null && !scratch.current.hoverState && scratch.current.hoverDone !== null && (
+          <Html center calculatePosition={clampToCanvas} zIndexRange={[30, 0]} style={{ pointerEvents: 'none' }}>
+            <DoneTip tl={tl} job={scratch.current.hoverDone} product={products[scratch.current.hoverDone] ?? null} madeFrom={madeFrom.get(tl.jobs[scratch.current.hoverDone].id)} />
+          </Html>
+        )}
         {tl && hoverJob !== null && scratch.current.hoverState && (
           <Html center calculatePosition={clampToCanvas} zIndexRange={[30, 0]} style={{ pointerEvents: 'none' }}>
-            <JobTip tl={tl} state={scratch.current.hoverState} t={scratch.current.hoverT} queueSize={scratch.current.hoverQueue} product={products[scratch.current.hoverState.job] ?? null} />
+            <JobTip tl={tl} state={scratch.current.hoverState} t={scratch.current.hoverT} queueSize={scratch.current.hoverQueue} product={products[scratch.current.hoverState.job] ?? null} madeFrom={madeFrom.get(tl.jobs[scratch.current.hoverState.job].id)} />
           </Html>
         )}
       </group>

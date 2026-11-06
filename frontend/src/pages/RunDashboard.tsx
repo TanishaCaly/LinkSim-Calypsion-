@@ -1,23 +1,29 @@
-import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { useQuery, useMutation } from '@tanstack/react-query'
-import {
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Cell,
-} from 'recharts'
-import {
-  Play, RefreshCw, AlertTriangle, CheckCircle, Clock, ChevronRight, ChevronLeft,
-  TrendingUp, Zap, Activity, Target, AlertCircle, BarChart2, Settings,
-  CalendarDays, Layers, X, Lightbulb, Printer, Expand, Shrink, List, Search, Square, Timer,
-} from 'lucide-react'
-import { simulationsApi } from '@/api/simulations'
+import { Play, RefreshCw, AlertTriangle, CheckCircle, Clock, TrendingUp, Zap, Activity, Target, AlertCircle, BarChart2, Settings, CalendarDays, Layers, X, Lightbulb, Printer, Expand, Shrink, Search, Square, Timer } from 'lucide-react'
 import type { SimConfigOverride } from '@/api/simulations'
-import { scenariosApi } from '@/api/scenarios'
 import { useAppStore } from '@/store/useAppStore'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Progress } from '@/components/ui/progress'
-import type { RunDetail, StationStat, SimConfig, WorkerPoolStat, StationStateStat, BufferStateStat, PartsFlow } from '@/types'
+import type { RunDetail, StationStat, WorkerPoolStat, StationStateStat, BufferStateStat, PartsFlow } from '@/types'
+import { SimConfigDialog, SimTimerDialog } from '@/components/run/SimDialogs'
+import SimSettingsMenu from '@/components/run/SimSettingsMenu'
+import { useRunSimulation } from '@/hooks/useRunSimulation'
+import { StateCharts, BottleneckPanel, StationThroughput } from '@/components/run/RunInsights'
+import { SectionHeading, SectionNav } from '@/components/run/Sections'
+import GraphMenu, { GRAPHS, type GraphKey } from '@/components/run/GraphMenu'
+import LeadTimeHistogram from '@/components/run/LeadTimeHistogram'
+import ShiftHeatmap from '@/components/run/ShiftHeatmap'
+import StationLanes from '@/components/run/StationLanes'
+import { parseJobTrace } from '@/lib/jobTrace'
+import RunTimeline, { useRunSeries } from '@/components/run/RunTimeline'
+import Sparkline from '@/components/run/Sparkline'
+import { ChartKey, TipHost } from '@/components/run/ChartKit'
+import { Drawer, DataTable, type DataTableProps } from '@/components/run/Drawer'
+import StationDrawer from '@/components/run/StationDrawer'
+import { statusOf } from '@/lib/status'
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -33,10 +39,7 @@ function StatusBadge({ status }: { status: string }) {
 }
 
 function utilColor(u: number) {
-  if (u >= 85) return '#ef4444'
-  if (u >= 70) return '#f59e0b'
-  if (u >= 40) return '#22c55e'
-  return '#94a3b8'
+  return statusOf(u).color
 }
 
 function utilBg(u: number) {
@@ -55,7 +58,7 @@ function utilTextColor(u: number) {
 
 // ─── Completed Jobs modal card ───────────────────────────────────────────────
 
-function CompletedJobsCard({ completed, inProgress, scrapped, stats }: { completed: number; inProgress: number; scrapped: number; stats: StationStat[] }) {
+function CompletedJobsCard({ completed, inProgress, scrapped, stats, spark }: { completed: number; inProgress: number; scrapped: number; stats: StationStat[]; spark?: number[] }) {
   const [open, setOpen] = useState(false)
   const sorted = [...stats].sort((a, b) => b.completed_jobs - a.completed_jobs)
   const maxJobs = sorted[0]?.completed_jobs || 1
@@ -66,7 +69,7 @@ function CompletedJobsCard({ completed, inProgress, scrapped, stats }: { complet
         <CardContent className="pt-5 pb-4 h-full">
           <div className="flex items-start justify-between">
             <div>
-              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Completed Jobs</p>
+              <p data-tip="Jobs that finished their whole route in this run." className="text-xs text-gray-500 uppercase tracking-wide font-medium">Completed Jobs</p>
               <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{completed}</p>
               {/* "In progress" here means "not yet finished the whole route" —
                   it includes jobs still mid-station AND jobs that haven't
@@ -83,6 +86,7 @@ function CompletedJobsCard({ completed, inProgress, scrapped, stats }: { complet
             </div>
             <div className="p-2 rounded-lg bg-blue-50"><CheckCircle className="h-4 w-4 text-blue-500" /></div>
           </div>
+          {spark && <Sparkline values={spark} color="var(--ls-accent)" label="Jobs finished so far" />}
         </CardContent>
       </Card>
       {open && (
@@ -130,7 +134,7 @@ function CompletedJobsCard({ completed, inProgress, scrapped, stats }: { complet
 
 // ─── Peak Utilization modal card ─────────────────────────────────────────────
 
-function PeakUtilCard({ peakUtil, bottleneck, stats }: { peakUtil: number; bottleneck: StationStat | null; stats: StationStat[] }) {
+function PeakUtilCard({ peakUtil, bottleneck, stats, spark }: { peakUtil: number; bottleneck: StationStat | null; stats: StationStat[]; spark?: number[] }) {
   const [open, setOpen] = useState(false)
   const sorted = [...stats].sort((a, b) => b.station_utilization - a.station_utilization)
 
@@ -143,12 +147,13 @@ function PeakUtilCard({ peakUtil, bottleneck, stats }: { peakUtil: number; bottl
         <CardContent className="pt-5 pb-4 h-full">
           <div className="flex items-start justify-between">
             <div>
-              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Peak Utilization</p>
+              <p data-tip="Utilization of the busiest station: the share of the run it spent working." className="text-xs text-gray-500 uppercase tracking-wide font-medium">Peak Utilization</p>
               <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{peakUtil.toFixed(1)}%</p>
               <p className="text-xs text-gray-400 mt-1">{bottleneck ? bottleneck.station_name : ''}</p>
             </div>
             <div className="p-2 rounded-lg bg-blue-50"><Activity className="h-4 w-4 text-blue-500" /></div>
           </div>
+          {spark && <Sparkline values={spark} color="var(--ls-crim)" label="Busiest station, % busy" />}
         </CardContent>
       </Card>
       {open && (
@@ -178,7 +183,7 @@ function PeakUtilCard({ peakUtil, bottleneck, stats }: { peakUtil: number; bottl
             </div>
             <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-red-200 [&::-webkit-scrollbar-thumb]:rounded-full">
               {sorted.map((s, i) => {
-                const color = s.station_utilization >= 85 ? '#ef4444' : s.station_utilization >= 70 ? '#f59e0b' : '#22c55e'
+                const color = utilColor(s.station_utilization)
                 return (
                   <div key={s.station_name} className={`flex items-center gap-3 px-6 py-3.5 border-b border-gray-50 last:border-0 ${i === 0 ? 'bg-red-50/40' : 'hover:bg-gray-50'}`}>
                     <span className="text-xs font-bold text-gray-300 w-6 tabular-nums shrink-0">{i + 1}</span>
@@ -200,7 +205,7 @@ function PeakUtilCard({ peakUtil, bottleneck, stats }: { peakUtil: number; bottl
 
 // ─── Avg Utilization modal card ──────────────────────────────────────────────
 
-function AvgUtilCard({ avgUtil, stats }: { avgUtil: number; stats: StationStat[] }) {
+function AvgUtilCard({ avgUtil, stats, spark }: { avgUtil: number; stats: StationStat[]; spark?: number[] }) {
   const [open, setOpen] = useState(false)
   const sorted = [...stats].sort((a, b) => b.operator_utilization - a.operator_utilization)
 
@@ -210,12 +215,16 @@ function AvgUtilCard({ avgUtil, stats }: { avgUtil: number; stats: StationStat[]
         <CardContent className="pt-5 pb-4 h-full">
           <div className="flex items-start justify-between">
             <div>
-              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Station Util.</p>
+              <p data-tip="Average utilization across all stations: the share of the run a station spent working." className="text-xs text-gray-500 uppercase tracking-wide font-medium">Station Util.</p>
               <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{avgUtil.toFixed(1)}%</p>
               <p className="text-xs text-gray-400 mt-1">average across stations</p>
             </div>
-            <div className="p-2 rounded-lg bg-blue-50"><Target className="h-4 w-4 text-blue-500" /></div>
+            <svg viewBox="0 0 44 44" className="h-9 w-9 shrink-0" aria-hidden>
+              <circle cx="22" cy="22" r="17" fill="none" stroke="var(--ls-chip)" strokeWidth="6" />
+              <circle cx="22" cy="22" r="17" fill="none" stroke={utilColor(avgUtil)} strokeWidth="6" strokeLinecap="round" strokeDasharray={`${(Math.min(100, Math.max(avgUtil, 1.5)) / 100) * 106.8} 106.8`} transform="rotate(-90 22 22)" />
+            </svg>
           </div>
+          {spark && <Sparkline values={spark} color="var(--ls-accent)" label="Average station utilization, %" />}
         </CardContent>
       </Card>
       {open && (
@@ -244,7 +253,7 @@ function AvgUtilCard({ avgUtil, stats }: { avgUtil: number; stats: StationStat[]
             </div>
             <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-blue-200 [&::-webkit-scrollbar-thumb]:rounded-full">
               {sorted.map((s, i) => {
-                const sColor = s.station_utilization >= 85 ? '#ef4444' : s.station_utilization >= 70 ? '#f59e0b' : '#22c55e'
+                const sColor = utilColor(s.station_utilization)
                 return (
                   <div key={s.station_name} className={`flex items-center gap-3 px-6 py-3.5 border-b border-gray-50 last:border-0 ${i === 0 ? 'bg-blue-50/40' : 'hover:bg-gray-50'}`}>
                     <span className="text-xs font-bold text-gray-300 w-6 tabular-nums shrink-0">{i + 1}</span>
@@ -269,7 +278,7 @@ function StateBar({ parts }: { parts: { value: number; color: string; label: str
   return (
     <div className="flex h-2 w-full overflow-hidden rounded-full bg-gray-100">
       {parts.map((p) => p.value > 0 && (
-        <div key={p.label} style={{ width: `${p.value}%`, background: p.color }} title={`${p.label} ${p.value.toFixed(2)}%`} />
+        <div key={p.label} style={{ width: `${p.value}%`, background: p.color }} data-tip={`${p.label}\n${p.value.toFixed(2)}% of the time`} />
       ))}
     </div>
   )
@@ -285,11 +294,11 @@ const STATION_COLUMNS = [
 ] as const
 const BUFFER_STATES = [
   { key: 'empty', label: 'Empty', color: '#cbd5e1' },
-  { key: 'occupied', label: 'Occupied', color: '#3b82f6' },
-  { key: 'full', label: 'Full', color: '#ef4444' },
+  { key: 'occupied', label: 'Occupied', color: 'var(--ls-accent)' },
+  { key: 'full', label: 'Full', color: 'var(--ls-bad)' },
 ] as const
 const WORKER_STATES = [
-  { key: 'working_pct', label: 'Working', color: '#22c55e' },
+  { key: 'working_pct', label: 'Working', color: 'var(--ls-ok)' },
   { key: 'free_pct', label: 'Free', color: '#cbd5e1' },
 ] as const
 
@@ -335,7 +344,7 @@ function StatisticalAnalysisCard({ result }: { result: RunDetail['result'] }) {
         <CardContent className="pt-5 pb-4 h-full">
           <div className="flex items-start justify-between">
             <div>
-              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Statistical Analysis</p>
+              <p data-tip="Averages and spread of the run measures across stations and jobs." className="text-xs text-gray-500 uppercase tracking-wide font-medium">Statistical Analysis</p>
               <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{avgWorking == null ? '—' : `${avgWorking.toFixed(1)}%`}</p>
               <p className="text-xs text-gray-400 mt-1">{avgWorking == null ? 'run again to see it' : 'avg working, across stations'}</p>
             </div>
@@ -487,7 +496,7 @@ function AvgSetupCard({ stats }: { stats: StationStat[] }) {
         <CardContent className="pt-5 pb-4 h-full">
           <div className="flex items-start justify-between">
             <div>
-              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Setup Time</p>
+              <p data-tip="Time stations spent on setup between jobs." className="text-xs text-gray-500 uppercase tracking-wide font-medium">Setup Time</p>
               <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{totalSetup.toFixed(1)} min</p>
               <p className="text-xs text-gray-400 mt-1">total across stations</p>
             </div>
@@ -550,7 +559,7 @@ function AvgCycleTimeCard({ stats }: { stats: StationStat[] }) {
         <CardContent className="pt-5 pb-4 h-full">
           <div className="flex items-start justify-between">
             <div>
-              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Max Cycle Time</p>
+              <p data-tip="The longest average time any station took to process one job." className="text-xs text-gray-500 uppercase tracking-wide font-medium">Max Cycle Time</p>
               <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{worstCycleTime.toFixed(1)} min</p>
               <p className="text-xs text-gray-400 mt-1">worst-case, arrival to completion, across stations</p>
             </div>
@@ -612,7 +621,7 @@ function AvgBufferBlockedCard({ stats }: { stats: StationStat[] }) {
         <CardContent className="pt-5 pb-4 h-full">
           <div className="flex items-start justify-between">
             <div>
-              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Buffer Blocked</p>
+              <p data-tip="Share of time a station was blocked: it had finished a job but could not pass it on." className="text-xs text-gray-500 uppercase tracking-wide font-medium">Buffer Blocked</p>
               <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{avgBlocked.toFixed(1)}%</p>
               <p className="text-xs text-gray-400 mt-1">stuck waiting on a full downstream buffer</p>
             </div>
@@ -687,7 +696,7 @@ function BottleneckCard({ bottleneck, stats }: { bottleneck: StationStat | null;
         <CardContent className="pt-5 pb-4 h-full">
           <div className="flex items-start justify-between gap-2">
             <div className="min-w-0 flex-1">
-              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Bottleneck Station</p>
+              <p data-tip="The busiest station. It sets how fast the whole line can go." className="text-xs text-gray-500 uppercase tracking-wide font-medium">Bottleneck Station</p>
               <p
                 className={`font-bold text-gray-900 mt-1 leading-tight break-words ${
                   (bottleneck?.station_name?.length ?? 0) > 14 ? 'text-lg' : 'text-2xl'
@@ -700,8 +709,16 @@ function BottleneckCard({ bottleneck, stats }: { bottleneck: StationStat | null;
                 {otherBottlenecks.length > 0 && ` · +${otherBottlenecks.length} more`}
               </p>
             </div>
-            <div className="p-2 rounded-lg bg-blue-50 shrink-0"><Zap className="h-4 w-4 text-blue-500" /></div>
+            <i className="mt-1 h-2.5 w-2.5 shrink-0 rounded-[3px]" style={{ background: bottleneck ? utilColor(bottleneck.station_utilization) : 'var(--ls-mute)' }} />
           </div>
+          {bottleneck && (
+            <div className="mt-3 h-2 overflow-hidden rounded-md bg-ls-chip">
+              <i
+                className="block h-full rounded-md"
+                style={{ width: `${Math.min(100, bottleneck.station_utilization)}%`, background: `linear-gradient(90deg, ${utilColor(bottleneck.station_utilization)}, color-mix(in srgb, ${utilColor(bottleneck.station_utilization)} 55%, white))` }}
+              />
+            </div>
+          )}
         </CardContent>
       </Card>
       {open && (
@@ -733,7 +750,7 @@ function BottleneckCard({ bottleneck, stats }: { bottleneck: StationStat | null;
             </div>
             <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-orange-200 [&::-webkit-scrollbar-thumb]:rounded-full">
               {sorted.map((s, i) => {
-                const color = s.station_utilization >= 85 ? '#ef4444' : s.station_utilization >= 70 ? '#f59e0b' : '#22c55e'
+                const color = utilColor(s.station_utilization)
                 return (
                   <div key={s.station_name} className={`flex items-center gap-3 px-6 py-3.5 border-b border-gray-50 last:border-0 ${i === 0 ? 'bg-orange-50/40' : 'hover:bg-gray-50'}`}>
                     <span className="text-xs font-bold text-gray-300 w-6 tabular-nums shrink-0">{i + 1}</span>
@@ -759,7 +776,7 @@ function BottleneckCard({ bottleneck, stats }: { bottleneck: StationStat | null;
 
 type ThroughputSort = 'throughput_desc' | 'throughput_asc' | 'name_asc' | 'name_desc'
 
-function ThroughputCard({ value, sub, stats }: { value: string; sub: string; stats: StationStat[] }) {
+function ThroughputCard({ value, sub, stats, spark }: { value: string; sub: string; stats: StationStat[]; spark?: number[] }) {
   const [open, setOpen] = useState(false)
   const [search, setSearch] = useState('')
   const [sortBy, setSortBy] = useState<ThroughputSort>('throughput_desc')
@@ -789,7 +806,7 @@ function ThroughputCard({ value, sub, stats }: { value: string; sub: string; sta
         <CardContent className="pt-5 pb-4 h-full">
           <div className="flex items-start justify-between">
             <div>
-              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Throughput</p>
+              <p data-tip="Jobs finished per hour of simulated time. Click for the per-station numbers." className="text-xs text-gray-500 uppercase tracking-wide font-medium">Throughput</p>
               <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{value}</p>
               <p className="text-xs text-gray-400 mt-1">{sub}</p>
             </div>
@@ -797,6 +814,7 @@ function ThroughputCard({ value, sub, stats }: { value: string; sub: string; sta
               <TrendingUp className="h-4 w-4 text-blue-500" />
             </div>
           </div>
+          {spark && <Sparkline values={spark} color="var(--ls-purple)" label="Jobs finished per period" />}
         </CardContent>
       </Card>
 
@@ -941,7 +959,7 @@ function AtRiskCard({ count, stats }: { count: number; stats: StationStat[] }) {
         <CardContent className="pt-5 pb-4 h-full">
           <div className="flex items-start justify-between">
             <div>
-              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Stations at Risk</p>
+              <p data-tip="Stations working 80% of the run or more, so close to their limit." className="text-xs text-gray-500 uppercase tracking-wide font-medium">Stations at Risk</p>
               <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{count}</p>
               <p className="text-xs text-gray-400 mt-1">≥ 80% utilization</p>
             </div>
@@ -998,7 +1016,7 @@ function AtRiskCard({ count, stats }: { count: number; stats: StationStat[] }) {
             <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-amber-200 [&::-webkit-scrollbar-thumb]:rounded-full">
               {riskStations.map((s, i) => {
                 const isBottleneck = s.station_utilization >= 85
-                const barColor = isBottleneck ? '#ef4444' : '#f59e0b'
+                const barColor = isBottleneck ? 'var(--ls-bad)' : 'var(--ls-warn)'
                 return (
                   <div key={s.station_name} className={`flex items-center gap-3 px-6 py-3.5 border-b border-gray-50 last:border-0 ${i === 0 ? 'bg-amber-50/40' : 'hover:bg-gray-50'}`}>
                     <div className="flex items-center gap-2 flex-1 min-w-0">
@@ -1043,7 +1061,7 @@ function TotalFailuresCard({ total, rework, stats }: { total: number; rework: nu
         <CardContent className="pt-5 pb-4 h-full">
           <div className="flex items-start justify-between">
             <div>
-              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Total Failures</p>
+              <p data-tip="Machine breakdowns across all stations. Avg rework is the share of jobs that had to be redone." className="text-xs text-gray-500 uppercase tracking-wide font-medium">Total Failures</p>
               <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{total}</p>
               <p className="text-xs text-gray-400 mt-1">{rework.toFixed(1)}% avg rework</p>
             </div>
@@ -1236,7 +1254,7 @@ function MtbfCard({
         <CardContent className="pt-5 pb-4 h-full">
           <div className="flex items-start justify-between">
             <div>
-              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">MTBF</p>
+              <p data-tip="Mean time between failures: how long a station runs, on average, between breakdowns." className="text-xs text-gray-500 uppercase tracking-wide font-medium">MTBF</p>
               <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">
                 {avgConfiguredMtbf != null ? `${avgConfiguredMtbf.toFixed(0)} min` : '—'}
               </p>
@@ -1335,7 +1353,7 @@ function AvailabilityCard({
         <CardContent className="pt-5 pb-4 h-full">
           <div className="flex items-start justify-between">
             <div>
-              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Availability</p>
+              <p data-tip="Share of the time stations were not broken down." className="text-xs text-gray-500 uppercase tracking-wide font-medium">Availability</p>
               <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">
                 {avgConfiguredAvailability != null ? `${avgConfiguredAvailability.toFixed(2)}%` : '—'}
               </p>
@@ -1424,7 +1442,7 @@ function SimDurationCard({
         <CardContent className="pt-5 pb-4 h-full">
           <div className="flex items-start justify-between">
             <div>
-              <p className="text-xs text-gray-500 uppercase tracking-wide font-medium">Sim Duration</p>
+              <p data-tip="How long the simulation ran, in minutes, hours and calendar days." className="text-xs text-gray-500 uppercase tracking-wide font-medium">Sim Duration</p>
               <p className="text-2xl font-bold text-gray-900 mt-1 leading-none">{simDays} days</p>
               <p className="text-xs text-gray-400 mt-1">{simTime.toFixed(0)} min</p>
             </div>
@@ -1495,1276 +1513,7 @@ function SimDurationCard({
   )
 }
 
-// ─── SimConfig dialog ─────────────────────────────────────────────────────────
-
-const PRESETS = [
-  { label: '1 Shift',  sub: '8 hours',   SIM_TIME: 480,    SHIFT_DURATION: 480 },
-  { label: '1 Day',    sub: '24 hours',  SIM_TIME: 1440,   SHIFT_DURATION: 480 },
-  { label: '1 Week',   sub: '7 days',    SIM_TIME: 10080,  SHIFT_DURATION: 480 },
-  { label: '1 Month',  sub: '30 days',   SIM_TIME: 43200,  SHIFT_DURATION: 480 },
-  { label: '1 Year',   sub: '365 days',  SIM_TIME: 525600, SHIFT_DURATION: 480 },
-]
-
-interface SimConfigDialogProps {
-  open: boolean
-  value: SimConfigOverride
-  onChange: (v: SimConfigOverride) => void
-  onClose: () => void
-}
-
-interface RunProgress { pct: number; msg: string; simTimeNow?: number; simTimeTotal?: number }
-
-// Engine defaults from backend/parsers/yaml_parser.py — used whenever a
-// scenario/override hasn't set its own SHIFT_n_START/END. Only covers the
-// original fixed 3 — a 4th+ shift always has explicit hours set by whoever
-// added it via "+ Add shift" (see addShift below), never a silent default.
-const SHIFT_DEFAULTS: Record<number, { start: number; end: number }> = {
-  1: { start: 6, end: 14 },
-  2: { start: 14, end: 22 },
-  3: { start: 22, end: 6 },
-}
-
-const CALENDAR_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-
-function fmtHour(h: number): string {
-  const hh = Math.floor(h) % 24
-  const period = hh < 12 ? 'am' : 'pm'
-  const display = hh % 12 === 0 ? 12 : hh % 12
-  return `${display}${period}`
-}
-
-const HOUR_OPTIONS = Array.from({ length: 24 }, (_, h) => h)
-
-// Python weekday() numbering used by the backend: Monday=0 ... Sunday=6.
-// Matches SimulationUtils.working_days' fallback when a shift has no
-// explicit WORKING_DAYS_n set — Shift 1/2 default to Mon-Fri, Shift 3
-// defaults to every day, same as the engine's original assumption. Any
-// shift beyond the original 3 defaults to Mon-Fri, same as 1/2.
-const DEFAULT_WORKING_DAYS: Record<number, number[]> = {
-  1: [0, 1, 2, 3, 4],
-  2: [0, 1, 2, 3, 4],
-  3: [0, 1, 2, 3, 4, 5, 6],
-}
-
-interface BreakWindow { start: number; duration: number }
-
-/** One shift's full editable config — an arbitrary-length array of these
- * replaces the old fixed Record<1|2|3, T> shape, so "+ Add shift" is just
- * pushing a new entry rather than a structural change. */
-interface ShiftEntry {
-  num: number
-  name: string
-  start: number
-  end: number
-  workingDays: number[]
-  breaks: BreakWindow[]
-}
-
-// Matches backend/parsers/yaml_parser.py's _SIM_CONFIG_DEFAULTS — one
-// default break per shift so a run has a realistic rest/lunch break out of
-// the box, even before the user opens this dialog. A 4th+ shift gets no
-// default break (empty), consistent with having no default hours either.
-const DEFAULT_BREAKS: Record<number, BreakWindow[]> = {
-  1: [{ start: 10, duration: 30 }],
-  2: [{ start: 18, duration: 30 }],
-  3: [{ start: 2, duration: 30 }],
-}
-
-/** Build the initial ShiftEntry[] from a SimConfigOverride, covering
- * whichever SHIFT_n_START keys are present (at least 3, or more if the
- * scenario was saved with extra shifts already). */
-function shiftEntriesFromConfig(value: SimConfigOverride): ShiftEntry[] {
-  let maxNum = 3
-  for (let i = 4; value[`SHIFT_${i}_START`] != null; i++) maxNum = i
-  return Array.from({ length: maxNum }, (_, i) => {
-    const num = i + 1
-    return {
-      num,
-      name: (value[`SHIFT_${num}_NAME`] as string | undefined) ?? '',
-      start: (value[`SHIFT_${num}_START`] as number | undefined) ?? SHIFT_DEFAULTS[num]?.start ?? 8,
-      end: (value[`SHIFT_${num}_END`] as number | undefined) ?? SHIFT_DEFAULTS[num]?.end ?? 16,
-      workingDays: (value[`WORKING_DAYS_${num}`] as number[] | undefined) ?? DEFAULT_WORKING_DAYS[num] ?? [0, 1, 2, 3, 4],
-      breaks: (value[`BREAKS_${num}`] as BreakWindow[] | undefined) ?? DEFAULT_BREAKS[num] ?? [],
-    }
-  })
-}
-
-/** Flatten ShiftEntry[] back into the SHIFT_n_START/WORKING_DAYS_n/BREAKS_n/
- * SHIFT_n_NAME keys the engine and rest of the app read. */
-function shiftEntriesToConfig(shifts: ShiftEntry[]): Partial<SimConfigOverride> {
-  const out: Record<string, unknown> = {}
-  shifts.forEach(s => {
-    out[`SHIFT_${s.num}_START`] = s.start
-    out[`SHIFT_${s.num}_END`] = s.end
-    out[`WORKING_DAYS_${s.num}`] = s.workingDays
-    out[`BREAKS_${s.num}`] = s.breaks
-    out[`SHIFT_${s.num}_NAME`] = s.name
-  })
-  return out
-}
-
-/**
- * Two shift-hour windows as (start, end) hour-of-day pairs, where end <= start
- * means the shift wraps past midnight (e.g. 22-6). Every window is expressed
- * as its "today" AND "tomorrow" occurrence on a 0-48 timeline — a plain
- * same-day shift (e.g. 2-4) still needs its tomorrow occurrence (26-28) to
- * correctly detect overlap against a wrapping shift that spills into the
- * next calendar day (e.g. 22-6, whose today-occurrence is 22-30). Returns
- * true if the two windows share ANY overlapping time.
- */
-function hourWindowsOverlap(aStart: number, aEnd: number, bStart: number, bEnd: number): boolean {
-  const toIntervals = (start: number, end: number): [number, number][] => {
-    const todayEnd = end <= start ? end + 24 : end
-    return [[start, todayEnd], [start + 24, todayEnd + 24]]
-  }
-  const as = toIntervals(aStart, aEnd)
-  const bs = toIntervals(bStart, bEnd)
-  return as.some(([as1, ae1]) => bs.some(([bs1, be1]) => as1 < be1 && bs1 < ae1))
-}
-
-/**
- * Warnings for the Shift Calendar — non-blocking (Apply/Save always works
- * regardless; see the "warning only" decision this mirrors from elsewhere in
- * the app, e.g. Source/Drain). Flags five real misconfigurations:
- *
- *   1. Two shifts overlapping in time on a day both are actually active —
- *      e.g. Shift 1 6am-2pm and Shift 4 8am-4pm both running Monday means
- *      the same hours are double-covered, almost certainly not intended.
- *   2. A break scheduled outside its OWN shift's hours — it would never
- *      actually happen, since the engine only checks breaks while that
- *      shift is active.
- *   3. A shift with every day of the week unchecked — it will never run at
- *      all, silently, with nothing else in the UI explaining why.
- *   4. A shift whose start and end hour are identical — ambiguous: could
- *      mean "runs the full 24 hours" but is far more often a forgotten edit
- *      to the end-hour dropdown.
- *   5. A day of the week with zero shifts active across the WHOLE
- *      calendar — flagged only when at least one OTHER day does have
- *      coverage, so an intentionally fully-idle scenario (e.g. a paused
- *      line) doesn't get warned on every single day.
- *
- * Does NOT flag: a day with zero shifts when the whole week has no active
- * shifts anywhere (that's covered by #3 on every shift instead), or a
- * break that's merely long (already caught by #2 once it spills past the
- * shift's own end).
- */
-function shiftCalendarWarnings(shifts: ShiftEntry[]): string[] {
-  const warnings: string[] = []
-  const dayLabel = (d: number) => CALENDAR_DAYS[d] ?? `Day ${d}`
-  const shiftLabel = (s: ShiftEntry) => s.name.trim() || `Shift ${s.num}`
-
-  for (let i = 0; i < shifts.length; i++) {
-    for (let j = i + 1; j < shifts.length; j++) {
-      const a = shifts[i]
-      const b = shifts[j]
-      if (!hourWindowsOverlap(a.start, a.end, b.start, b.end)) continue
-      const sharedDays = a.workingDays.filter((d) => b.workingDays.includes(d))
-      if (sharedDays.length === 0) continue
-      warnings.push(`${shiftLabel(a)} and ${shiftLabel(b)} overlap on ${sharedDays.map(dayLabel).join(', ')}`)
-    }
-  }
-
-  for (const s of shifts) {
-    for (const bw of s.breaks) {
-      const breakEnd = bw.start + bw.duration / 60
-      if (!hourWindowsOverlap(s.start, s.end, bw.start, breakEnd)) {
-        warnings.push(`${shiftLabel(s)}'s break is outside its own hours — it won't happen`)
-      }
-    }
-  }
-
-  for (const s of shifts) {
-    if (s.workingDays.length === 0) {
-      warnings.push(`${shiftLabel(s)} has no working days — it will never run`)
-    }
-  }
-
-  for (const s of shifts) {
-    if (s.start === s.end) {
-      warnings.push(`${shiftLabel(s)} start and end time are the same`)
-    }
-  }
-
-  const anyShiftHasAnyDay = shifts.some((s) => s.workingDays.length > 0)
-  if (anyShiftHasAnyDay) {
-    for (let d = 0; d < 7; d++) {
-      const covered = shifts.some((s) => s.workingDays.includes(d))
-      if (!covered) warnings.push(`No shift runs on ${dayLabel(d)}`)
-    }
-  }
-
-  return warnings
-}
-
-/**
- * Editable weekly view of however many shifts this scenario uses (3 by
- * default, more via "+ Add shift"). Each shift has its own independent
- * working-days pattern — no shift is special-cased to always run every day.
- * Double-click a cell to toggle that shift on/off for that day. A station's
- * own "Shifts/Day" setting (Canvas Build panel) decides which of these
- * shifts it actually observes — 0/empty ignores this calendar entirely and
- * runs 24/7.
- */
-function ShiftCalendar({
-  shifts, onChange, onAddShift, onRemoveShift,
-}: {
-  shifts: ShiftEntry[]
-  onChange: (num: number, patch: Partial<ShiftEntry>) => void
-  onAddShift: () => void
-  onRemoveShift: (num: number) => void
-}) {
-  const toggleDay = (num: number, dayIdx: number) => {
-    const s = shifts.find(sh => sh.num === num)
-    if (!s) return
-    const days = s.workingDays
-    onChange(num, { workingDays: days.includes(dayIdx) ? days.filter(d => d !== dayIdx) : [...days, dayIdx].sort() })
-  }
-
-  return (
-    <div>
-      <div className="flex items-center justify-between mb-2">
-        <label className="text-xs font-semibold text-gray-400 uppercase tracking-widest">
-          Shift Calendar
-        </label>
-        <button
-          type="button"
-          onClick={onAddShift}
-          className="text-[11px] font-semibold text-blue-600 hover:text-blue-700"
-        >
-          + Add shift
-        </button>
-      </div>
-      <div className="border border-gray-200 rounded-xl bg-gray-50 p-3">
-        <div className="grid gap-1.5 items-center" style={{ gridTemplateColumns: '64px repeat(7, 1fr)' }}>
-          <div />
-          {CALENDAR_DAYS.map(d => (
-            <div key={d} className="text-[10px] font-bold text-gray-400 text-center uppercase">{d}</div>
-          ))}
-          {shifts.map(s => (
-            <FragmentRow
-              key={s.num}
-              name={s.name}
-              shiftNum={s.num}
-              onRename={name => onChange(s.num, { name })}
-              color="bg-green-400"
-              start={s.start}
-              end={s.end}
-              days={s.workingDays}
-              onToggleDay={dayIdx => toggleDay(s.num, dayIdx)}
-            />
-          ))}
-        </div>
-
-        <div className="mt-3 pt-3 border-t border-gray-200 space-y-2">
-          {shifts.map(s => (
-            <div key={s.num} className="flex items-center gap-2">
-              <span className="text-[11px] text-gray-500 font-medium w-16 shrink-0 truncate">{s.name.trim() || `Shift ${s.num}`}</span>
-              <select
-                value={s.start}
-                onChange={e => onChange(s.num, { start: Number(e.target.value) })}
-                className="h-7 text-xs text-gray-800 bg-white border border-gray-200 rounded-md px-1.5"
-              >
-                {HOUR_OPTIONS.map(h => <option key={h} value={h}>{fmtHour(h)}</option>)}
-              </select>
-              <span className="text-xs text-gray-400">–</span>
-              <select
-                value={s.end}
-                onChange={e => onChange(s.num, { end: Number(e.target.value) })}
-                className="h-7 text-xs text-gray-800 bg-white border border-gray-200 rounded-md px-1.5"
-              >
-                {HOUR_OPTIONS.map(h => <option key={h} value={h}>{fmtHour(h)}</option>)}
-              </select>
-              {shifts.length > 1 && (
-                <button
-                  type="button"
-                  onClick={() => onRemoveShift(s.num)}
-                  className="text-gray-300 hover:text-red-500 transition-colors ml-auto"
-                  aria-label="Remove shift"
-                >
-                  <X className="h-3.5 w-3.5" />
-                </button>
-              )}
-            </div>
-          ))}
-        </div>
-
-        <div className="mt-3 pt-3 border-t border-gray-200 space-y-3">
-          <p className="text-[11px] text-gray-500 font-medium">Breaks (e.g. lunch)</p>
-          {shifts.map(s => (
-            <div key={s.num} className="space-y-1.5">
-              <span className="text-[11px] text-gray-500 font-medium">{s.name.trim() || `Shift ${s.num}`}</span>
-              {s.breaks.map((bw, bi) => (
-                <div key={bi} className="flex items-center gap-2 pl-2">
-                  <select
-                    value={bw.start}
-                    onChange={e => {
-                      const next = s.breaks.map((w, i) => i === bi ? { ...w, start: Number(e.target.value) } : w)
-                      onChange(s.num, { breaks: next })
-                    }}
-                    className="h-7 text-xs text-gray-800 bg-white border border-gray-200 rounded-md px-1.5"
-                  >
-                    {HOUR_OPTIONS.map(h => <option key={h} value={h}>{fmtHour(h)}</option>)}
-                  </select>
-                  <span className="text-xs text-gray-400">for</span>
-                  <BreakDurationInput
-                    value={bw.duration}
-                    onCommit={parsed => {
-                      const next = s.breaks.map((w, i) => i === bi ? { ...w, duration: parsed } : w)
-                      onChange(s.num, { breaks: next })
-                    }}
-                  />
-                  <span className="text-xs text-gray-400">min</span>
-                  <button
-                    type="button"
-                    onClick={() => onChange(s.num, { breaks: s.breaks.filter((_, i) => i !== bi) })}
-                    className="text-gray-300 hover:text-red-500 transition-colors ml-1"
-                    aria-label="Remove break"
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-              ))}
-              <button
-                type="button"
-                onClick={() => onChange(s.num, { breaks: [...s.breaks, { start: 12, duration: 30 }] })}
-                className="pl-2 text-[11px] font-medium text-blue-600 hover:text-blue-700"
-              >
-                + Add break
-              </button>
-            </div>
-          ))}
-        </div>
-
-        <p className="text-[11px] text-gray-400 mt-2.5 leading-relaxed">
-          Double-click a day in the calendar to turn that shift on/off for that day — each shift keeps its own
-          schedule. A station's own "Shift Available" setting decides which of these it uses.
-        </p>
-      </div>
-    </div>
-  )
-}
-
-/**
- * Break duration input as an uncontrolled-feeling text field: keeps its own
- * draft string while typing (so backspacing to empty actually works instead
- * of a controlled numeric value snapping back every keystroke), and only
- * commits a real number — clamped to >= 1 — on blur.
- */
-function BreakDurationInput({ value, onCommit }: { value: number; onCommit: (parsed: number) => void }) {
-  const [draft, setDraft] = useState(String(value))
-
-  useEffect(() => { setDraft(String(value)) }, [value])
-
-  return (
-    <input
-      type="number"
-      min={1}
-      value={draft}
-      onChange={e => setDraft(e.target.value)}
-      onBlur={() => {
-        const parsed = Math.max(1, Number(draft) || 1)
-        setDraft(String(parsed))
-        onCommit(parsed)
-      }}
-      className="h-7 w-16 text-xs text-gray-800 bg-white border border-gray-200 rounded-md px-1.5 [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
-    />
-  )
-}
-
-function FragmentRow({
-  name, shiftNum, onRename, color, start, end, days, onToggleDay,
-}: {
-  name: string
-  shiftNum: number
-  onRename: (name: string) => void
-  color: string
-  start: number
-  end: number
-  days: number[]
-  onToggleDay: (dayIdx: number) => void
-}) {
-  return (
-    <>
-      <input
-        value={name}
-        onChange={e => onRename(e.target.value)}
-        placeholder={`Shift ${shiftNum}`}
-        className="text-[11px] text-gray-700 font-medium h-7 w-full rounded-md border border-transparent hover:border-gray-200 focus:border-blue-300 focus:bg-white bg-transparent px-1.5 transition-colors"
-      />
-      {CALENDAR_DAYS.map((d, i) => {
-        const active = days.includes(i)
-        return (
-          <div key={d} className="relative group/cell">
-            <div
-              onDoubleClick={() => onToggleDay(i)}
-              className={`h-6 rounded-md cursor-pointer select-none transition-colors ${active ? `${color} hover:brightness-95` : 'bg-gray-100 hover:bg-gray-200'}`}
-            />
-            <span className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-2 whitespace-nowrap rounded-lg bg-white text-gray-700 text-xs font-medium px-3 py-2 shadow-lg border border-gray-100 opacity-0 scale-95 origin-bottom transition-all duration-150 group-hover/cell:opacity-100 group-hover/cell:scale-100 z-30">
-              {active ? `${fmtHour(start)}–${fmtHour(end)}` : 'Off'}
-            </span>
-          </div>
-        )
-      })}
-    </>
-  )
-}
-
-// ─── Simulation Timer dialog ──────────────────────────────────────────────────
-// Separate, dedicated entry point for "when does the simulated clock start,
-// and for how long does it run" — distinct from the general Simulation
-// Config dialog's shift/breaks/working-days setup. Mirrors the run-timing
-// pattern used by tools like Simio/FlexSim (a real start date/time + a run
-// length), rather than bundling it into the broader config modal.
-
-/** Format a Date as the value a <input type="datetime-local"> expects (local time, no timezone/seconds). */
-function toDatetimeLocalValue(d: Date): string {
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
-}
-
-/**
- * Custom dropdown calendar + time picker, styled to match the rest of the
- * app instead of relying on the browser's own tiny native calendar-icon
- * popup on <input type="datetime-local">. Value/onChange use the same
- * "YYYY-MM-DDTHH:mm" string shape as toDatetimeLocalValue so it's a drop-in
- * replacement wherever that native input was used.
- */
-function DateTimePicker({ value, onChange, className }: { value: string; onChange: (v: string) => void; className?: string }) {
-  const [open, setOpen] = useState(false)
-  const wrapRef = useRef<HTMLDivElement>(null)
-  const parsed = value ? new Date(value) : new Date()
-  const [viewMonth, setViewMonth] = useState(() => new Date(parsed.getFullYear(), parsed.getMonth(), 1))
-
-  useEffect(() => {
-    if (!open) return
-    const onClick = (e: MouseEvent) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false)
-    }
-    document.addEventListener('mousedown', onClick)
-    return () => document.removeEventListener('mousedown', onClick)
-  }, [open])
-
-  const selectDay = (day: number) => {
-    const d = new Date(viewMonth.getFullYear(), viewMonth.getMonth(), day, parsed.getHours(), parsed.getMinutes())
-    onChange(toDatetimeLocalValue(d))
-  }
-
-  const setTime = (hh: number, mm: number) => {
-    const d = new Date(parsed)
-    d.setHours(hh, mm)
-    onChange(toDatetimeLocalValue(d))
-  }
-
-  const firstOfMonth = new Date(viewMonth.getFullYear(), viewMonth.getMonth(), 1)
-  const daysInMonth = new Date(viewMonth.getFullYear(), viewMonth.getMonth() + 1, 0).getDate()
-  // Monday-first grid: JS getDay() is Sunday=0, shift so Monday lands at column 0.
-  const leadingBlanks = (firstOfMonth.getDay() + 6) % 7
-  const cells: (number | null)[] = [...Array(leadingBlanks).fill(null), ...Array.from({ length: daysInMonth }, (_, i) => i + 1)]
-
-  const isSelectedDay = (day: number) =>
-    parsed.getFullYear() === viewMonth.getFullYear() && parsed.getMonth() === viewMonth.getMonth() && parsed.getDate() === day
-  const isToday = (day: number) => {
-    const t = new Date()
-    return t.getFullYear() === viewMonth.getFullYear() && t.getMonth() === viewMonth.getMonth() && t.getDate() === day
-  }
-
-  return (
-    <div ref={wrapRef} className={`relative ${className ?? ''}`}>
-      <div className="w-full h-10 flex items-center gap-1.5 rounded-lg border border-gray-200 bg-gray-50 focus-within:bg-white focus-within:border-blue-400 transition-colors pl-3 pr-1.5">
-        <button
-          type="button"
-          onClick={() => { setViewMonth(new Date(parsed.getFullYear(), parsed.getMonth(), 1)); setOpen(v => !v) }}
-          className="flex items-center gap-2 text-sm text-gray-800 hover:text-blue-600 transition-colors"
-        >
-          <CalendarDays className="h-3.5 w-3.5 text-gray-400 shrink-0" />
-          {parsed.toLocaleDateString(undefined, { day: '2-digit', month: '2-digit', year: 'numeric' })}
-        </button>
-        <span className="text-gray-300">·</span>
-        {/* Directly editable — no need to open the calendar dropdown just to
-            nudge the time, which is the part users adjust most often. */}
-        <input
-          type="time"
-          value={`${String(parsed.getHours()).padStart(2, '0')}:${String(parsed.getMinutes()).padStart(2, '0')}`}
-          onChange={(e) => {
-            const [hh, mm] = e.target.value.split(':').map(Number)
-            if (Number.isFinite(hh) && Number.isFinite(mm)) setTime(hh, mm)
-          }}
-          className="flex-1 min-w-0 h-full text-sm text-gray-800 bg-transparent focus:outline-none"
-        />
-      </div>
-
-      {open && (
-        <div className="absolute z-20 mt-1.5 w-72 bg-white rounded-xl border border-gray-200 shadow-lg p-3">
-          <div className="flex items-center justify-between mb-2">
-            <button
-              type="button"
-              onClick={() => setViewMonth(m => new Date(m.getFullYear(), m.getMonth() - 1, 1))}
-              className="w-7 h-7 flex items-center justify-center rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100"
-            ><ChevronLeft className="h-4 w-4" /></button>
-            <span className="text-sm font-semibold text-gray-800">
-              {viewMonth.toLocaleDateString(undefined, { month: 'long', year: 'numeric' })}
-            </span>
-            <button
-              type="button"
-              onClick={() => setViewMonth(m => new Date(m.getFullYear(), m.getMonth() + 1, 1))}
-              className="w-7 h-7 flex items-center justify-center rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100"
-            ><ChevronRight className="h-4 w-4" /></button>
-          </div>
-
-          <div className="grid grid-cols-7 gap-0.5 mb-1">
-            {['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'].map(d => (
-              <div key={d} className="text-center text-[10px] font-semibold text-gray-400 py-1">{d}</div>
-            ))}
-          </div>
-          <div className="grid grid-cols-7 gap-0.5">
-            {cells.map((day, i) => (
-              <button
-                key={i}
-                type="button"
-                disabled={day === null}
-                onClick={() => day && selectDay(day)}
-                className={`h-8 rounded-lg text-xs transition-colors ${
-                  day === null
-                    ? ''
-                    : isSelectedDay(day)
-                      ? 'bg-blue-600 text-white font-semibold'
-                      : isToday(day)
-                        ? 'text-blue-600 font-semibold bg-blue-50 hover:bg-blue-100'
-                        : 'text-gray-700 hover:bg-gray-100'
-                }`}
-              >
-                {day ?? ''}
-              </button>
-            ))}
-          </div>
-
-          <div className="flex justify-end mt-3 pt-3 border-t border-gray-100">
-            <button
-              type="button"
-              onClick={() => setOpen(false)}
-              className="h-8 px-3 text-xs font-semibold text-blue-600 bg-blue-50 hover:bg-blue-100 rounded-lg transition-colors"
-            >
-              Done
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
-function SimTimerDialog({
-  open, value, onChange, onClose, progress, onRun, isRunning, completionLog,
-}: SimConfigDialogProps & { progress?: RunProgress | null; onRun?: (cfg: SimConfigOverride) => void; isRunning?: boolean; completionLog?: Record<string, unknown[]> | null }) {
-  const [startDate, setStartDate] = useState(() =>
-    value.SIMULATION_START_DATE ? String(value.SIMULATION_START_DATE).slice(0, 16) : toDatetimeLocalValue(new Date())
-  )
-  const [endDateStr, setEndDateStr] = useState(() => {
-    const start = value.SIMULATION_START_DATE ? new Date(String(value.SIMULATION_START_DATE)) : new Date()
-    const mins = value.SIM_TIME ?? 10080
-    const d = new Date(start)
-    d.setMinutes(d.getMinutes() + mins)
-    return toDatetimeLocalValue(d)
-  })
-  const [activePreset, setActivePreset] = useState<number | null>(null)
-  const [warmup, setWarmup] = useState(String(value.WARMUP_TIME ?? 0))
-
-  // Replay controls for the last completed run's recorded timeline — the
-  // backend runs SimPy as a single batch job with no live-pause capability,
-  // so Reset/Play/Pause/speed here can only scrub an already-finished run's
-  // completion_log, same mechanism as GanttTimeline/the 3D canvas use.
-  const [replayPct, setReplayPct] = useState(0)
-  const [replayPlaying, setReplayPlaying] = useState(false)
-  const [replaySpeed, setReplaySpeed] = useState<1 | 10 | 50>(10)
-  const replaySpeedMap = { 1: 1, 10: 10, 50: 50 }
-
-  const replayJobs = useMemo(() => {
-    if (!completionLog) return []
-    const rows: { start: number; end: number }[] = []
-    for (const entries of Object.values(completionLog)) {
-      for (const e of entries as Record<string, unknown>[]) {
-        const startStr = e['process_start_time_real'] as string
-        const endStr = e['process_end_time_real'] as string
-        if (!startStr || !endStr) continue
-        const start = new Date(startStr.replace(' ', 'T')).getTime()
-        const end = new Date(endStr.replace(' ', 'T')).getTime()
-        if (Number.isFinite(start) && Number.isFinite(end)) rows.push({ start, end })
-      }
-    }
-    return rows
-  }, [completionLog])
-
-  const replayTMin = replayJobs.length > 0 ? Math.min(...replayJobs.map(j => j.start)) : 0
-  const replayTMax = replayJobs.length > 0 ? Math.max(...replayJobs.map(j => j.end)) : 1
-  const replayTotalMs = Math.max(1, replayTMax - replayTMin)
-  const hasReplayData = replayJobs.length > 0
-
-  useEffect(() => {
-    // Reset scrub position whenever the underlying run data changes, so
-    // reopening the dialog for a different run doesn't start mid-timeline.
-    setReplayPct(0)
-    setReplayPlaying(false)
-  }, [completionLog])
-
-  useEffect(() => {
-    if (!replayPlaying) return
-    let raf: number
-    let last = performance.now()
-    const tick = (now: number) => {
-      const delta = now - last
-      last = now
-      const advanceMs = delta * replaySpeedMap[replaySpeed]
-      setReplayPct(p => {
-        const next = p + (advanceMs / replayTotalMs) * 100
-        if (next >= 100) { setReplayPlaying(false); return 100 }
-        return next
-      })
-      raf = requestAnimationFrame(tick)
-    }
-    raf = requestAnimationFrame(tick)
-    return () => cancelAnimationFrame(raf)
-  }, [replayPlaying, replaySpeed, replayTotalMs])
-
-  const replayCutoffMs = replayTMin + (replayPct / 100) * replayTotalMs
-  const replayElapsedMin = hasReplayData ? Math.round((replayCutoffMs - replayTMin) / 60000) : 0
-  const replayTotalMin = hasReplayData ? Math.round(replayTotalMs / 60000) : 0
-
-  useEffect(() => {
-    if (!open) return
-    document.body.style.overflow = 'hidden'
-    return () => { document.body.style.overflow = '' }
-  }, [open])
-
-  if (!open) return null
-
-  // Duration (minutes) is derived from the start/end gap — end date is the
-  // source of truth here (AnyLogic-style), not a separately-tracked count.
-  const durationMins = (() => {
-    if (!startDate || !endDateStr) return null
-    const mins = (new Date(endDateStr).getTime() - new Date(startDate).getTime()) / 60000
-    return Number.isFinite(mins) && mins > 0 ? mins : null
-  })()
-
-  const applyPreset = (i: number, mins: number) => {
-    setActivePreset(i)
-    const d = new Date(startDate)
-    d.setMinutes(d.getMinutes() + mins)
-    setEndDateStr(toDatetimeLocalValue(d))
-  }
-
-  // Moving the start date shifts the end date by the same amount, preserving
-  // whatever run length was already set instead of silently changing it.
-  const shiftStartTo = (newStart: string) => {
-    if (startDate && endDateStr) {
-      const deltaMs = new Date(newStart).getTime() - new Date(startDate).getTime()
-      if (Number.isFinite(deltaMs)) {
-        setEndDateStr(toDatetimeLocalValue(new Date(new Date(endDateStr).getTime() + deltaMs)))
-      }
-    }
-    setStartDate(newStart)
-  }
-
-  // Shift-1 window/working-days this override actually uses (falls back to
-  // the same engine defaults SimConfigDialog uses), so the weekday check and
-  // "snap to shift start" below reflect the real config, not a guess.
-  const shift1Start = value.SHIFT_1_START ?? SHIFT_DEFAULTS[1].start
-  const shift1WorkingDays = (value.WORKING_DAYS_1 as number[] | undefined) ?? DEFAULT_WORKING_DAYS[1]
-  const shift1Name = (value.SHIFT_1_NAME as string | undefined)?.trim() || 'Shift 1'
-
-  const startDateObj = startDate ? new Date(startDate) : null
-  // JS getDay(): Sunday=0..Saturday=6 -> convert to Python-style Monday=0..Sunday=6
-  // used by WORKING_DAYS_n, so this lines up with the engine's own weekday check.
-  const startIsWorkingDay = startDateObj
-    ? shift1WorkingDays.includes((startDateObj.getDay() + 6) % 7)
-    : true
-
-  /** Jump Start Date to the next moment Shift 1 is actually scheduled to run. */
-  const snapToNextShiftStart = () => {
-    const base = startDateObj ?? new Date()
-    const d = new Date(base)
-    d.setHours(Math.floor(shift1Start), Math.round((shift1Start % 1) * 60), 0, 0)
-    if (d.getTime() <= base.getTime()) d.setDate(d.getDate() + 1)
-    for (let i = 0; i < 8; i++) {
-      if (shift1WorkingDays.includes((d.getDay() + 6) % 7)) break
-      d.setDate(d.getDate() + 1)
-    }
-    shiftStartTo(toDatetimeLocalValue(d))
-  }
-
-  const buildConfig = (): SimConfigOverride => ({
-    ...value,
-    SIMULATION_START_DATE: startDate ? `${startDate}:00` : undefined,
-    SIM_TIME: durationMins ?? Number(value.SIM_TIME ?? 10080),
-    WARMUP_TIME: Math.max(0, Number(warmup) || 0),
-  })
-
-  const apply = () => {
-    onChange(buildConfig())
-    onClose()
-  }
-
-  // Applies the config AND immediately triggers a run with it — passes the
-  // freshly-built config directly to onRun rather than relying on onChange's
-  // state update having landed yet (see triggerMutation's overrideCfg param).
-  const applyAndRun = () => {
-    const cfg = buildConfig()
-    onChange(cfg)
-    onRun?.(cfg)
-    onClose()
-  }
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[85vh] z-10 flex flex-col overflow-hidden">
-
-        <div className="flex items-center justify-between px-6 py-5 border-b border-gray-100 shrink-0">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg bg-blue-50 flex items-center justify-center">
-              <Clock className="h-4 w-4 text-blue-600" />
-            </div>
-            <h2 className="text-base font-semibold text-gray-900">Simulation Timer</h2>
-          </div>
-          <button onClick={onClose} className="w-7 h-7 flex items-center justify-center rounded-lg text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors">
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-
-        <div className="px-6 py-5 space-y-4 overflow-y-auto overflow-x-hidden [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-blue-300 [&::-webkit-scrollbar-thumb]:rounded-full hover:[&::-webkit-scrollbar-thumb]:bg-blue-400">
-
-          {/* Live running-time readout while a run is in progress — mirrors the
-              "Time" field Tecnomatix Plant Simulation shows at the top of its
-              own event-controller dialog, fed from the same SSE progress state
-              the header progress bar uses. */}
-          {progress && progress.simTimeNow != null && progress.simTimeTotal != null && (
-            <div className="rounded-xl border border-blue-100 bg-blue-50 px-4 py-3 flex items-center justify-between">
-              <span className="text-xs font-semibold text-blue-400 uppercase tracking-widest">Time</span>
-              <span className="text-sm font-bold text-blue-900 tabular-nums">
-                {progress.simTimeNow.toFixed(1)} / {progress.simTimeTotal.toFixed(1)} min
-                <span className="text-blue-400 font-medium ml-2">({progress.pct.toFixed(0)}%)</span>
-              </span>
-            </div>
-          )}
-
-          {/* Replay controls for the last completed run's recorded timeline.
-              The engine is a one-shot SimPy batch job — it can't be paused
-              mid-computation — so these buttons scrub playback of a FINISHED
-              run's completion_log rather than controlling a live simulation,
-              the same model GanttTimeline/the 3D canvas already use. */}
-          {!isRunning && hasReplayData && (
-            <section className="rounded-xl border border-gray-200 bg-gray-50/60 p-4 space-y-3">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-gray-500 uppercase tracking-widest">Replay last run</span>
-                <span className="text-[10px] text-gray-400 tabular-nums">{replayElapsedMin}m / {replayTotalMin}m</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  title="Reset"
-                  onClick={() => { setReplayPct(0); setReplayPlaying(false) }}
-                  className="h-8 w-8 flex items-center justify-center rounded-lg border border-gray-200 bg-white text-gray-500 hover:bg-gray-50 shrink-0"
-                >
-                  <RefreshCw className="h-3.5 w-3.5" />
-                </button>
-                <button
-                  type="button"
-                  title={replayPlaying ? 'Pause' : 'Play'}
-                  onClick={() => {
-                    if (replayPct >= 100) setReplayPct(0)
-                    setReplayPlaying(p => replayPct >= 100 ? true : !p)
-                  }}
-                  className="h-8 px-3 flex items-center justify-center rounded-lg bg-blue-600 text-white hover:bg-blue-700 text-xs font-semibold shrink-0"
-                >
-                  {replayPlaying ? '⏸ Pause' : '▶ Start'}
-                </button>
-                <button
-                  type="button"
-                  title="Stop"
-                  onClick={() => setReplayPlaying(false)}
-                  className="h-8 px-3 flex items-center justify-center rounded-lg border border-gray-200 bg-white text-gray-500 hover:bg-gray-50 text-xs font-semibold shrink-0"
-                >
-                  ■ Stop
-                </button>
-                <div className="flex items-center rounded-lg border border-gray-200 overflow-hidden shrink-0 ml-auto">
-                  {([1, 10, 50] as const).map(s => (
-                    <button
-                      key={s}
-                      type="button"
-                      onClick={() => setReplaySpeed(s)}
-                      className={`h-8 px-2.5 text-xs font-semibold transition-colors ${replaySpeed === s ? 'bg-blue-50 text-blue-700' : 'bg-white text-gray-400 hover:bg-gray-50'}`}
-                    >
-                      {s}×
-                    </button>
-                  ))}
-                </div>
-              </div>
-              <input
-                type="range"
-                min={0}
-                max={100}
-                step={0.1}
-                value={replayPct}
-                onChange={(e) => { setReplayPlaying(false); setReplayPct(Number(e.target.value)) }}
-                className="w-full accent-blue-600"
-              />
-            </section>
-          )}
-
-          {/* Date range */}
-          <section className="rounded-xl border border-gray-200 p-4 space-y-4">
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <label className="text-xs font-semibold text-gray-400 uppercase tracking-widest">Start Date &amp; Time</label>
-                {startDateObj && (
-                  <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${startIsWorkingDay ? 'text-gray-500 bg-gray-100' : 'text-amber-600 bg-amber-50'}`}>
-                    {startDateObj.toLocaleDateString(undefined, { weekday: 'long' })}
-                    {!startIsWorkingDay && ' — non-working day'}
-                  </span>
-                )}
-              </div>
-              <div className="flex items-center gap-2">
-                <DateTimePicker value={startDate} onChange={shiftStartTo} className="flex-1" />
-                <button
-                  type="button"
-                  onClick={() => shiftStartTo(toDatetimeLocalValue(new Date()))}
-                  className="h-10 px-3 text-xs font-semibold text-blue-600 bg-blue-50 hover:bg-blue-100 rounded-lg border border-blue-100 transition-colors whitespace-nowrap"
-                >
-                  Now
-                </button>
-              </div>
-              <div className="flex items-center justify-between mt-1.5 gap-2">
-                <p className="text-[10px] text-gray-400">
-                  Anchors shift working-days (e.g. "Monday") to actual weekdays.
-                </p>
-                <button
-                  type="button"
-                  onClick={snapToNextShiftStart}
-                  className="text-[10px] font-semibold text-blue-600 hover:text-blue-700 whitespace-nowrap shrink-0"
-                >
-                  Snap to next {shift1Name} start
-                </button>
-              </div>
-              {!startIsWorkingDay && (
-                <p className="text-[10px] text-amber-600 mt-1">
-                  {shift1Name} doesn't run on this weekday — the station will sit idle until its next working day.
-                </p>
-              )}
-            </div>
-
-            <div className="border-t border-gray-100 pt-4">
-              <label className="text-xs font-semibold text-gray-400 uppercase tracking-widest block mb-2">End Date &amp; Time</label>
-              <DateTimePicker
-                value={endDateStr}
-                onChange={(v) => { setEndDateStr(v); setActivePreset(null) }}
-              />
-              <p className="text-[10px] text-gray-400 mt-1.5">
-                The real calendar date the simulated clock stops at. Run length is computed from the gap to Start Date.
-              </p>
-            </div>
-
-            <div className="border-t border-gray-100 pt-4">
-              <p className="text-xs font-semibold text-gray-400 uppercase tracking-widest mb-3">Quick Fill</p>
-              <div className="grid grid-cols-5 gap-2">
-                {PRESETS.map((p, i) => (
-                  <button
-                    key={p.label}
-                    onClick={() => applyPreset(i, p.SIM_TIME)}
-                    className={`flex flex-col items-center py-3 rounded-xl border text-sm transition-all duration-150 ${
-                      activePreset === i
-                        ? 'border-blue-500 bg-blue-50 text-blue-700 shadow-sm'
-                        : 'border-gray-100 bg-gray-50 hover:border-blue-200 hover:bg-blue-50/50 text-gray-600'
-                    }`}
-                  >
-                    <span className="font-semibold text-sm">{p.label}</span>
-                    <span className="text-[10px] text-gray-400 mt-0.5">{p.sub}</span>
-                  </button>
-                ))}
-              </div>
-              <p className="text-[10px] text-gray-400 mt-1.5">Sets End Date to Start Date + the chosen length. Edit End Date directly for anything else.</p>
-            </div>
-          </section>
-
-          {/* Warm-up + summary */}
-          <section className="rounded-xl border border-gray-200 p-4 space-y-4">
-            <div>
-              <label className="text-xs font-semibold text-gray-400 uppercase tracking-widest block mb-2">
-                Warm-up Time (minutes)
-              </label>
-              <div className="flex items-center border border-gray-200 rounded-xl bg-gray-50 focus-within:border-blue-400 focus-within:bg-white transition-colors overflow-hidden">
-                <button
-                  type="button"
-                  onClick={() => setWarmup(v => String(Math.max(0, Number(v) - 60)))}
-                  className="px-3 py-2.5 text-blue-500 hover:bg-blue-50 hover:text-blue-700 text-lg font-bold transition-colors select-none"
-                >−</button>
-                <input
-                  type="number"
-                  min={0}
-                  max={Math.max(0, (durationMins ?? 0) - 60)}
-                  value={warmup}
-                  onChange={e => setWarmup(e.target.value)}
-                  className="flex-1 text-center text-sm text-gray-900 bg-transparent focus:outline-none [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
-                />
-                <button
-                  type="button"
-                  onClick={() => setWarmup(v => String(Math.min(Math.max(0, (durationMins ?? 0) - 60), Number(v) + 60)))}
-                  className="px-3 py-2.5 text-blue-500 hover:bg-blue-50 hover:text-blue-700 text-lg font-bold transition-colors select-none"
-                >+</button>
-              </div>
-              <p className="text-xs text-gray-400 mt-1.5">
-                {Number(warmup) > 0
-                  ? `First ${(Number(warmup) / 60).toFixed(1)} hours excluded from utilization/throughput — lets the line fill up before measuring steady-state.`
-                  : 'Off by default. Set a value to exclude the initial ramp-up period from KPIs.'}
-              </p>
-            </div>
-
-            <div className="rounded-xl bg-blue-50 border border-blue-100 px-4 py-3">
-              <p className="text-[10px] font-semibold text-blue-400 uppercase tracking-widest mb-1">Simulated Period</p>
-              {durationMins ? (
-                <>
-                  <p className="text-sm text-blue-900 font-medium">
-                    {new Date(startDate).toLocaleString()} &rarr; {new Date(endDateStr).toLocaleString()}
-                  </p>
-                  <p className="text-[11px] text-blue-400 mt-1">
-                    = {(durationMins / 60).toFixed(1)} hours · {(durationMins / 1440).toFixed(1)} days
-                  </p>
-                </>
-              ) : (
-                <p className="text-sm text-red-500 font-medium">End Date must be after Start Date.</p>
-              )}
-            </div>
-
-            {/* Informational only — LinkSim's SimPy engine is event-driven and
-                always jumps straight between scheduled events, so it already
-                behaves as if this were on; there's no tick-based mode to
-                disable it for. Shown checked/locked for parity with tools
-                like Plant Simulation that expose it as a real toggle. */}
-            <label className="flex items-center gap-2 text-xs text-gray-500 cursor-default select-none">
-              <input type="checkbox" checked disabled className="h-3.5 w-3.5 rounded border-gray-300 accent-blue-400 opacity-80" />
-              Skip long event intervals
-              <span className="text-[10px] text-gray-400">(always on — engine is event-driven)</span>
-            </label>
-          </section>
-        </div>
-
-        <div className="px-6 py-4 border-t border-gray-100 flex justify-end gap-2 shrink-0">
-          <Button variant="outline" size="sm" onClick={onClose}>Cancel</Button>
-          <Button size="sm" onClick={apply} disabled={!durationMins} variant="outline">Save Timer</Button>
-          {onRun && (
-            <Button
-              size="sm"
-              onClick={applyAndRun}
-              disabled={!durationMins || isRunning}
-              className="bg-blue-600 hover:bg-blue-700"
-            >
-              {isRunning ? 'Running…' : 'Save & Run'}
-            </Button>
-          )}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDialogProps) {
-  const [custom, setCustom] = useState(String(value.SIM_TIME ?? 10080))
-  const [reps, setReps] = useState(String(value.num_replications ?? 1))
-  const [activePreset, setActivePreset] = useState<number | null>(null)
-  // Arbitrary-length list of shift configs (hours, working days, breaks,
-  // display name) — replaces the old fixed 1/2/3 Record shape so "+ Add
-  // shift" is just pushing another entry, not a structural change.
-  const [shifts, setShifts] = useState<ShiftEntry[]>(() => shiftEntriesFromConfig(value))
-
-  // SimConfigDialog stays mounted permanently (only `open` toggles
-  // visibility, see its render call in RunDashboard), so the useState
-  // initializer above only ever runs once for the whole page's lifetime.
-  // Without this, reopening the dialog after switching scenarios (or after
-  // the scenario's saved shift names load in asynchronously) kept showing
-  // whatever `shifts` was first computed from, not the current `value` —
-  // which is why saved shift names appeared to "reset" to Shift 1/2/3.
-  useEffect(() => {
-    if (open) setShifts(shiftEntriesFromConfig(value))
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open])
-
-  // Non-blocking — Apply always works regardless of these. Just flags
-  // overlapping shift hours and breaks scheduled outside their own shift's
-  // hours, both real (if easy to make) configuration mistakes.
-  const calendarWarnings = useMemo(() => shiftCalendarWarnings(shifts), [shifts])
-
-  const updateShift = (num: number, patch: Partial<ShiftEntry>) => {
-    setShifts(prev => prev.map(s => s.num === num ? { ...s, ...patch } : s))
-  }
-  const addShift = () => {
-    setShifts(prev => {
-      const num = Math.max(...prev.map(s => s.num)) + 1
-      // Matches every other shift's convention (see DEFAULT_BREAKS /
-      // backend _SIM_CONFIG_DEFAULTS): one 30-min break roughly mid-shift,
-      // so a newly added shift behaves realistically out of the box too.
-      return [...prev, { num, name: '', start: 8, end: 16, workingDays: [0, 1, 2, 3, 4], breaks: [{ start: 12, duration: 30 }] }]
-    })
-  }
-  const removeShift = (num: number) => {
-    setShifts(prev => prev.length > 1 ? prev.filter(s => s.num !== num) : prev)
-  }
-
-  // Freeze the page behind the dialog — without this, the underlying
-  // dashboard's own horizontal/vertical scrollbars stay live and visible
-  // (and scrollable) while this modal is open.
-  useEffect(() => {
-    if (!open) return
-    const prevOverflow = document.body.style.overflow
-    document.body.style.overflow = 'hidden'
-    return () => { document.body.style.overflow = prevOverflow }
-  }, [open])
-
-  if (!open) return null
-
-  const apply = () => {
-    onChange({
-      ...value,
-      SIM_TIME: Number(custom),
-      num_replications: Math.max(1, Math.min(30, Number(reps) || 1)),
-      // No Random Seed box any more — every run is random ("Auto").
-      RANDOM_SEED: undefined,
-      ...shiftEntriesToConfig(shifts),
-    })
-    onClose()
-  }
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[85vh] z-10 flex flex-col overflow-hidden">
-
-        {/* Header */}
-        <div className="flex items-center justify-between px-6 py-5 border-b border-gray-100 shrink-0">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg bg-blue-50 flex items-center justify-center">
-              <Settings className="h-4 w-4 text-blue-600" />
-            </div>
-            <h2 className="text-base font-semibold text-gray-900">Simulation Config</h2>
-          </div>
-          <button onClick={onClose} className="w-7 h-7 flex items-center justify-center rounded-lg text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors">
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-
-        <div className="px-6 py-5 space-y-5 overflow-y-auto overflow-x-hidden [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-blue-200 [&::-webkit-scrollbar-thumb]:rounded-full">
-          {/* Presets */}
-          <div>
-            <p className="text-xs font-semibold text-gray-400 uppercase tracking-widest mb-3">Duration Presets</p>
-            <div className="grid grid-cols-5 gap-2">
-              {PRESETS.map((p, i) => (
-                <button
-                  key={p.label}
-                  onClick={() => { setActivePreset(i); setCustom(String(p.SIM_TIME)) }}
-                  className={`flex flex-col items-center py-3 rounded-xl border text-sm transition-all duration-150 ${
-                    activePreset === i
-                      ? 'border-blue-500 bg-blue-50 text-blue-700 shadow-sm'
-                      : 'border-gray-100 bg-gray-50 hover:border-blue-200 hover:bg-blue-50/50 text-gray-600'
-                  }`}
-                >
-                  <span className="font-semibold text-sm">{p.label}</span>
-                  <span className="text-[10px] text-gray-400 mt-0.5">{p.sub}</span>
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Simulation Time */}
-          <div>
-            <label className="text-xs font-semibold text-gray-400 uppercase tracking-widest block mb-2">
-              Simulation Time (minutes)
-            </label>
-            <div className="flex items-center border border-gray-200 rounded-xl bg-gray-50 focus-within:border-blue-400 focus-within:bg-white transition-colors overflow-hidden">
-              <button
-                type="button"
-                onClick={() => { setCustom(v => String(Math.max(60, Number(v) - 60))); setActivePreset(null) }}
-                className="px-3 py-2.5 text-blue-500 hover:bg-blue-50 hover:text-blue-700 text-lg font-bold transition-colors select-none"
-              >−</button>
-              <input
-                type="number"
-                min={60}
-                max={525600}
-                value={custom}
-                onChange={e => { setCustom(e.target.value); setActivePreset(null) }}
-                className="flex-1 text-center text-sm text-gray-900 bg-transparent focus:outline-none [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
-              />
-              <button
-                type="button"
-                onClick={() => { setCustom(v => String(Math.min(525600, Number(v) + 60))); setActivePreset(null) }}
-                className="px-3 py-2.5 text-blue-500 hover:bg-blue-50 hover:text-blue-700 text-lg font-bold transition-colors select-none"
-              >+</button>
-            </div>
-            <p className="text-xs text-gray-400 mt-1.5">
-              = {(Number(custom) / 60).toFixed(1)} hours · {(Number(custom) / 1440).toFixed(1)} days
-            </p>
-          </div>
-
-          {/* Shift Calendar — editable view of however many shifts this run
-              uses (3 by default, more via "+ Add shift"). Each shift has its
-              own independent working-days pattern (double-click a cell to
-              toggle), no shift is special-cased to always run every day.
-              Each station's own "Shift Available" setting (Canvas Build
-              panel) decides which of these shifts actually apply to it.
-              Values shown fall back to the engine defaults (6am-2pm /
-              2pm-10pm / 10pm-6am, Mon-Fri for Shift 1/2 and every day for
-              Shift 3) when not yet configured. */}
-          <ShiftCalendar
-            shifts={shifts}
-            onChange={updateShift}
-            onAddShift={addShift}
-            onRemoveShift={removeShift}
-          />
-
-          {/* Non-blocking — flags overlapping shift hours and breaks
-              scheduled outside their own shift's hours. Save/Apply still
-              works either way; this is just a heads-up. */}
-          {calendarWarnings.length > 0 && (
-            <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 space-y-1.5">
-              {calendarWarnings.map((w, i) => (
-                <p key={i} className="text-xs text-amber-700 flex items-start gap-1.5">
-                  <span className="shrink-0">⚠</span>
-                  <span>{w}</span>
-                </p>
-              ))}
-            </div>
-          )}
-
-          {/* Replications */}
-          <div>
-            <label className="text-xs font-semibold text-gray-400 uppercase tracking-widest block mb-2">
-              Replications (1–30)
-            </label>
-            <div className="flex items-center border border-gray-200 rounded-xl bg-gray-50 focus-within:border-blue-400 focus-within:bg-white transition-colors overflow-hidden">
-              <button
-                type="button"
-                onClick={() => setReps(v => String(Math.max(1, Number(v) - 1)))}
-                className="px-3 py-2.5 text-blue-500 hover:bg-blue-50 hover:text-blue-700 text-lg font-bold transition-colors select-none"
-              >−</button>
-              <input
-                type="number"
-                min={1}
-                max={30}
-                value={reps}
-                onChange={e => setReps(e.target.value)}
-                className="flex-1 text-center text-sm text-gray-900 bg-transparent focus:outline-none [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
-              />
-              <button
-                type="button"
-                onClick={() => setReps(v => String(Math.min(30, Number(v) + 1)))}
-                className="px-3 py-2.5 text-blue-500 hover:bg-blue-50 hover:text-blue-700 text-lg font-bold transition-colors select-none"
-              >+</button>
-            </div>
-            <p className="text-xs text-gray-400 mt-1.5">Multiple replications average results for statistical stability.</p>
-          </div>
-
-        </div>
-
-        {/* Footer */}
-        <div className="flex gap-3 px-6 py-4 border-t border-gray-100 shrink-0">
-          <Button variant="outline" className="flex-1 rounded-xl border-gray-200 text-gray-600 hover:border-blue-300 hover:text-blue-600" onClick={onClose}>Cancel</Button>
-          <Button className="flex-1 rounded-xl bg-blue-600 hover:bg-blue-700 shadow-sm" onClick={apply}>Apply</Button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
 // ─── Job Trace table ──────────────────────────────────────────────────────────
-
-interface JobTraceRow {
-  jobId: string
-  station: string
-  arrival: string | null
-  departure: string | null
-  windowMin: number | null
-  waitingMin: number | null
-  processingMin: number | null
-  otherTimeMin: number | null
-  totalMin: number | null
-  status: string
-  delayReason: string
-}
-
-function parseJobTrace(completionLog: Record<string, unknown[]>): JobTraceRow[] {
-  const rows: JobTraceRow[] = []
-  for (const [station, entries] of Object.entries(completionLog)) {
-    for (const e of entries as Record<string, unknown>[]) {
-      const jobId = (e['job_id'] as string) ?? '—'
-      // process_start/end_time_real mark when this job actually started/finished
-      // being WORKED ON at this station (after it already got the machine) —
-      // NOT when it first arrived and began waiting in queue. So the window
-      // between them is "Processing Time + Setup Time + Rework Time + any
-      // shift-pause time falling inside it," not the job's full time at this
-      // station. "Blocked Time" is the SEPARATE, prior queue-wait period
-      // before the machine was acquired. Verified against real engine output:
-      // one job's Blocked Time consistently equals the sum of the
-      // process-window durations of jobs ahead of it in a single-server
-      // queue. The true end-to-end time a job spends at a station is
-      // Blocked Time + this window, not this window alone.
-      const arrival = (e['process_start_time_real'] as string) ?? null
-      const departure = (e['process_end_time_real'] as string) ?? null
-      const status = (e['status'] as string) ?? (departure ? 'Completed' : 'In Progress')
-      const delayReason = (e['delay_reason'] as string) ?? '—'
-      // Round to 2dp rather than truncating to a whole number — station
-      // durations imported from a spreadsheet are routinely fractional
-      // (e.g. 4.39 min), and Math.round() was silently flattening those to
-      // "4", losing real precision the user configured.
-      const round2 = (n: number) => Math.round(n * 100) / 100
-      const waitingMin = e['Blocked Time'] != null ? round2(Number(e['Blocked Time'])) : null
-      const processingMin = e['Processing Time'] != null ? round2(Number(e['Processing Time'])) : null
-      // What usually explains the gap between Processing (min) and Total
-      // (min) below — Total counts the full process-window (see windowMin's
-      // comment above), which silently folds in every OTHER delay signal
-      // the backend tracks (sim_core.py's _determine_delay_reason draws
-      // from these exact same fields to pick "Delay Reason"): machine
-      // breakdown, waiting for an operator, material shortage, setup/
-      // changeover, rework, and off-shift pause time (a job's station
-      // acquired the machine, then sat paused overnight/weekend waiting for
-      // the next shift). None of these had their own column before, so
-      // Delay Reason could say e.g. "Waiting for material" while "Waiting
-      // (min)" showed 0 in this same row — that column is queue-wait
-      // (Blocked Time) only, a DIFFERENT signal from all six of these.
-      // Summing them here means Waiting + Processing + this always accounts
-      // for the Total a user sees, and it's built from the identical signal
-      // set Delay Reason itself uses, so the two never disagree about what
-      // actually happened to a job.
-      const breakdownMin = e['station_downtime'] != null ? Number(e['station_downtime']) : 0
-      const operatorMin = e['operators_downtime'] != null ? Number(e['operators_downtime']) : 0
-      const materialMin = e['material_unavailability'] != null ? Number(e['material_unavailability']) : 0
-      const setupMin = e['total_setup_time'] != null ? Number(e['total_setup_time']) : 0
-      const reworkMin = e['total_rework_time'] != null ? Number(e['total_rework_time']) : 0
-      const pauseMin = e['pause_time'] != null ? Number(e['pause_time']) : 0
-      const otherTimeMin = round2(breakdownMin + operatorMin + materialMin + setupMin + reworkMin + pauseMin)
-      let windowMin: number | null = null
-      if (arrival && departure) {
-        const start = new Date(arrival.replace(' ', 'T')).getTime()
-        const end = new Date(departure.replace(' ', 'T')).getTime()
-        windowMin = round2((end - start) / 60000)
-      }
-      // Total (min) used to be waitingMin + windowMin, where windowMin came
-      // from subtracting two whole-second timestamp strings — losing
-      // sub-second precision the backend's own numeric fields still have
-      // (e.g. Processing Time 822.86 + pause_time 540 truly sums to
-      // 1362.86, but the timestamp-derived window rounded to 1362.85).
-      // Summing the precise numeric fields directly instead means Total
-      // always exactly equals Waiting + Processing + Other Delay, with no
-      // rounding drift between the two paths.
-      const totalMin = waitingMin != null && processingMin != null
-        ? round2(waitingMin + processingMin + otherTimeMin)
-        : null
-      rows.push({ jobId, station, arrival, departure, windowMin, waitingMin, processingMin, otherTimeMin, totalMin, status, delayReason })
-    }
-  }
-  // Sort by arrival time (jobs with no arrival timestamp sink to the bottom)
-  rows.sort((a, b) => {
-    if (!a.arrival) return 1
-    if (!b.arrival) return -1
-    return a.arrival.localeCompare(b.arrival)
-  })
-  return rows
-}
 
 function JobTraceTable({
   result, isExpanded, onExpandToggle,
@@ -2947,8 +1696,8 @@ function parseGantt(completionLog: Record<string, unknown[]>): GanttJob[] {
 function GanttTimeline({ result, simTime, onExpandToggle, isExpanded }: { result: Record<string, unknown>; simTime?: number; onExpandToggle?: () => void; isExpanded?: boolean }) {
   const isDark = useAppStore(s => s.theme) === 'dark'
   const svgC = isDark
-    ? { rowEven: '#1e293b', rowOdd: '#0f172a', grid: '#334155', legendBg: '#1e293b', label: '#e2e8f0', muted: '#94a3b8', barBorder: 'rgba(255,255,255,0.12)' }
-    : { rowEven: '#f9fafb', rowOdd: '#ffffff', grid: '#e5e7eb', legendBg: '#f8fafc', label: '#374151', muted: '#9ca3af', barBorder: 'rgba(0,0,0,0.08)' }
+    ? { rowEven: '#171A1F', rowOdd: '#111418', grid: '#2A2F37', legendBg: '#171A1F', label: '#E9EBEE', muted: '#8C96A7', barBorder: 'rgba(255,255,255,0.12)' }
+    : { rowEven: '#F8FAFC', rowOdd: '#FFFFFF', grid: '#E6E9EF', legendBg: '#F8FAFC', label: '#344054', muted: '#8A94A6', barBorder: 'rgba(0,0,0,0.08)' }
 
   // FIX: `rawLog`/`jobs` are computed up front (instead of via early
   // `return` statements) so that every hook below is called on every
@@ -3090,9 +1839,9 @@ function GanttTimeline({ result, simTime, onExpandToggle, isExpanded }: { result
           <line x1={0} y1={LEGEND_H} x2={LABEL_W + CHART_W} y2={LEGEND_H} stroke={svgC.grid} strokeWidth={1} />
           {/* Legend items */}
           {[
-            { color: '#22c55e', label: 'Processing' },
-            { color: '#eab308', label: 'Waiting' },
-            { color: '#ef4444', label: 'Blocked/Down' },
+            { color: 'var(--ls-ok)', label: 'Processing' },
+            { color: 'var(--ls-warn)', label: 'Waiting' },
+            { color: 'var(--ls-bad)', label: 'Blocked/Down' },
           ].map((item, i) => (
             <g key={item.label} transform={`translate(${LABEL_W + 12 + i * 110}, 0)`}>
               <rect x={0} y={LEGEND_H / 2 - 5} width={10} height={10} rx={2} fill={item.color} />
@@ -3169,11 +1918,11 @@ function GanttTimeline({ result, simTime, onExpandToggle, isExpanded }: { result
                 style={{ cursor: 'pointer' }}
               >
                 {/* Processing segment — green */}
-                {pw > 0 && <rect x={x1} y={y} width={pw} height={BAR_H} fill="#22c55e" rx={2} />}
+                {pw > 0 && <rect x={x1} y={y} width={pw} height={BAR_H} fill="var(--ls-ok)" rx={2} />}
                 {/* Waiting segment — yellow */}
-                {ww > 0 && <rect x={x1 + pw} y={y} width={ww} height={BAR_H} fill="#eab308" rx={0} />}
+                {ww > 0 && <rect x={x1 + pw} y={y} width={ww} height={BAR_H} fill="var(--ls-warn)" rx={0} />}
                 {/* Blocked segment — red */}
-                {bw > 0 && <rect x={x1 + pw + ww} y={y} width={bw} height={BAR_H} fill="#ef4444" rx={0} />}
+                {bw > 0 && <rect x={x1 + pw + ww} y={y} width={bw} height={BAR_H} fill="var(--ls-bad)" rx={0} />}
                 {/* Thin border around full bar for definition */}
                 <rect x={x1} y={y} width={w} height={BAR_H} fill="none" stroke={svgC.barBorder} strokeWidth={0.5} rx={2} />
               </g>
@@ -3185,7 +1934,7 @@ function GanttTimeline({ result, simTime, onExpandToggle, isExpanded }: { result
             <line
               x1={LABEL_W + (scrubPct / 100) * CHART_W} y1={LEGEND_H}
               x2={LABEL_W + (scrubPct / 100) * CHART_W} y2={chartH - 20}
-              stroke="#1d4ed8" strokeWidth={1.5} strokeDasharray="4 3" />
+              stroke="var(--ls-accent)" strokeWidth={1.5} strokeDasharray="4 3" />
           )}
         </svg>
 
@@ -3289,101 +2038,6 @@ function GanttTimeline({ result, simTime, onExpandToggle, isExpanded }: { result
 }
 
 // ─── Charts ───────────────────────────────────────────────────────────────────
-
-function UtilTooltip({ active, payload, label }: { active?: boolean; payload?: {name: string; value: number; color: string}[]; label?: string }) {
-  if (!active || !payload?.length) return null
-  return (
-    <div className="bg-white border border-gray-100 rounded-xl shadow-lg px-4 py-3 text-sm">
-      <p className="font-semibold text-gray-800 mb-2">{label}</p>
-      {payload.map((p) => (
-        <div key={p.name} className="flex items-center justify-between gap-4">
-          <div className="flex items-center gap-1.5">
-            <div className="w-2 h-2 rounded-full" style={{ background: p.color }} />
-            <span className="text-gray-500 text-xs">{p.name === 'station' ? 'Station' : 'Operator'}</span>
-          </div>
-          <span className="font-bold text-gray-800">{p.value}%</span>
-        </div>
-      ))}
-    </div>
-  )
-}
-
-function UtilisationChart({ stats }: { stats: StationStat[] }) {
-  const isDark = useAppStore(s => s.theme) === 'dark'
-  const gridStroke = isDark ? '#334155' : '#f0f0f0'
-  const tickFill = isDark ? '#94a3b8' : '#666'
-  const cursorFill = isDark ? '#1e293b' : '#f1f5f9'
-  const data = [...stats]
-    .sort((a, b) => b.station_utilization - a.station_utilization)
-    .map((s) => ({
-      name: s.station_name.length > 14 ? s.station_name.slice(0, 13) + '…' : s.station_name,
-      station: parseFloat(s.station_utilization.toFixed(1)),
-      operator: parseFloat(s.operator_utilization.toFixed(1)),
-    }))
-  // Scale chart width with station count so bars/labels stay readable instead
-  // of squeezing to fit a fixed container when there are many stations.
-  const chartWidth = Math.max(600, data.length * 44)
-
-  return (
-    <div className="overflow-x-auto [&::-webkit-scrollbar]:h-1.5 [&::-webkit-scrollbar-thumb]:bg-blue-200 [&::-webkit-scrollbar-thumb]:rounded-full">
-      <BarChart width={chartWidth} height={280} data={data} margin={{ top: 4, right: 16, left: -8, bottom: 30 }}>
-        <CartesianGrid strokeDasharray="3 3" stroke={gridStroke} />
-        <XAxis dataKey="name" tick={{ fontSize: 10, fill: tickFill }} angle={-35} textAnchor="end" interval={0} />
-        <YAxis domain={[0, 100]} tickFormatter={(v) => `${v}%`} tick={{ fontSize: 11, fill: tickFill }} />
-        <Tooltip content={<UtilTooltip />} cursor={{ fill: cursorFill, radius: 4 }} />
-        <Bar dataKey="station" name="station" fill={utilColor(0)} radius={[3, 3, 0, 0]} barSize={14}>
-          {data.map((d, i) => <Cell key={i} fill={utilColor(d.station)} />)}
-        </Bar>
-        <Bar dataKey="operator" name="operator" fill="#93c5fd" radius={[3, 3, 0, 0]} barSize={14} />
-      </BarChart>
-    </div>
-  )
-}
-
-function BottleneckChart({ stats }: { stats: StationStat[] }) {
-  const isDark = useAppStore(s => s.theme) === 'dark'
-  const gridStroke = isDark ? '#334155' : '#f0f0f0'
-  const tickFill = isDark ? '#94a3b8' : '#666'
-  const cursorFill = isDark ? '#1e293b' : '#f1f5f9'
-  const top = [...stats].sort((a, b) => b.station_utilization - a.station_utilization)
-  const data = top.map((s) => ({
-    name: s.station_name.length > 14 ? s.station_name.slice(0, 13) + '…' : s.station_name,
-    util: parseFloat(s.station_utilization.toFixed(1)),
-  }))
-  // Scale chart width with station count so bars/labels stay readable instead
-  // of squeezing to fit a fixed container when there are many stations.
-  const chartWidth = Math.max(600, data.length * 44)
-
-  return (
-    <div className="overflow-x-auto [&::-webkit-scrollbar]:h-1.5 [&::-webkit-scrollbar-thumb]:bg-blue-200 [&::-webkit-scrollbar-thumb]:rounded-full">
-      <BarChart width={chartWidth} height={280} data={data} margin={{ top: 4, right: 16, left: -8, bottom: 30 }}>
-        <CartesianGrid strokeDasharray="3 3" stroke={gridStroke} />
-        <XAxis dataKey="name" tick={{ fontSize: 10, fill: tickFill }} angle={-35} textAnchor="end" interval={0} />
-        <YAxis domain={[0, 100]} tickFormatter={(v) => `${v}%`} tick={{ fontSize: 11, fill: tickFill }} />
-        <Tooltip
-          cursor={{ fill: cursorFill }}
-          content={({ active, payload, label }) => {
-            if (!active || !payload?.length) return null
-            const val = payload[0].value as number | undefined
-            return (
-              <div className="bg-white border border-gray-100 rounded-xl shadow-lg px-4 py-3 text-sm">
-                <p className="font-semibold text-gray-800 mb-1">{label}</p>
-                <div className="flex items-center gap-1.5">
-                  <div className="w-2 h-2 rounded-full" style={{ background: payload[0].color }} />
-                  <span className="text-gray-500 text-xs">Utilization</span>
-                  <span className="font-bold text-gray-800 ml-2">{val ?? 0}%</span>
-                </div>
-              </div>
-            )
-          }}
-        />
-        <Bar dataKey="util" fill={utilColor(0)} radius={[3,3,0,0]} barSize={18}>
-          {data.map((d, i) => <Cell key={i} fill={utilColor(d.util)} />)}
-        </Bar>
-      </BarChart>
-    </div>
-  )
-}
 
 const POPUP_WIDTH = 240
 const POPUP_MARGIN = 12
@@ -3509,7 +2163,7 @@ function StationHealthGrid({ stats }: { stats: StationStat[] }) {
   )
 }
 
-function StationTable({ stats }: { stats: StationStat[] }) {
+function StationTable({ stats, onSelect }: { stats: StationStat[]; onSelect?: (name: string) => void }) {
   const th = (label: string) => (
     <th className="text-left text-xs font-semibold text-gray-400 uppercase tracking-wider py-3 px-4 whitespace-nowrap">
       {label}
@@ -3544,7 +2198,8 @@ function StationTable({ stats }: { stats: StationStat[] }) {
             return (
               <tr
                 key={s.station_name}
-                className={`hover:bg-blue-50/40 transition-colors duration-100 ${idx % 2 === 0 ? 'bg-white' : 'bg-gray-50/40'}`}
+                onClick={() => onSelect?.(s.station_name)}
+                className={`hover:bg-blue-50/40 transition-colors duration-100 ${onSelect ? 'cursor-pointer' : ''} ${idx % 2 === 0 ? 'bg-white' : 'bg-gray-50/40'}`}
               >
                 {/* Station name */}
                 <td className="py-3 px-4">
@@ -3656,290 +2311,35 @@ function WorkerTable({ pools }: { pools: Record<string, WorkerPoolStat> }) {
   )
 }
 
-// ─── Run history sidebar ──────────────────────────────────────────────────────
-
-function RunHistory({
-  scenarioId, activeRunId, onSelect,
-}: {
-  scenarioId: number; activeRunId: number | null; onSelect: (r: RunDetail) => void
-}) {
-  const { data: runs = [] } = useQuery({
-    queryKey: ['runs', scenarioId],
-    queryFn: () => simulationsApi.listRuns(scenarioId),
-    refetchInterval: 3000,
-  })
-
-  const statusDot: Record<string, string> = {
-    completed: 'bg-green-400',
-    running:   'bg-blue-400 animate-pulse',
-    failed:    'bg-red-400',
-    stopped:   'bg-red-400',
-    pending:   'bg-gray-300',
-  }
-
-  return (
-    <div className="space-y-1.5">
-      {runs.map((r) => {
-        const isActive = r.id === activeRunId
-        return (
-          <button
-            key={r.id}
-            onClick={() => {
-              // The history list only carries lightweight KPI fields (no
-              // station_stats/result) — fetch the full run detail so switching
-              // to an older run shows its complete KPIs, station utilization,
-              // and timeline, not just the summary numbers.
-              simulationsApi.getRun(r.id).then(onSelect)
-            }}
-            className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-sm transition-all duration-150 border ${
-              isActive
-                ? 'bg-blue-50 border-blue-300 text-blue-700 shadow-sm shadow-blue-100'
-                : 'bg-white border-gray-100 hover:border-blue-200 hover:bg-blue-50/40 text-gray-600'
-            }`}
-          >
-            <div className="flex items-center gap-2.5">
-              <div className={`w-2 h-2 rounded-full shrink-0 ${statusDot[r.status] ?? 'bg-gray-300'}`} />
-              <div className="text-left">
-                <p className={`text-xs font-semibold ${isActive ? 'text-blue-700' : 'text-gray-700'}`}>
-                  Run #{r.id}
-                </p>
-                <p className={`text-[10px] capitalize ${
-                  r.status === 'completed' ? 'text-green-500' :
-                  r.status === 'running'   ? 'text-blue-400' :
-                  r.status === 'failed'    ? 'text-red-400'  :
-                  r.status === 'stopped'   ? 'text-red-400'  : 'text-gray-400'
-                }`}>{r.status}</p>
-              </div>
-            </div>
-            <ChevronRight className={`h-3 w-3 ${isActive ? 'text-blue-400' : 'text-gray-300'}`} />
-          </button>
-        )
-      })}
-      {runs.length === 0 && (
-        <p className="text-xs text-gray-400 text-center py-4">No runs yet</p>
-      )}
-    </div>
-  )
-}
-
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 type Tab = 'kpis' | 'gantt' | 'jobtrace'
 
+// Overview = the KPI cards and charts, Detect = the job timeline, Trace = the per-job table.
+const TABS: { key: Tab; label: string }[] = [
+  { key: 'kpis', label: 'Overview' },
+  { key: 'gantt', label: 'Detect' },
+  { key: 'jobtrace', label: 'Trace' },
+]
+
 export default function RunDashboard() {
   const navigate = useNavigate()
-  const { activeScenario, activeRun, setActiveRun, setActiveScenario, showToast, justReset, setJustReset } = useAppStore()
-  const [displayRun, setDisplayRun] = useState<RunDetail | null>(activeRun)
-  const [tab, setTab] = useState<Tab>('kpis')
+  const { activeScenario } = useAppStore()
+  const {
+    displayRun, simCfg, setSimCfg, persistSimConfig, progress, isRunning,
+    start, stop, canStop, stopPending,
+  } = useRunSimulation()
+  const [tabState, setTab] = useState<Tab>('kpis')
+  // The left menu: Dashboard is the tabbed Overview page; KPIs and Gantt reuse its views; the rest show one graph.
+  const [graph, setGraph] = useState<GraphKey>('dash')
+  const tab: Tab | 'none' = graph === 'dash' || displayRun?.status !== 'completed' ? tabState : graph === 'kpis' ? 'kpis' : graph === 'gantt' ? 'gantt' : 'none'
+  const series = useRunSeries(displayRun?.result?.completion_log as Record<string, unknown[]> | undefined, displayRun?.station_stats ?? [])
   const [ganttExpanded, setGanttExpanded] = useState(false)
   const [jobTraceExpanded, setJobTraceExpanded] = useState(false)
   const [configOpen, setConfigOpen] = useState(false)
   const [timerOpen, setTimerOpen] = useState(false)
-  const [simCfg, setSimCfg] = useState<SimConfigOverride>({ SIM_TIME: 10080, num_replications: 1 })
-
-  // Load whatever shift hours/working-days/breaks/names were last saved on
-  // THIS scenario (e.g. from a previous Simulation Config session), instead
-  // of always starting from the bare SIM_TIME/num_replications default —
-  // otherwise reopening Simulation Config for a scenario with custom shift
-  // names would show the generic "Shift 1/2/3" until re-typed.
-  useEffect(() => {
-    if (!activeScenario) return
-    setSimCfg(cfg => ({ ...(activeScenario.simulation_config as SimConfigOverride ?? {}), ...cfg, SIM_TIME: cfg.SIM_TIME, num_replications: cfg.num_replications }))
-  }, [activeScenario?.id])
-
-  // Persist shift hours/working-days/breaks/names (and anything else in
-  // Simulation Config) onto the scenario record itself, not just this
-  // session's next-run override — so a rename made here is visible
-  // everywhere the name is shown, including the Canvas Build panel, and
-  // survives a reload/navigation instead of vanishing after one run.
-  const persistSimConfig = async (next: SimConfigOverride) => {
-    setSimCfg(next)
-    if (!activeScenario) return
-    try {
-      const updated = await scenariosApi.update(activeScenario.id, {
-        simulation_config: { ...(activeScenario.simulation_config ?? {}), ...next } as Partial<SimConfig>,
-      })
-      setActiveScenario(updated)
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : 'Failed to save simulation config', 'error')
-    }
-  }
-
-  // Whenever the active scenario changes, load THAT scenario's own latest run
-  // (or clear the display entirely if it has none) — otherwise the previously
-  // viewed scenario's run stays on screen after switching scenarios.
-  //
-  // Skipped while justReset is set: this effect also re-fires on every fresh
-  // mount of this page (not just on an actual scenario switch), since
-  // activeScenario?.id is unchanged but the component itself is new — e.g.
-  // navigating to View Flow and back to /run. Without this guard, Reset's
-  // cleared KPIs would silently get re-populated a few seconds later once
-  // this effect's fetch of "the scenario's latest run" resolved, since Reset
-  // doesn't delete anything server-side — it only clears local state.
-  useEffect(() => {
-    if (justReset) return
-    if (!activeScenario) { setDisplayRun(null); setActiveRun(null); return }
-    let cancelled = false
-    simulationsApi.listRuns(activeScenario.id).then((runs) => {
-      if (cancelled) return
-      if (runs.length === 0) { setDisplayRun(null); setActiveRun(null); return }
-      // listRuns only returns lightweight KPI fields (no station_stats/result)
-      // — fetch the full detail for the latest run so the dashboard shows
-      // complete KPIs, station utilization, and timeline immediately.
-      simulationsApi.getRun(runs[0].id).then((detail) => {
-        if (cancelled) return
-        setDisplayRun(detail)
-        setActiveRun(detail)
-      })
-    })
-    return () => { cancelled = true }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeScenario?.id, justReset])
-
-  const [progress, setProgress] = useState<{ pct: number; msg: string; simTimeNow?: number; simTimeTotal?: number } | null>(null)
-  const [historyCollapsed, setHistoryCollapsed] = useState(false)
-  const [historyWidth, setHistoryWidth] = useState(224) // matches the old fixed w-56
-  const isResizingHistory = useRef(false)
-  const esRef = useRef<EventSource | null>(null)
-  // The run currently being streamed — the Stop button needs this id to
-  // call stopRun(), and there's no other single place holding "the run
-  // that's actively in progress right now" (activeRun/displayRun can also
-  // point at a past, already-finished run selected from history).
-  const runningRunIdRef = useRef<number | null>(null)
-  // Bumped on every Reset click. In-flight async callbacks from a run that
-  // was triggered before Reset (the SSE "done" handler, its onerror poll
-  // retry, and the mutation's safety-net setTimeout below) capture the
-  // token at schedule time and skip their setDisplayRun/setActiveRun calls
-  // if it's gone stale — otherwise Reset only clears state for a moment
-  // before one of these delayed callbacks quietly repopulates it (KPIs
-  // looked reset, but View Flow's run overlay came back once the run's
-  // "done" event or safety-net poll landed after the click).
-  const resetTokenRef = useRef(0)
-
-  // Drag-to-resize the run-history sidebar — mirrors a native panel splitter
-  // instead of the old all-or-nothing collapse toggle. Tracks the delta from
-  // drag-start rather than e.clientX directly, since this sidebar isn't at
-  // the screen's left edge (the app nav sidebar sits to its left).
-  const startHistoryResize = (e: React.MouseEvent) => {
-    isResizingHistory.current = true
-    const startX = e.clientX
-    const startWidth = historyWidth
-    const onMouseMove = (ev: MouseEvent) => {
-      if (!isResizingHistory.current) return
-      const next = Math.min(480, Math.max(160, startWidth + (ev.clientX - startX)))
-      setHistoryWidth(next)
-    }
-    const onMouseUp = () => {
-      isResizingHistory.current = false
-      window.removeEventListener('mousemove', onMouseMove)
-      window.removeEventListener('mouseup', onMouseUp)
-    }
-    window.addEventListener('mousemove', onMouseMove)
-    window.addEventListener('mouseup', onMouseUp)
-  }
-
-  const stopStream = () => {
-    if (esRef.current) { esRef.current.close(); esRef.current = null }
-  }
-
-  const startStream = (runId: number) => {
-    stopStream()
-    runningRunIdRef.current = runId
-    const token = resetTokenRef.current
-    const url = simulationsApi.streamUrl(runId)
-    const es = new EventSource(url)
-    esRef.current = es
-
-    es.onmessage = (e) => {
-      try {
-        const evt = JSON.parse(e.data)
-        if (evt.type === 'progress') {
-          if (token !== resetTokenRef.current) return
-          setProgress({ pct: evt.pct, msg: evt.msg, simTimeNow: evt.sim_time_now, simTimeTotal: evt.sim_time_total })
-        } else if (evt.type === 'done' || evt.type === 'error') {
-          runningRunIdRef.current = null
-          if (token !== resetTokenRef.current) { stopStream(); return }
-          setProgress(null)
-          stopStream()
-          // Fetch final run detail
-          simulationsApi.getRun(runId).then((detail) => {
-            if (token !== resetTokenRef.current) return
-            setDisplayRun(detail)
-            setActiveRun(detail)
-            showToast(
-              detail.status === 'completed'
-                ? `Run #${runId} completed — ${detail.completed_jobs} jobs`
-                : `Run #${runId} failed`,
-              detail.status === 'completed' ? 'success' : 'error'
-            )
-          })
-        }
-      } catch { /* ignore */ }
-    }
-
-    es.onerror = () => {
-      // SSE closed or server gone; fallback: poll once
-      stopStream()
-      if (token !== resetTokenRef.current) return
-      simulationsApi.getRun(runId).then((detail) => {
-        if (token !== resetTokenRef.current) return
-        // Whatever the run's actual status, the live stream is gone — never
-        // leave the "Queued…" banner stuck on screen after this point. A
-        // fast-completing run can finish (and its progress_store entry get
-        // cleaned up) before the EventSource even finishes connecting, so
-        // "running" here just means "poll again shortly", not "keep waiting".
-        setProgress(null)
-        setDisplayRun(detail)
-        setActiveRun(detail)
-        if (detail.status === 'running') {
-          setTimeout(() => startStream(runId), 500)
-        }
-      })
-    }
-  }
-
-  const triggerMutation = useMutation({
-    // Accepts an explicit config override so callers that just updated
-    // simCfg (e.g. "Apply & Run" in the Simulation Timer) can pass the new
-    // value directly, instead of racing React's async state update by
-    // reading simCfg from closure right after calling its setter.
-    mutationFn: (overrideCfg?: SimConfigOverride) => simulationsApi.triggerRun(activeScenario!.id, overrideCfg ?? simCfg),
-    onSuccess: (data) => {
-      showToast('Simulation started')
-      setProgress({ pct: 0, msg: 'Queued…' })
-      setJustReset(false)
-      startStream(data.id)
-      const token = resetTokenRef.current
-      // Safety net: a small/fast scenario can finish (and its progress_store
-      // entry get cleaned up) before the EventSource even finishes
-      // connecting, so the "done" SSE event is never seen and the banner
-      // gets stuck at "Queued…" forever. Back this up with a direct poll —
-      // if the run is already done by the time this fires, clear the
-      // banner and show the result even if SSE missed it.
-      setTimeout(() => {
-        if (token !== resetTokenRef.current) return
-        simulationsApi.getRun(data.id).then((detail) => {
-          if (token !== resetTokenRef.current) return
-          if (detail.status !== 'running' && detail.status !== 'pending') {
-            stopStream()
-            setProgress(null)
-            setDisplayRun(detail)
-            setActiveRun(detail)
-          }
-        })
-      }, 1500)
-    },
-    onError: (err: Error) => showToast(err.message, 'error'),
-  })
-
-  const stopMutation = useMutation({
-    mutationFn: (runId: number) => simulationsApi.stopRun(runId),
-    onSuccess: () => showToast('Stop requested — finishing current step…'),
-    onError: (err: Error) => showToast(err.message, 'error'),
-  })
-
-  useEffect(() => { return stopStream }, [])
-
+  const [drawerStation, setDrawerStation] = useState<string | null>(null)
+  const [dataTable, setDataTable] = useState<DataTableProps | null>(null)
   if (!activeScenario) {
     return (
       <div className="min-h-full p-8">
@@ -3973,7 +2373,6 @@ export default function RunDashboard() {
     const t = activeScenario.stations_data[s.station_name]?.['Station Type']
     return t !== 'Source' && t !== 'Drain'
   })
-  const isRunning = !!progress || triggerMutation.isPending
 
   // KPIs — all pre-calculated by backend
   const simTime = displayRun?.simulation_time ?? 0
@@ -3994,8 +2393,16 @@ export default function RunDashboard() {
   const totalRework = displayRun?.kpi_avg_rework_pct ?? 0
   const simDays = displayRun?.kpi_sim_days?.toFixed(1) ?? '0.0'
 
+  const utilizationCards = (
+    <StationLanes
+      stats={stats}
+      onData={setDataTable}
+    />
+  )
+
   return (
     <>
+      <TipHost />
       <SimConfigDialog
         open={configOpen}
         value={simCfg}
@@ -4009,91 +2416,31 @@ export default function RunDashboard() {
         onChange={setSimCfg}
         onClose={() => setTimerOpen(false)}
         progress={progress}
-        onRun={(cfg) => triggerMutation.mutate(cfg)}
+        onRun={(cfg) => start(cfg)}
         isRunning={isRunning}
         completionLog={displayRun?.result?.completion_log as Record<string, unknown[]> | undefined}
       />
 
+      <Drawer open={drawerStation !== null} onClose={() => setDrawerStation(null)} title={drawerStation ?? ''} eyebrow="Station">
+        {drawerStation && (
+          <StationDrawer
+            stat={stats.find((x) => x.station_name === drawerStation)}
+            states={(displayRun?.result?.station_states as Record<string, StationStateStat> | undefined)?.[drawerStation]}
+          />
+        )}
+      </Drawer>
+      <Drawer open={dataTable !== null} onClose={() => setDataTable(null)} title={dataTable?.title ?? ''} eyebrow="Data">
+        {dataTable && <DataTable {...dataTable} />}
+      </Drawer>
+
       <div className="flex h-full">
-        {/* Sidebar */}
-        <aside
-          className={`no-print relative border-r border-gray-100 bg-white flex flex-col shadow-sm ${historyCollapsed ? 'w-10' : ''}`}
-          style={historyCollapsed ? undefined : { width: historyWidth }}
-        >
-          {/* Collapse toggle */}
-          <button
-            onClick={() => setHistoryCollapsed(c => !c)}
-            className="group/toggle absolute -right-3 top-5 w-6 h-6 rounded-full bg-white border border-gray-200 shadow-sm flex items-center justify-center hover:bg-gray-50 transition-colors z-30"
-          >
-            {historyCollapsed
-              ? <ChevronRight className="h-3 w-3 text-gray-500" />
-              : <ChevronLeft className="h-3 w-3 text-gray-500" />
-            }
-            <span className="pointer-events-none absolute left-full ml-2 whitespace-nowrap rounded-lg bg-white text-gray-700 text-xs font-medium px-3 py-2 shadow-lg border border-gray-100 opacity-0 scale-95 origin-left transition-all duration-150 group-hover/toggle:opacity-100 group-hover/toggle:scale-100 z-30">
-              {historyCollapsed ? 'Expand run history' : 'Collapse run history'}
-            </span>
-          </button>
-
-          {/* Drag-to-resize handle — starts below the collapse button so the
-              two controls never share a hit-area. */}
-          {!historyCollapsed && (
-            <div
-              onMouseDown={startHistoryResize}
-              draggable={false}
-              className="absolute -right-1.5 top-12 bottom-0 w-3 cursor-col-resize z-20 select-none flex justify-center group/handle"
-            >
-              <div className="w-1 h-10 mt-4 rounded-full bg-gray-200 group-hover/handle:bg-blue-300 transition-colors" />
-              <span className="pointer-events-none absolute left-full ml-2 top-4 whitespace-nowrap rounded-lg bg-white text-gray-700 text-xs font-medium px-3 py-2 shadow-lg border border-gray-100 opacity-0 scale-95 origin-left transition-all duration-150 group-hover/handle:opacity-100 group-hover/handle:scale-100 z-30">
-                Drag to resize
-              </span>
-            </div>
-          )}
-
-          {!historyCollapsed && (<>
-            {/* Header */}
-            <div className="px-4 pt-5 pb-3 border-b border-gray-100">
-              <p className="text-xs font-bold text-gray-500 uppercase tracking-widest">What If</p>
-            </div>
-
-            {/* Runs list */}
-            <div className="flex-1 overflow-auto p-3 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-gray-50 [&::-webkit-scrollbar-thumb]:bg-blue-200 [&::-webkit-scrollbar-thumb]:rounded-full hover:[&::-webkit-scrollbar-thumb]:bg-blue-300">
-              <RunHistory
-                scenarioId={activeScenario.id}
-                activeRunId={displayRun?.id ?? null}
-                onSelect={(r) => {
-                  // Switching to a different run (e.g. an older completed one)
-                  // must never leave a previous run's "Queued…" banner or SSE
-                  // connection alive on screen.
-                  stopStream()
-                  setProgress(null)
-                  setDisplayRun(r)
-                  setActiveRun(r)
-                  setJustReset(false)
-                }}
-              />
-            </div>
-
-            {/* Legend */}
-            <div className="p-4 border-t border-gray-100 space-y-2">
-              <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-widest mb-2">Legend</p>
-              {[
-                { color: 'bg-green-400', label: 'Healthy (40–69%)' },
-                { color: 'bg-amber-400', label: 'High load (70–84%)' },
-                { color: 'bg-red-400',   label: 'Bottleneck (≥85%)' },
-              ].map(({ color, label }) => (
-                <div key={label} className="flex items-center gap-2">
-                  <div className={`w-2 h-2 rounded-full ${color}`} />
-                  <span className="text-xs text-gray-500">{label}</span>
-                </div>
-              ))}
-            </div>
-          </>)}
-        </aside>
+        <GraphMenu value={graph} onChange={setGraph} />
 
         {/* Main */}
-        <div className="print-main flex-1 min-w-0 p-6 overflow-auto bg-gradient-to-br from-white via-blue-50/30 to-indigo-50/40">
+        <div className="print-main flex-1 min-w-0 p-6 overflow-auto">
           {/* Header */}
           <div className="print:hidden flex items-center justify-between flex-wrap gap-3 mb-5 max-w-full">
+            <div className="flex min-w-0 flex-wrap items-center gap-x-5 gap-y-2">
             <div className="min-w-0 shrink-0">
               <h1 className="text-xl font-bold text-gray-900">{activeScenario.name}</h1>
               <p className="text-sm text-gray-400 mt-0.5">
@@ -4105,37 +2452,22 @@ export default function RunDashboard() {
                 {displayRun?.num_replications && displayRun.num_replications > 1 ? ` · ${displayRun.num_replications} reps` : ''}
               </p>
             </div>
+            {displayRun?.status === 'completed' && (
+              <div className="flex gap-0.5 rounded-xl bg-ls-line p-[3px]">
+                {TABS.map((t) => (
+                  <button
+                    key={t.key}
+                    onClick={() => { setTab(t.key); setGraph('dash') }}
+                    className={`h-[34px] rounded-[9px] px-3.5 text-[13px] transition-colors ${tab === t.key ? 'bg-ls-card font-semibold text-ls-ink shadow-sm' : 'font-medium text-ls-ink2 hover:text-ls-ink'}`}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+            )}
+            </div>
             <div className="flex gap-2 flex-wrap justify-end">
-              <Button variant="outline" size="sm" onClick={() => setConfigOpen(true)}>
-                <Settings className="h-4 w-4 mr-1.5" />
-                Config
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => setTimerOpen(true)}>
-                <Clock className="h-4 w-4 mr-1.5" />
-                Simulation Timer
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                title="Clear the run — KPIs go to 0 and View Flow opens a blank Build canvas"
-                onClick={() => {
-                  resetTokenRef.current += 1
-                  stopStream()
-                  setProgress(null)
-                  setDisplayRun(null)
-                  setActiveRun(null)
-                  setJustReset(true)
-                  setSimCfg({ SIM_TIME: 10080, num_replications: 1 })
-                  showToast('Reset — showing no run')
-                }}
-              >
-                <RefreshCw className="h-4 w-4 mr-1.5" />
-                Reset
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => navigate('/canvas')}>
-                <BarChart2 className="h-4 w-4 mr-1.5" />
-                View Flow
-              </Button>
+              <SimSettingsMenu small onConfig={() => setConfigOpen(true)} onTimer={() => setTimerOpen(true)} />
               {displayRun?.status === 'completed' && (
                 <Button variant="outline" size="sm" onClick={() => window.print()}>
                   <Printer className="h-4 w-4 mr-1.5" />
@@ -4146,19 +2478,16 @@ export default function RunDashboard() {
                 <Button
                   size="sm"
                   variant="outline"
-                  onClick={() => {
-                    const runId = runningRunIdRef.current ?? displayRun?.id
-                    if (runId != null) stopMutation.mutate(runId)
-                  }}
-                  disabled={stopMutation.isPending || (runningRunIdRef.current == null && displayRun?.id == null)}
+                  onClick={stop}
+                  disabled={stopPending || !canStop}
                   className="border-red-200 text-red-600 hover:bg-red-50 rounded-lg"
                   title="Stop this run at its next checkpoint — partial results up to that point are kept"
                 >
                   <Square className="h-4 w-4 mr-1.5" />
-                  {stopMutation.isPending ? 'Stopping…' : 'Stop'}
+                  {stopPending ? 'Stopping…' : 'Stop'}
                 </Button>
               )}
-              <Button size="sm" onClick={() => triggerMutation.mutate()} disabled={isRunning} className="bg-blue-600 hover:bg-blue-700 rounded-lg shadow-sm">
+              <Button size="sm" onClick={() => start()} disabled={isRunning}>
                 {isRunning ? (
                   <><RefreshCw className="h-4 w-4 mr-1.5 animate-spin" />Running…</>
                 ) : (
@@ -4201,30 +2530,10 @@ export default function RunDashboard() {
                 {displayRun.status === 'failed' && <AlertTriangle className="h-4 w-4 text-red-500" />}
                 <span className="text-sm text-gray-400">Run #{displayRun.id}</span>
               </div>
-              {displayRun.status === 'completed' && (
-                <div className="flex rounded-lg border border-gray-200 overflow-hidden">
-                  <button
-                    onClick={() => setTab('kpis')}
-                    className={`px-4 py-1.5 text-sm font-medium transition-colors ${tab === 'kpis' ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}
-                  >
-                    <Layers className="h-3.5 w-3.5 inline mr-1" />KPIs
-                  </button>
-                  <button
-                    onClick={() => setTab('gantt')}
-                    className={`px-4 py-1.5 text-sm font-medium transition-colors ${tab === 'gantt' ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}
-                  >
-                    <CalendarDays className="h-3.5 w-3.5 inline mr-1" />Timeline
-                  </button>
-                  <button
-                    onClick={() => setTab('jobtrace')}
-                    className={`px-4 py-1.5 text-sm font-medium transition-colors ${tab === 'jobtrace' ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}
-                  >
-                    <List className="h-3.5 w-3.5 inline mr-1" />Job Trace
-                  </button>
-                </div>
-              )}
             </div>
           )}
+
+          {displayRun?.status === 'completed' && tab === 'kpis' && graph === 'dash' && <SectionNav />}
 
           {/* KPI cards — shown on the KPIs tab, same as before the tabs
               existed, so selecting Timeline/Job Trace replaces them entirely
@@ -4236,6 +2545,7 @@ export default function RunDashboard() {
               `tab`, rather than a blank area with nothing in it. */}
           {(!displayRun || tab === 'kpis') && (
             <>
+              {displayRun?.status === 'completed' && <SectionHeading id="sec-measures" title="All measures" note="Click a card for the numbers behind it" first />}
               {runWarnings.length > 0 && (
                 <div className="mb-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3">
                   <p className="text-xs font-bold text-amber-800 mb-1">Warning{runWarnings.length > 1 ? 's' : ''}</p>
@@ -4243,13 +2553,13 @@ export default function RunDashboard() {
                 </div>
               )}
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3 auto-rows-fr">
-                <CompletedJobsCard completed={completedJobs} inProgress={inProgressJobs} scrapped={scrappedJobs} stats={stats} />
-                <ThroughputCard value={`${throughput} /hr`} sub="jobs per hour" stats={stats} />
+                <CompletedJobsCard completed={completedJobs} inProgress={inProgressJobs} scrapped={scrappedJobs} stats={stats} spark={series?.rows.map((r) => r.cum as number)} />
+                <ThroughputCard value={`${throughput} /hr`} sub="jobs per hour" stats={stats} spark={series?.rows.map((r) => r.done as number)} />
                 <SimDurationCard simDays={simDays} simTime={simTime} simCfg={simCfg} />
-                <PeakUtilCard peakUtil={peakUtil} bottleneck={bottleneck} stats={stats} />
+                <PeakUtilCard peakUtil={peakUtil} bottleneck={bottleneck} stats={stats} spark={displayRun?.kpi_bottleneck_station ? series?.rows.map((r) => (r[displayRun.kpi_bottleneck_station as string] as number) ?? 0) : undefined} />
               </div>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6 auto-rows-fr">
-                <AvgUtilCard avgUtil={avgUtil} stats={stats} />
+                <AvgUtilCard avgUtil={avgUtil} stats={stats} spark={series?.rows.map((r) => r.avg as number)} />
                 <BottleneckCard bottleneck={bottleneck} stats={stats} />
                 <AtRiskCard count={atRisk} stats={stats} />
                 <TotalFailuresCard total={totalFailures} rework={totalRework} stats={stats} />
@@ -4267,6 +2577,19 @@ export default function RunDashboard() {
             </>
           )}
 
+          {displayRun?.status === 'completed' && !['dash', 'kpis', 'gantt'].includes(graph) && (
+            <>
+              <SectionHeading id="graph-view" title={GRAPHS.find((g) => g.key === graph)!.label} note={GRAPHS.find((g) => g.key === graph)!.sub} first />
+              {graph === 'bar' && utilizationCards}
+              {graph === 'stacked' && <StateCharts only="stacked" result={displayRun.result} stats={stats} onStation={setDrawerStation} onData={setDataTable} />}
+              {graph === 'pie' && <StateCharts only="pie" result={displayRun.result} stats={stats} onStation={setDrawerStation} onData={setDataTable} />}
+              {graph === 'line' && <RunTimeline only="line" data={series} onData={setDataTable} />}
+              {graph === 'area' && <RunTimeline only="area" data={series} onData={setDataTable} />}
+              {graph === 'hist' && <LeadTimeHistogram completionLog={displayRun.result?.completion_log as Record<string, unknown[]> | undefined} onData={setDataTable} />}
+              {graph === 'heat' && <ShiftHeatmap completionLog={displayRun.result?.completion_log as Record<string, unknown[]> | undefined} onData={setDataTable} />}
+            </>
+          )}
+
           {displayRun && (
             <div className="relative">
               {displayRun.status === 'failed' && (
@@ -4279,9 +2602,11 @@ export default function RunDashboard() {
 
               {displayRun.status === 'completed' && (
                 <>
-                  {tab === 'kpis' && (
+                  {tab === 'kpis' && graph === 'dash' && (
                     <>
                       {Object.keys(activeScenario.variant_intervals ?? {}).length > 0 && (
+                        <>
+                        <SectionHeading id="sec-arrivals" title="Job arrivals" note="How the scenario feeds jobs in" />
                         <Card className="mb-5">
                           <CardHeader className="pb-2">
                             <CardTitle className="text-sm font-semibold text-gray-700">Job Arrival Schedule</CardTitle>
@@ -4292,14 +2617,14 @@ export default function RunDashboard() {
                               {Object.entries(activeScenario.variant_quantities ?? {}).map(([variant, qty]) => {
                                 const interval = activeScenario.variant_intervals?.[variant]
                                 return (
-                                  <div key={variant} className="flex items-center gap-3 px-4 py-3 rounded-xl border border-gray-100 bg-gradient-to-br from-violet-50/60 to-purple-50/40 min-w-[180px]">
-                                    <div className="p-2 rounded-lg bg-violet-100 shrink-0">
-                                      <CalendarDays className="h-4 w-4 text-violet-500" />
+                                  <div key={variant} className="flex items-center gap-3 px-4 py-3 rounded-xl border border-gray-100 bg-ls-soft min-w-[180px]">
+                                    <div className="p-2 rounded-lg bg-ls-chip shrink-0">
+                                      <CalendarDays className="h-4 w-4 text-ls-purple" />
                                     </div>
                                     <div className="min-w-0">
                                       <p className="text-sm font-semibold text-gray-800 truncate">{variant}</p>
                                       <p className="text-xs text-gray-400 mt-0.5">{qty} jobs</p>
-                                      <p className="text-xs font-bold mt-0.5" style={{ color: interval ? '#7c3aed' : '#9ca3af' }}>
+                                      <p className="text-xs font-bold mt-0.5" style={{ color: interval ? 'var(--ls-purple)' : 'var(--ls-mute)' }}>
                                         {interval ? `every ${interval} min` : 'all at once'}
                                       </p>
                                     </div>
@@ -4309,10 +2634,12 @@ export default function RunDashboard() {
                             </div>
                           </CardContent>
                         </Card>
+                        </>
                       )}
 
                       {stats.length > 0 && (
                         <>
+                          <SectionHeading id="sec-stations" title="Stations" note="How each station did" />
                           <Card className="mb-5">
                             <CardHeader className="pb-2">
                               <CardTitle className="text-sm font-semibold text-gray-700">Station Health Overview</CardTitle>
@@ -4322,41 +2649,13 @@ export default function RunDashboard() {
                             </CardContent>
                           </Card>
 
-                          <div className="flex flex-col gap-5 mb-5">
-                            <Card>
-                              <CardHeader className="pb-2">
-                                <div className="flex items-center justify-between">
-                                  <CardTitle className="text-sm font-semibold text-gray-700">Station & Operator Utilization</CardTitle>
-                                  <div className="flex items-center gap-3 text-xs text-gray-400">
-                                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-sm inline-block bg-green-400" /> Station</span>
-                                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-sm inline-block bg-blue-200" /> Operator</span>
-                                  </div>
-                                </div>
-                              </CardHeader>
-                              <CardContent>
-                                <UtilisationChart stats={stats} />
-                              </CardContent>
-                            </Card>
-                            <Card>
-                              <CardHeader className="pb-4">
-                                <div className="flex items-center justify-between">
-                                  <CardTitle className="text-sm font-semibold text-gray-700">Top Bottlenecks</CardTitle>
-                                  <span className="text-xs text-gray-400">Sorted by utilization</span>
-                                </div>
-                              </CardHeader>
-                              <CardContent>
-                                <BottleneckChart stats={stats} />
-                              </CardContent>
-                            </Card>
-                          </div>
-
                           <Card>
                             <CardHeader className="pb-2">
                               <div className="flex items-center justify-between">
                                 <CardTitle className="text-sm font-semibold text-gray-700">Station Details</CardTitle>
                                 <button
-                                  onClick={() => navigate('/insights')}
-                                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-xs font-semibold shadow-sm hover:shadow-blue-200 hover:shadow-md transition-all"
+                                  onClick={() => navigate('/interfaces')}
+                                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-ls-dark text-ls-card text-xs font-semibold shadow-sm hover:opacity-90 transition-all"
                                 >
                                   <Lightbulb className="h-3 w-3" />
                                   AI Insights
@@ -4364,7 +2663,7 @@ export default function RunDashboard() {
                               </div>
                             </CardHeader>
                             <CardContent>
-                              <StationTable stats={stats} />
+                              <StationTable stats={stats} onSelect={setDrawerStation} />
                             </CardContent>
                           </Card>
 
@@ -4382,9 +2681,34 @@ export default function RunDashboard() {
                               </CardContent>
                             </Card>
                           )}
+                          <SectionHeading id="sec-output" title="Output over time" note="From the run's own job log" />
+                          <RunTimeline
+                            data={series}
+                            onData={setDataTable}
+                          />
+
+                          <SectionHeading id="sec-utilization" title="Utilization" note="How busy stations and operators were" />
+                          {utilizationCards}
+
+                          <StationThroughput stats={stats} bottleneck={displayRun.kpi_bottleneck_station ?? null} lineOutput={displayRun.kpi_throughput ?? null} />
+
+                          <SectionHeading id="sec-time" title="Time and delay" note="Where the time went" />
+                          <StateCharts result={displayRun.result} stats={stats} onStation={setDrawerStation} onData={setDataTable} />
+
+                          <ShiftHeatmap completionLog={displayRun.result?.completion_log as Record<string, unknown[]> | undefined} onData={setDataTable} />
+
                         </>
                       )}
                     </>
+                  )}
+
+                  {tab === 'gantt' && (
+                    <BottleneckPanel
+                      bottleneck={bottleneck}
+                      result={displayRun.result}
+                      order={(Object.values(activeScenario.processflow_data ?? {})[0] ?? []).flatMap((st) => (typeof st.resource === 'string' ? [st.resource] : st.resource?.options ?? []))}
+                      repairMin={bottleneck ? (activeScenario.stations_data[bottleneck.station_name]?.['Repair Time'] as number | undefined) : undefined}
+                    />
                   )}
 
                   {tab === 'gantt' && (
@@ -4402,11 +2726,21 @@ export default function RunDashboard() {
                       </CardHeader>
                       <CardContent>
                         <GanttTimeline result={displayRun.result ?? {}} simTime={displayRun.simulation_time} isExpanded={ganttExpanded} onExpandToggle={() => setGanttExpanded(e => !e)} />
+                        <ChartKey
+                          colors={[
+                            { color: 'var(--ls-ok)', label: 'Processing', note: 'a job being worked on' },
+                            { color: 'var(--ls-warn)', label: 'Waiting', note: 'a job waiting for this station' },
+                          ]}
+                          x="Simulation time, in minutes from the start of the run"
+                          y="Stations; each bar is one job's visit"
+                          measure="Each block runs from when a job reached the station to when it left, split into waiting and processing."
+                        />
                       </CardContent>
                     </Card>
                   )}
 
                   {tab === 'jobtrace' && (
+                    <>
                     <Card>
                       <CardHeader className="pb-2">
                         <div className="flex items-center justify-between">
@@ -4427,6 +2761,7 @@ export default function RunDashboard() {
                         />
                       </CardContent>
                     </Card>
+                    </>
                   )}
                 </>
               )}

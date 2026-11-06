@@ -1,114 +1,96 @@
+import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import {
-  AlertTriangle, TrendingUp, Shield, Zap, BarChart2, Clock, Lightbulb, Play,
-} from 'lucide-react'
+import { AlertTriangle, ChevronDown, Clock, Lightbulb, Play } from 'lucide-react'
 import { insightsApi } from '@/api/insights'
 import { useAppStore } from '@/store/useAppStore'
 import { Button } from '@/components/ui/button'
-import { cn, priorityColor } from '@/lib/utils'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { cn } from '@/lib/utils'
 import type { InsightItem } from '@/types'
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// Interfaces & AI: what the run's analysis suggests (ranked, expandable). The suggestions
+// are the engine's own insights for the run on screen.
 
-const SECTION_META: Record<string, { icon: React.ElementType; label: string; color: string }> = {
-  strategic_recommendations: { icon: TrendingUp, label: 'Strategic',      color: 'text-purple-600 bg-purple-50 border-purple-100' },
-  operational_insights:      { icon: BarChart2,  label: 'Operational',    color: 'text-blue-600 bg-blue-50 border-blue-100' },
-  predictive_analysis:       { icon: Clock,      label: 'Predictive',     color: 'text-amber-600 bg-amber-50 border-amber-100' },
-  optimization_opportunities:{ icon: Zap,        label: 'Optimisation',   color: 'text-green-600 bg-green-50 border-green-100' },
-  risk_assessment:           { icon: Shield,     label: 'Risk Assessment', color: 'text-red-600 bg-red-50 border-red-100' },
+const CATEGORIES = [
+  { key: 'strategic_recommendations', label: 'Strategic', pill: 'bg-ls-accent-soft text-ls-accent-ink' },
+  { key: 'operational_insights', label: 'Operational', pill: 'bg-ls-chip text-ls-ink2' },
+  { key: 'predictive_analysis', label: 'Predictive', pill: 'bg-ls-idle-t text-ls-idle-i' },
+  { key: 'optimization_opportunities', label: 'Optimisation', pill: 'bg-ls-ok-t text-ls-ok-i' },
+  { key: 'risk_assessment', label: 'Risk', pill: 'bg-ls-crim-t text-ls-crim' },
+] as const
+
+const PRIORITY_PILL: Record<string, string> = {
+  high: 'bg-ls-bad-t text-ls-bad-i',
+  medium: 'bg-ls-warn-t text-ls-warn-i',
+  low: 'bg-ls-idle-t text-ls-idle-i',
 }
+const PRIORITY_RANK: Record<string, number> = { high: 0, medium: 1, low: 2 }
 
-const PRIORITY_BORDER: Record<string, string> = {
-  high:   'border-l-red-500',
-  medium: 'border-l-amber-400',
-  low:    'border-l-blue-400',
-}
+interface Ranked extends InsightItem { cat: (typeof CATEGORIES)[number]; id: string }
 
-function InsightCard({ item }: { item: InsightItem }) {
-  const borderColor = PRIORITY_BORDER[item.priority] ?? 'border-l-blue-400'
+function EmptyState({ icon: Icon, title, text, action }: { icon: React.ComponentType<{ className?: string }>; title: string; text: string; action?: React.ReactNode }) {
   return (
-    <div className={cn(
-      'bg-white rounded-2xl border border-gray-100 border-l-4 shadow-sm hover:shadow-md transition-all duration-200 p-5',
-      borderColor
-    )}>
-      {/* Title + priority badge */}
-      <div className="flex items-start justify-between gap-3 mb-2">
-        <h3 className="text-sm font-semibold text-gray-900 leading-snug">{item.title}</h3>
-        <span className={cn('text-xs font-semibold px-2.5 py-0.5 rounded-full shrink-0', priorityColor(item.priority))}>
-          {item.priority}
-        </span>
-      </div>
-
-      {/* Insight text */}
-      <p className="text-sm text-gray-500 mb-3">{item.insight}</p>
-
-      {/* Recommendation box */}
-      <div className="bg-blue-50 rounded-xl p-3 mb-4 border border-blue-100">
-        <div className="flex items-start gap-2">
-          <Lightbulb className="h-4 w-4 text-blue-500 mt-0.5 shrink-0" />
-          <p className="text-sm text-blue-700 font-medium">{item.recommendation}</p>
-        </div>
-      </div>
-
-      {/* Footer metadata */}
-      <div className="flex items-center justify-between text-xs text-gray-400 pt-3 border-t border-gray-100">
-        <div className="flex items-center gap-1">
-          <AlertTriangle className="h-3 w-3" />
-          {item.impact}
-        </div>
-        <div className="flex items-center gap-1">
-          <Clock className="h-3 w-3" />
-          {item.timeframe}
-        </div>
-        <div className="font-medium text-gray-500">
-          {Math.round(item.confidence * 100)}% confidence
-        </div>
-      </div>
-    </div>
+    <Card>
+      <CardContent className="flex flex-col items-center gap-3 py-20 text-center">
+        <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-ls-accent-soft"><Icon className="h-8 w-8 text-ls-accent" /></div>
+        <p className="text-lg font-semibold text-ls-ink">{title}</p>
+        <p className="text-sm text-ls-mute">{text}</p>
+        {action}
+      </CardContent>
+    </Card>
   )
 }
 
-function SectionPanel({
-  title,
-  icon: Icon,
-  color,
-  items,
-}: {
-  title: string
-  icon: React.ElementType
-  color: string
-  items: InsightItem[]
-}) {
-  if (items.length === 0) return null
-  const [textColor, bgColor, borderColor] = color.split(' ')
+function InsightRow({ item, rank, reviewed, onReview }: { item: Ranked; rank: number; reviewed: boolean; onReview: () => void }) {
+  const [open, setOpen] = useState(false)
   return (
-    <div className="mb-10">
-      {/* Section header */}
-      <div className="flex items-center gap-3 mb-4">
-        <div className={cn('w-8 h-8 rounded-lg flex items-center justify-center border', bgColor, borderColor)}>
-          <Icon className={cn('h-4 w-4', textColor)} />
-        </div>
-        <h2 className="text-base font-semibold text-gray-800">{title}</h2>
-        <span className={cn('text-xs font-semibold px-2.5 py-0.5 rounded-full border', bgColor, textColor, borderColor)}>
-          {items.length}
-        </span>
-      </div>
+    <Card className={cn('mb-2.5 transition-opacity', reviewed && 'opacity-60')}>
+      <CardContent className="p-4">
+        <button onClick={() => setOpen((o) => !o)} className="flex w-full items-start gap-3 text-left">
+          <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-ls-chip font-display text-xs font-bold text-ls-ink2">{rank}</span>
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <b className="font-display text-sm text-ls-ink">{item.title}</b>
+              <span className={cn('rounded-full px-2.5 py-0.5 text-[11.5px] font-semibold', item.cat.pill)}>{item.cat.label}</span>
+              <span className={cn('rounded-full px-2.5 py-0.5 text-[11.5px] font-semibold capitalize', PRIORITY_PILL[item.priority] ?? PRIORITY_PILL.low)}>{item.priority}</span>
+              {reviewed && <span className="rounded-full bg-ls-chip px-2.5 py-0.5 text-[11.5px] font-semibold text-ls-ink2">Reviewed</span>}
+            </div>
+            <p className="mt-1 text-xs leading-relaxed text-ls-ink2">{item.insight}</p>
+          </div>
+          <div className="shrink-0 text-right">
+            <p className="max-w-[160px] text-xs font-semibold text-ls-ok-i">{item.impact}</p>
+            <p className="text-[11px] text-ls-mute">{Math.round(item.confidence * 100)}% confidence</p>
+          </div>
+          <ChevronDown className={cn('mt-1 h-4 w-4 shrink-0 text-ls-mute transition-transform', open && 'rotate-180')} />
+        </button>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {items.map((item, i) => (
-          <InsightCard key={i} item={item} />
-        ))}
-      </div>
-    </div>
+        {open && (
+          <div className="mt-3 border-t border-ls-line pt-3">
+            <p className="mb-1 text-[11px] font-bold uppercase tracking-wide text-ls-mute">Suggested change</p>
+            <div className="mb-3 flex items-start gap-2 rounded-xl bg-ls-accent-soft p-3">
+              <Lightbulb className="mt-0.5 h-4 w-4 shrink-0 text-ls-accent" />
+              <p className="text-sm font-medium text-ls-accent-ink">{item.recommendation}</p>
+            </div>
+            <div className="mb-3 flex flex-wrap gap-x-6 gap-y-1 text-xs text-ls-mute">
+              <span className="flex items-center gap-1"><Clock className="h-3 w-3" />{item.timeframe}</span>
+              <span className="flex items-center gap-1"><AlertTriangle className="h-3 w-3" />{item.impact}</span>
+            </div>
+            <div className="flex gap-2">
+              <Button size="sm" variant="outline" onClick={onReview}>{reviewed ? 'Mark unreviewed' : 'Mark reviewed'}</Button>
+            </div>
+          </div>
+        )}
+      </CardContent>
+    </Card>
   )
 }
-
-// ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function Insights() {
   const navigate = useNavigate()
   const { activeRun, activeScenario } = useAppStore()
+  const [filter, setFilter] = useState<string>('all')
+  const [reviewed, setReviewed] = useState<Set<string>>(new Set())
 
   const { data, isLoading, error } = useQuery({
     queryKey: ['insights', activeRun?.id],
@@ -116,110 +98,102 @@ export default function Insights() {
     enabled: !!activeRun && activeRun.status === 'completed',
   })
 
+  // Every insight in one list, most important first (priority, then confidence).
+  const ranked: Ranked[] = useMemo(() => {
+    if (!data) return []
+    const all = CATEGORIES.flatMap((cat) =>
+      ((data.insights[cat.key] as InsightItem[] | undefined) ?? []).map((it, i) => ({ ...it, cat, id: `${cat.key}-${i}` })),
+    )
+    return all.sort((a, b) => (PRIORITY_RANK[a.priority] ?? 3) - (PRIORITY_RANK[b.priority] ?? 3) || b.confidence - a.confidence)
+  }, [data])
+
+  const shown = filter === 'all' ? ranked : ranked.filter((r) => r.cat.key === filter)
+  const toggleReviewed = (id: string) => setReviewed((s) => { const n = new Set(s); if (n.has(id)) n.delete(id); else n.add(id); return n })
+
+  let body: React.ReactNode
   if (!activeRun) {
-    return (
-      <div className="min-h-full p-8">
-        <div className="max-w-5xl mx-auto">
-          <div className="rounded-2xl border border-gray-100 bg-white/70 py-32 flex flex-col items-center gap-4">
-            <div className="w-16 h-16 bg-blue-50 rounded-2xl flex items-center justify-center">
-              <Lightbulb className="h-8 w-8 text-blue-400" />
-            </div>
-            <p className="text-gray-700 font-semibold text-lg">No run selected</p>
-            <p className="text-sm text-gray-400">Run a simulation first to see AI insights.</p>
-            <Button onClick={() => navigate('/run')} className="bg-blue-600 hover:bg-blue-700 shadow-sm mt-2">
-              <Play className="h-4 w-4 mr-2" />
-              Go to Run Dashboard
-            </Button>
-          </div>
+    body = (
+      <EmptyState icon={Lightbulb} title="No run selected" text="Run a simulation first to see AI insights."
+        action={<Button onClick={() => navigate('/run')} className="mt-2"><Play className="h-4 w-4" />Go to Analysis</Button>} />
+    )
+  } else if (activeRun.status !== 'completed') {
+    body = <EmptyState icon={Clock} title={`Run #${activeRun.id} is ${activeRun.status}`} text="Insights are generated after a run completes." />
+  } else if (isLoading) {
+    body = <div className="animate-pulse py-24 text-center text-ls-mute">Generating insights…</div>
+  } else if (error || !data) {
+    body = (
+      <EmptyState icon={AlertTriangle} title="Failed to load insights" text="The run's analysis could not be read."
+        action={<Button variant="outline" onClick={() => navigate('/run')}>Back to Analysis</Button>} />
+    )
+  } else {
+    const count = (k: string) => (k === 'all' ? ranked.length : ranked.filter((r) => r.cat.key === k).length)
+    body = (
+      <div className="grid grid-cols-1 gap-5 lg:grid-cols-3">
+        <div className="lg:col-span-2">
+          <Card className="mb-3">
+            <CardContent className="flex flex-wrap gap-2 p-3">
+              {[{ key: 'all', label: 'All' }, ...CATEGORIES].map((c) => (
+                <button
+                  key={c.key}
+                  onClick={() => setFilter(c.key)}
+                  className={cn('h-8 rounded-full px-3.5 text-[12.5px] font-semibold transition-colors', filter === c.key ? 'bg-ls-dark text-ls-card' : 'bg-ls-card text-ls-ink2 shadow-sm hover:bg-ls-soft')}
+                >
+                  {c.label} · {count(c.key)}
+                </button>
+              ))}
+            </CardContent>
+          </Card>
+          {shown.length === 0 ? (
+            <Card><CardContent className="py-16 text-center text-sm text-ls-mute">No insights in this category for the run.</CardContent></Card>
+          ) : (
+            shown.map((r) => <InsightRow key={r.id} item={r} rank={ranked.indexOf(r) + 1} reviewed={reviewed.has(r.id)} onReview={() => toggleReviewed(r.id)} />)
+          )}
+        </div>
+
+        <div>
+          <Card className="mb-4">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-semibold text-ls-ink2">Analysis of run #{activeRun.id}</CardTitle>
+              <p className="text-xs text-ls-mute">Built from this run's station results.</p>
+            </CardHeader>
+            <CardContent>
+              <div className="grid grid-cols-2 gap-2">
+                {[
+                  ['Confidence', `${Math.round(data.insights.ai_confidence * 100)}%`],
+                  ['Found', String(ranked.length)],
+                  ['High priority', String(ranked.filter((r) => r.priority === 'high').length)],
+                  ['Reviewed', String(reviewed.size)],
+                ].map(([l, v]) => (
+                  <div key={l} className="rounded-xl bg-ls-soft px-3 py-2.5">
+                    <span className="block text-[10.5px] font-semibold text-ls-mute">{l}</span>
+                    <b className="font-display text-lg font-bold text-ls-ink">{v}</b>
+                  </div>
+                ))}
+              </div>
+              <p className="mt-3 text-xs leading-relaxed text-ls-mute">
+                Suggestions are advice. Change the layout in the Workspace and run again to see the effect.
+              </p>
+            </CardContent>
+          </Card>
         </div>
       </div>
     )
   }
-
-  if (activeRun.status !== 'completed') {
-    return (
-      <div className="flex flex-col items-center justify-center h-full text-gray-400 gap-4">
-        <div className="w-16 h-16 bg-amber-50 rounded-2xl flex items-center justify-center">
-          <Clock className="h-8 w-8 text-amber-400" />
-        </div>
-        <p className="text-lg font-semibold text-gray-600">Run #{activeRun.id} is {activeRun.status}</p>
-        <p className="text-sm text-gray-400">Insights are generated after a run completes.</p>
-      </div>
-    )
-  }
-
-  if (isLoading) {
-    return (
-      <div className="flex flex-col items-center justify-center h-full gap-4">
-        <div className="animate-pulse text-gray-400">Generating insights…</div>
-      </div>
-    )
-  }
-
-  if (error || !data) {
-    return (
-      <div className="flex flex-col items-center justify-center h-full text-gray-400 gap-3">
-        <AlertTriangle className="h-12 w-12 text-red-300" />
-        <p>Failed to load insights</p>
-        <Button variant="outline" onClick={() => navigate('/run')}>Back to Dashboard</Button>
-      </div>
-    )
-  }
-
-  const { insights } = data
-  const sectionKeys = Object.keys(SECTION_META) as (keyof typeof SECTION_META)[]
-  const totalInsights = sectionKeys.reduce((sum, key) => {
-    const items = insights[key as keyof typeof insights] as InsightItem[] | undefined
-    return sum + (items?.length ?? 0)
-  }, 0)
 
   return (
-    <div className="min-h-full bg-gradient-to-br from-white via-blue-50/30 to-indigo-50/40 p-8">
-      <div className="max-w-5xl mx-auto">
-
-        {/* Header */}
-        <div className="flex items-start justify-between mb-8">
-          <div>
-            <h1 className="text-2xl font-semibold text-gray-900">AI Insights</h1>
-            <p className="text-sm text-gray-400 mt-0.5">
-              {activeScenario?.name} · Run #{activeRun.id} · {activeRun.completed_jobs} jobs completed
+    <div className="min-h-full p-7">
+      <div className="mx-auto max-w-[1280px]">
+        <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center gap-5">
+            <h1 className="text-2xl font-semibold text-ls-ink">Interfaces &amp; AI</h1>
+          </div>
+          {activeRun && (
+            <p className="text-[12.5px] font-semibold text-ls-mute">
+              {activeScenario?.name} · Run #{activeRun.id}{activeRun.completed_jobs != null ? ` · ${activeRun.completed_jobs} jobs completed` : ''}
             </p>
-          </div>
-
-          <div className="flex items-center gap-2">
-            {/* AI Confidence pill */}
-            <div className="flex items-center gap-2 bg-green-50 border border-green-200 rounded-full px-4 py-2">
-              <div className="w-2 h-2 rounded-full bg-green-500" />
-              <span className="text-sm font-semibold text-green-700">
-                {Math.round(insights.ai_confidence * 100)}% confidence
-              </span>
-            </div>
-
-            {/* Insights count pill */}
-            <div className="flex items-center gap-2 bg-blue-50 border border-blue-200 rounded-full px-4 py-2">
-              <Lightbulb className="h-3.5 w-3.5 text-blue-500" />
-              <span className="text-sm font-semibold text-blue-700">{totalInsights} insights</span>
-            </div>
-          </div>
+          )}
         </div>
-
-        {/* Sections */}
-        {Object.entries(SECTION_META).map(([key, { icon, label, color }]) => {
-          const items = (insights as Record<string, InsightItem[]>)[key] ?? []
-          return (
-            <SectionPanel key={key} title={label} icon={icon} color={color} items={items} />
-          )
-        })}
-
-        {totalInsights === 0 && (
-          <div className="text-center py-24 rounded-2xl bg-white/70 border border-blue-100">
-            <div className="w-16 h-16 bg-blue-50 rounded-2xl flex items-center justify-center mx-auto mb-4">
-              <Lightbulb className="h-8 w-8 text-blue-400" />
-            </div>
-            <p className="text-gray-500 font-medium">No insights generated for this run.</p>
-          </div>
-        )}
-
+        {body}
       </div>
     </div>
   )

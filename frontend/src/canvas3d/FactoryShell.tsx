@@ -36,7 +36,7 @@ const LIGHT: Palette = {
   window: '#a9d6f5', door: '#566073', yellow: '#f2b705', white: '#f3f5f8',
 }
 const DARK: Palette = {
-  floor: '#262d38', ground: '#0e131a', wallBase: '#1c232d', wallUpper: '#3a4554', steel: '#161c25',
+  floor: '#445064', ground: '#2a3441', wallBase: '#323d4d', wallUpper: '#5a6678', steel: '#28313f',
   window: '#5f8fbd', door: '#2b3442', yellow: '#c99700', white: '#8c97a8',
 }
 

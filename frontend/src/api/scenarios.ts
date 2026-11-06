@@ -17,6 +17,10 @@ export const scenariosApi = {
 
   delete: (id: number) => api.delete(`/scenarios/${id}`),
 
+  /** Do the process-flow steps name real stations? (checks the saved scenario) */
+  validate: (id: number) =>
+    api.get<{ issue_count: number; issues: { variant: string; operation?: string; resource: string; resolved_to: string | null; type: 'case_mismatch' | 'missing' }[] }>(`/scenarios/${id}/validate`).then(r => r.data),
+
   /** Parse a .yaml or .xlsx file — returns parsed data only, does NOT save */
   parseFile: (file: File) => {
     const form = new FormData()
