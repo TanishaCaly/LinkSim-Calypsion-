@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from backend.storage import crud, get_db
 from backend.api.auth import require_auth
+from backend.api.routes.license import check_scenario_limit, check_station_limit
 from backend.api.schemas import (
     ScenarioCreate, ScenarioUpdate, ScenarioResponse, ScenarioListItem
 )
@@ -18,6 +19,8 @@ router = APIRouter(prefix="/api/scenarios", tags=["scenarios"])
 
 @router.post("/", response_model=ScenarioResponse, status_code=status.HTTP_201_CREATED)
 def create_scenario(payload: ScenarioCreate, db: Session = Depends(get_db), user_id: int = Depends(require_auth)):
+    check_scenario_limit(crud.count_scenarios(db, user_id=user_id))
+    check_station_limit(payload.stations_data)
     return crud.create_scenario(db, payload.model_dump(), user_id=user_id)
 
 
@@ -41,6 +44,8 @@ def get_scenario(scenario_id: int, db: Session = Depends(get_db), user_id: int =
 
 @router.patch("/{scenario_id}", response_model=ScenarioResponse)
 def update_scenario(scenario_id: int, payload: ScenarioUpdate, db: Session = Depends(get_db), user_id: int = Depends(require_auth)):
+    if payload.stations_data is not None:
+        check_station_limit(payload.stations_data)
     updated = crud.update_scenario(db, scenario_id, payload.model_dump(exclude_none=True), user_id=user_id)
     if not updated:
         raise HTTPException(status_code=404, detail="Scenario not found")

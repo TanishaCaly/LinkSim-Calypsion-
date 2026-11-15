@@ -8,8 +8,11 @@ from backend.storage import crud, get_db
 from backend.api.auth import require_auth
 from backend.engine.ai_insights import ai_insights_engine
 from backend.api.schemas import InsightsResponse
+from backend.api.routes.license import require_feature
+from backend import licensing
 
-router = APIRouter(prefix="/api/insights", tags=["insights"])
+router = APIRouter(prefix="/api/insights", tags=["insights"],
+                   dependencies=[Depends(require_feature(licensing.INSIGHTS_AI))])
 
 
 @router.get("/{run_id}", response_model=InsightsResponse)

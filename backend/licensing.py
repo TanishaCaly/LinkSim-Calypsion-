@@ -500,3 +500,37 @@ class LicenseManager:
 
 
 manager = LicenseManager()
+
+
+# ── Features ──────────────────────────────────────────────────────────
+# Codes defined on the LINKSIM product in the backoffice (Product → Features);
+# each edition sets which are on and the limit values. A feature the license
+# doesn't mention is not restricted, so older licenses keep working when a
+# new code is added.
+
+SIM_RUN = "sim.run"
+IMPORT_FILES = "import.excel"
+INSIGHTS_AI = "insights.ai"
+VIEW_3D = "view.3d"
+LIMIT_STATIONS = "limit.stations"
+LIMIT_SCENARIOS = "limit.scenarios"
+
+
+def feature(code: str):
+    """The license's value for a feature (bool, or int for limits); None when
+    the license doesn't say or licensing is off."""
+    if not ENABLED or not manager.ok:
+        return None
+    return (((manager.token or {}).get("license") or {}).get("features") or {}).get(code)
+
+
+def allows(code: str) -> bool:
+    value = feature(code)
+    return value is None or bool(value)   # false, or a limit of 0, means no
+
+
+def limit(code: str) -> Optional[int]:
+    """None = unlimited. The server sends a limit that is switched off in the
+    edition as 0."""
+    value = feature(code)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None

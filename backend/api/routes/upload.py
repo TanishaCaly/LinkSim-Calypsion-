@@ -2,13 +2,17 @@
 /api/upload — parse uploaded files and optionally create a scenario.
 Supports: .yaml, .xlsx, individual CSV bundle, or single flat routing CSV.
 """
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from typing import Optional, Dict, Any
 
+from backend import licensing
 from backend.parsers import ParserFactory, CsvParser
 from backend.api.schemas import UploadResponse
+from backend.api.routes.license import require_feature
 
-router = APIRouter(prefix="/api/upload", tags=["upload"])
+# Every file import (Excel, YAML, CSV) needs the import feature of the license.
+router = APIRouter(prefix="/api/upload", tags=["upload"],
+                   dependencies=[Depends(require_feature(licensing.IMPORT_FILES))])
 
 _SUPPORTED = {".yaml", ".yml", ".xlsx", ".xls", ".csv"}
 _csv = CsvParser()

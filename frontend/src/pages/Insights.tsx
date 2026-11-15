@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { AlertTriangle, ChevronDown, Clock, Lightbulb, Play } from 'lucide-react'
 import { insightsApi } from '@/api/insights'
+import { FEATURE, useLicenseFeatures } from '@/hooks/useLicenseFeatures'
 import { useAppStore } from '@/store/useAppStore'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -91,11 +92,12 @@ export default function Insights() {
   const { activeRun, activeScenario } = useAppStore()
   const [filter, setFilter] = useState<string>('all')
   const [reviewed, setReviewed] = useState<Set<string>>(new Set())
+  const canInsights = useLicenseFeatures().allows(FEATURE.insightsAi)
 
   const { data, isLoading, error } = useQuery({
     queryKey: ['insights', activeRun?.id],
     queryFn: () => insightsApi.get(activeRun!.id),
-    enabled: !!activeRun && activeRun.status === 'completed',
+    enabled: canInsights && !!activeRun && activeRun.status === 'completed',
   })
 
   // Every insight in one list, most important first (priority, then confidence).
@@ -111,7 +113,10 @@ export default function Insights() {
   const toggleReviewed = (id: string) => setReviewed((s) => { const n = new Set(s); if (n.has(id)) n.delete(id); else n.add(id); return n })
 
   let body: React.ReactNode
-  if (!activeRun) {
+  if (!canInsights) {
+    body = <EmptyState icon={Lightbulb} title="AI insights are not included in your license"
+      text="Contact Calypsion to upgrade your LinkSim edition." />
+  } else if (!activeRun) {
     body = (
       <EmptyState icon={Lightbulb} title="No run selected" text="Run a simulation first to see AI insights."
         action={<Button onClick={() => navigate('/run')} className="mt-2"><Play className="h-4 w-4" />Go to Analysis</Button>} />

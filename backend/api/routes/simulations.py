@@ -16,6 +16,8 @@ from sqlalchemy.orm import Session
 from backend.storage import crud, get_db
 from backend.storage.crud import get_station_stats
 from backend.api.auth import require_auth
+from backend.api.routes.license import check_station_limit, require_feature
+from backend import licensing
 from backend.api.schemas import RunRequest, RunResponse, RunDetailResponse, StationStatResponse
 from backend.engine import ManufacturingSimulation
 from backend.engine import progress_store
@@ -28,7 +30,8 @@ router = APIRouter(prefix="/api/simulations", tags=["simulations"])
 # Trigger a run
 # ---------------------------------------------------------------------------
 
-@router.post("/{scenario_id}/run", response_model=RunResponse, status_code=status.HTTP_202_ACCEPTED)
+@router.post("/{scenario_id}/run", response_model=RunResponse, status_code=status.HTTP_202_ACCEPTED,
+             dependencies=[Depends(require_feature(licensing.SIM_RUN))])
 def trigger_run(
     scenario_id: int,
     req: RunRequest,
@@ -39,6 +42,8 @@ def trigger_run(
     scenario = crud.get_scenario(db, scenario_id, user_id=user_id)
     if not scenario:
         raise HTTPException(status_code=404, detail="Scenario not found")
+    # Also stops scenarios saved before a downgrade to a smaller edition.
+    check_station_limit(scenario.stations_data)
 
     run = crud.create_run(db, scenario_id, num_replications=req.num_replications)
     progress_store.init(run.id)

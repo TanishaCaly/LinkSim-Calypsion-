@@ -21,6 +21,7 @@ import SimDialogsHost from '@/components/run/SimDialogsHost'
 import SimSettingsMenu, { openSimDialog } from '@/components/run/SimSettingsMenu'
 import { IdleReplayBar } from '@/components/run/ReplayBar'
 import { useRunSimulation } from '@/hooks/useRunSimulation'
+import { FEATURE, useLicenseFeatures } from '@/hooks/useLicenseFeatures'
 import { STATUS_LEGEND } from '@/lib/status'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -4586,6 +4587,8 @@ export default function Canvas() {
 
   // Mode: 'view' shows scenario flow; 'build' is free-canvas builder
   const [mode, setMode] = useState<'view' | 'build'>('build')
+  const can3d = useLicenseFeatures().allows(FEATURE.view3d)
+  useEffect(() => { if (!can3d) setMode('build') }, [can3d])
 
   // On a narrow window the side panel starts collapsed so the canvas keeps the room
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => typeof window !== 'undefined' && window.innerWidth < 900)
@@ -6357,7 +6360,8 @@ export default function Canvas() {
             <button onClick={() => setMode('build')} className={segBtn(onBuild)}>Build</button>
             <button
               onClick={() => { setMode('view') }}
-              disabled={!activeScenario}
+              disabled={!activeScenario || !can3d}
+              title={can3d ? undefined : 'The 3D view is not included in your LinkSim license'}
               className={segBtn(on3d)}
             >3D</button>
           </div>

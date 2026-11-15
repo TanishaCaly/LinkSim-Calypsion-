@@ -186,3 +186,57 @@ def test_air_gapped_license_file(monkeypatch, signer):
     with pytest.raises(lic.LicenseError) as e:
         m.import_license_file(json.dumps(signer(typ="license", fingerprint="another-pc")))
     assert e.value.reason == "wrong_machine"
+
+
+# ── Features ──
+
+@pytest.fixture
+def licensed(monkeypatch, signer):
+    """A valid license with the given features."""
+    def make(features):
+        m = lic.LicenseManager()
+        m.state = "valid"
+        m.token = {"license": {"features": features}}
+        monkeypatch.setattr(lic, "manager", m)
+        monkeypatch.setattr(lic, "ENABLED", True)
+    return make
+
+
+def test_feature_values(licensed):
+    licensed({"sim.run": True, "view.3d": False, "limit.stations": 50, "limit.scenarios": 0})
+    assert lic.allows("sim.run") and not lic.allows("view.3d")
+    assert lic.allows("insights.ai")                 # not in the license → not restricted
+    assert lic.limit("limit.stations") == 50
+    assert lic.limit("limit.scenarios") == 0          # switched off in the edition
+    assert lic.limit("limit.other") is None
+    assert lic.limit("sim.run") is None               # a boolean is not a limit
+
+
+def test_features_unrestricted_when_licensing_off(monkeypatch):
+    monkeypatch.setattr(lic, "ENABLED", False)
+    assert lic.allows("view.3d") and lic.limit("limit.stations") is None
+
+
+def test_feature_checks(licensed):
+    from fastapi import HTTPException
+    from backend.api.routes import license as routes
+
+    licensed({"insights.ai": False, "limit.stations": 2, "limit.scenarios": 3})
+    with pytest.raises(HTTPException) as e:
+        routes.require_feature("insights.ai")()
+    assert e.value.status_code == 403 and e.value.detail["feature"] == "insights.ai"
+    routes.require_feature("sim.run")()
+
+    stations = {
+        "Start": {"Station Type": "Source"}, "End": {"Station Type": "Drain"},
+        "Op1": {}, "Op2": {"Station Type": "Station"}, "Link": {"Station Type": "Connector"},
+    }
+    assert routes.count_stations(stations) == 2
+    routes.check_station_limit(stations)
+    with pytest.raises(HTTPException):
+        routes.check_station_limit({**stations, "Op3": {"Station Type": "Buffer"}})
+
+    routes.check_scenario_limit(2)
+    with pytest.raises(HTTPException) as e:
+        routes.check_scenario_limit(3)
+    assert "up to 3" in e.value.detail["msg"]
