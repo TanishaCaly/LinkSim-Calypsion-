@@ -304,8 +304,14 @@ def test_web_flow_over_http(web, monkeypatch):
     features.update({"limit.scenarios": 1})
     with TestClient(main.app) as c:
         assert c.get("/api/license/status").json()["signed_in"] is False
-        token = c.post("/api/auth/signup", json={"username": "ann", "password": "pw"}).json()["token"]
+        # Signup only creates the account; the key is entered after, signed in.
+        assert c.post("/api/auth/signup", json={"username": "ann", "password": "short"}).status_code == 400
+        r = c.post("/api/auth/signup", json={"username": "ann", "password": "long-enough", "email": "Ann@x.com"})
+        assert r.status_code == 201
+        token = r.json()["token"]
         h = {"Authorization": f"Bearer {token}"}
+        r = c.post("/api/auth/signup", json={"username": "ann2", "password": "long-enough", "email": "ann@x.com"})
+        assert r.status_code == 409 and "email" in r.json()["detail"]
 
         st = c.get("/api/license/status", headers=h).json()
         assert st["mode"] == "user" and st["signed_in"] and st["state"] == "unlicensed"

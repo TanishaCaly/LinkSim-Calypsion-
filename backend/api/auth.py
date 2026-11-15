@@ -59,6 +59,9 @@ class SignupRequest(BaseModel):
     email: Optional[str] = None
 
 
+_MIN_PASSWORD = 8
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -73,16 +76,20 @@ class AuthResponse(BaseModel):
 @router.post("/signup", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
 def signup(payload: SignupRequest, db: Session = Depends(get_db)):
     username = payload.username.strip()
+    email = (payload.email or "").strip().lower() or None
     if not username or not payload.password:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username and password are required")
+    if len(payload.password) < _MIN_PASSWORD:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Password must be at least {_MIN_PASSWORD} characters")
+    if email is not None and "@" not in email:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Enter a valid email address")
     if db.query(User).filter(User.username == username).first():
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Username already taken")
+    if email is not None and db.query(User).filter(User.email == email).first():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="An account with this email already exists")
 
-    user = User(
-        username=username,
-        email=payload.email.strip() if payload.email else None,
-        password_hash=_hash_password(payload.password),
-    )
+    user = User(username=username, email=email, password_hash=_hash_password(payload.password))
     db.add(user)
     db.commit()
     db.refresh(user)

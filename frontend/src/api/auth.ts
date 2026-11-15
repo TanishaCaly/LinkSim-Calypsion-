@@ -13,8 +13,8 @@ export const authApi = {
       return r.data
     }),
 
-  signup: (username: string, password: string) =>
-    api.post<LoginResponse>('/auth/signup', { username, password }).then((r) => {
+  signup: (username: string, password: string, email?: string) =>
+    api.post<LoginResponse>('/auth/signup', { username, password, email: email || null }).then((r) => {
       setToken(r.data.token)
       return r.data
     }),
