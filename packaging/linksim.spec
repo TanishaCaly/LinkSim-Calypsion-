@@ -17,7 +17,9 @@ hidden = (
 a = Analysis(
     [os.path.join(SPECPATH, "desktop_launcher.py")],
     pathex=[ROOT],
-    datas=[(os.path.join(ROOT, "frontend", "dist"), "frontend_dist")],
+    datas=[(os.path.join(ROOT, "frontend", "dist"), "frontend_dist"),
+           # Licensing API key, written by build.ps1.
+           (os.path.join(ROOT, "build", "license_config.json"), ".")],
     hiddenimports=hidden,
     # Not used by the app: keep tests and build/dev tools out of the exe.
     excludes=["pytest", "_pytest", "backend.tests", "tkinter", "IPython", "matplotlib", "PyInstaller"],

@@ -33,3 +33,7 @@ dist-ssr/
 # Tester build output (packaging/build.ps1)
 build/
 release/
+
+# License state when testing licensing in development (backend/licensing.py)
+license.json
+machine_id

@@ -1,9 +1,11 @@
 import { useEffect } from 'react'
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
-import { BarChart3, FolderOpen, GitBranch, Sparkles, Sun, Moon, LogOut, Check, AlertCircle } from 'lucide-react'
+import { useQuery } from '@tanstack/react-query'
+import { BarChart3, FolderOpen, GitBranch, Sparkles, Sun, Moon, LogOut, Check, AlertCircle, KeyRound, WifiOff } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAppStore } from '@/store/useAppStore'
 import { authApi } from '@/api/auth'
+import { licenseApi } from '@/api/license'
 
 const nav = [
   { to: '/canvas', icon: GitBranch, label: 'Workspace' },
@@ -18,6 +20,7 @@ export default function Layout() {
   const { toast, clearToast, theme, toggleTheme, activeScenario, leaveGuard } = useAppStore()
   const navigate = useNavigate()
   const location = useLocation()
+  const { data: license } = useQuery({ queryKey: ['license'], queryFn: licenseApi.status, staleTime: 60_000 })
 
   // Notifications close by themselves after 3 s. Each new one (a fresh
   // object, even with the same text) restarts the 3 s.
@@ -90,6 +93,16 @@ export default function Layout() {
         </nav>
 
         <div className="flex items-center gap-2">
+          {/* Desktop build: this PC's license (details, deactivate) */}
+          {license?.enabled && (
+            <button
+              onClick={() => (leaveGuard ? leaveGuard(() => navigate('/license')) : navigate('/license'))}
+              title={license.state === 'offline' ? 'License server unreachable — working offline' : 'License'}
+              className={cn(iconButton, license.state === 'offline' && 'text-amber-600')}
+            >
+              {license.state === 'offline' ? <WifiOff className="h-4 w-4" /> : <KeyRound className="h-4 w-4" />}
+            </button>
+          )}
           <button
             onClick={toggleTheme}
             title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}

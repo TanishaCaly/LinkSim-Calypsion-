@@ -2,6 +2,8 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import Layout from '@/components/layout/Layout'
 import RequireAuth from '@/components/RequireAuth'
+import RequireLicense from '@/components/RequireLicense'
+import License from '@/pages/License'
 import Login from '@/pages/Login'
 import Signup from '@/pages/Signup'
 import SubscriptionExpired from '@/pages/SubscriptionExpired'
@@ -21,21 +23,24 @@ export default function App() {
     <QueryClientProvider client={queryClient}>
       <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
         <Routes>
-          <Route path="login" element={<Login />} />
-          <Route path="signup" element={<Signup />} />
-          <Route path="subscription-expired" element={<SubscriptionExpired />} />
-          <Route
-            element={
-              <RequireAuth>
-                <Layout />
-              </RequireAuth>
-            }
-          >
-            <Route index element={<ScenarioManager />} />
-            <Route path="run" element={<RunDashboard />} />
-            <Route path="canvas" element={<Canvas />} />
-            <Route path="interfaces" element={<Insights />} />
-            <Route path="insights" element={<Navigate to="/interfaces" replace />} />
+          <Route path="license" element={<License />} />
+          <Route element={<RequireLicense />}>
+            <Route path="login" element={<Login />} />
+            <Route path="signup" element={<Signup />} />
+            <Route path="subscription-expired" element={<SubscriptionExpired />} />
+            <Route
+              element={
+                <RequireAuth>
+                  <Layout />
+                </RequireAuth>
+              }
+            >
+              <Route index element={<ScenarioManager />} />
+              <Route path="run" element={<RunDashboard />} />
+              <Route path="canvas" element={<Canvas />} />
+              <Route path="interfaces" element={<Insights />} />
+              <Route path="insights" element={<Navigate to="/interfaces" replace />} />
+            </Route>
           </Route>
         </Routes>
       </BrowserRouter>

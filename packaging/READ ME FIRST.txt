@@ -5,7 +5,9 @@ WHAT YOU NEED
 - A Windows 10 or Windows 11 PC (64-bit)
 - About 600 MB free disk space
 - A web browser (Microsoft Edge, which comes with Windows, or Google Chrome)
-- No internet connection and no installation needed
+- An internet connection the first time (to activate your license key),
+  and now and then afterwards. LinkSim keeps working offline for several days.
+- No installation needed
 
 
 HOW TO START
@@ -20,6 +22,11 @@ HOW TO START
    If the browser does not open, copy the address shown in the black window
    (it looks like http://127.0.0.1:8000) into your browser.
 
+5. The first time, LinkSim asks for your license key (it looks like
+   LNK-XXXX-XXXX-XXXX). Enter it and click Activate.
+   To move LinkSim to another PC, first click the key icon at the top
+   right and choose "Deactivate this PC".
+
 Keep the black window open while you use LinkSim.
 To quit LinkSim, close the black window.
 
@@ -33,7 +40,8 @@ IMPORTANT
 - If your antivirus blocks or removes LinkSim.exe, please allow it (mark it
   as safe / add an exception). This is a known false alarm for this type
   of program.
-- LinkSim runs only on your own PC. Nothing is sent over the internet.
+- LinkSim runs only on your own PC. Your scenarios and data are never sent
+  over the internet; only the license check contacts license.calypsion.com.
 - Large simulations can take several minutes and use a lot of memory.
   Use the Stop button if a run takes too long.
 

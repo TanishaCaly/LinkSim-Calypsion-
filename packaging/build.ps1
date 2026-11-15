@@ -5,10 +5,19 @@
 #
 # Needs: venv312 with requirements.txt + pyinstaller installed, and Node.js
 # (frontend\node_modules already installed).
+#
+# Needs the licensing API key (Backoffice > Settings > API clients, scoped to
+# LINKSIM) in the environment — it goes into the build, never into git:
+#     $env:LINKSIM_LICENSE_API_KEY = 'lsk_...'
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 $python = Join-Path $root 'venv312\Scripts\python.exe'
+
+if (-not $env:LINKSIM_LICENSE_API_KEY) { throw 'Set $env:LINKSIM_LICENSE_API_KEY first (see the top of this file)' }
+New-Item -ItemType Directory -Force build | Out-Null
+# Read by desktop_launcher.py; build\ is ignored by git.
+@{ api_key = $env:LINKSIM_LICENSE_API_KEY } | ConvertTo-Json | Set-Content -Encoding utf8 'build\license_config.json'
 
 Write-Host '1/4  Building the web page (frontend\dist)...'
 Push-Location frontend

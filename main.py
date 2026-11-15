@@ -6,6 +6,7 @@ Run with:
 """
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 
@@ -46,7 +47,10 @@ from backend.api.routes import (
     upload_router,
     insights_router,
     debug_router,
+    license_router,
+    require_license,
 )
+from backend.licensing import ENABLED as LICENSE_ENABLED, manager as license_manager
 
 
 @asynccontextmanager
@@ -58,6 +62,10 @@ async def lifespan(app: FastAPI):
         n = fail_unfinished_runs(db)
     if n:
         logger.info(f"Marked {n} unfinished run(s) from before the restart as failed")
+    # Desktop build: check the license in the background (it may wait on the
+    # network); the activation page waits for the result.
+    if LICENSE_ENABLED:
+        threading.Thread(target=license_manager.refresh, daemon=True).start()
     yield
 
 
@@ -90,11 +98,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Auth routes are open (you need to be able to log in without a token first);
-# every other router requires a valid session token.
-app.include_router(auth_router)
+# License routes are open (the activation page runs before anything else).
+# Everything else needs a valid license first (desktop build only, see
+# backend/licensing.py); auth routes are open past that so you can log in,
+# every other router also requires a valid session token.
+app.include_router(license_router)
+app.include_router(auth_router, dependencies=[Depends(require_license)])
 
-_auth_dep = [Depends(require_auth)]
+_auth_dep = [Depends(require_license), Depends(require_auth)]
 app.include_router(scenarios_router, dependencies=_auth_dep)
 app.include_router(simulations_router, dependencies=_auth_dep)
 app.include_router(upload_router, dependencies=_auth_dep)

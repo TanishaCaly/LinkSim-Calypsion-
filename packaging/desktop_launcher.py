@@ -6,6 +6,7 @@ from the same server, and opens it in the default browser. Data (database +
 log) is kept in %LOCALAPPDATA%\\LinkSim, so a newer LinkSim.exe keeps it.
 Closing the console window stops LinkSim.
 """
+import json
 import os
 import socket
 import sys
@@ -79,6 +80,9 @@ def main() -> None:
     os.environ["DATABASE_URL"] = "sqlite:///" + os.path.join(DATA_DIR, "linksim.db").replace("\\", "/")
     os.environ["LINKSIM_STATIC_DIR"] = os.path.join(APP_DIR, "frontend_dist")
     os.environ["LINKSIM_DESKTOP"] = "1"
+    # Read by backend/licensing.py (written into the build by build.ps1).
+    with open(os.path.join(APP_DIR, "license_config.json"), encoding="utf-8-sig") as f:
+        os.environ["LINKSIM_LICENSE_API_KEY"] = json.load(f)["api_key"]
 
     port = _free_port()
     url = f"http://127.0.0.1:{port}"
