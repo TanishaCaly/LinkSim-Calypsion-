@@ -4,7 +4,7 @@ import { cn } from '@/lib/utils'
 
 export function SectionHeading({ id, title, note, first }: { id: string; title: string; note?: string; first?: boolean }) {
   return (
-    <div id={id} className={cn('mb-3 flex scroll-mt-4 flex-wrap items-baseline justify-between gap-x-4', first ? 'mt-1' : 'mt-8')}>
+    <div id={id} className={cn('mb-3 flex break-after-avoid scroll-mt-4 flex-wrap items-baseline justify-between gap-x-4', first ? 'mt-1' : 'mt-8')}>
       <h2 className="font-display text-[15px] font-bold text-ls-ink">{title}</h2>
       {note && <span className="text-xs text-ls-mute">{note}</span>}
     </div>

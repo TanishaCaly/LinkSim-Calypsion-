@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Panel, useStore } from 'reactflow'
 import { jobPrefix } from '@/lib/variantColors'
-import ReplayBar, { DEFAULT_REPLAY_SPEED, REPLAY_SPEEDS, fmtReplayClock } from '@/components/run/ReplayBar'
+import ReplayBar, { DEFAULT_REPLAY_SPEED, IdleReplayBar, REPLAY_SPEEDS, fmtReplayClock } from '@/components/run/ReplayBar'
 import SimSettingsMenu, { openSimDialog } from '@/components/run/SimSettingsMenu'
 
 /**
@@ -237,7 +237,7 @@ function parseLog(
   return { jobs: list, t0, total: tEnd - t0 }
 }
 
-export default function JobReplay({ completionLog, releaseTimes, finishTimes, assemblies, dismantles, targets, variantColors, runMinutes }: {
+export default function JobReplay({ completionLog, releaseTimes, finishTimes, assemblies, dismantles, targets, variantColors, runMinutes, runControls }: {
   completionLog: Record<string, unknown[]>
   releaseTimes?: Record<string, unknown>
   finishTimes?: Record<string, unknown>
@@ -250,6 +250,8 @@ export default function JobReplay({ completionLog, releaseTimes, finishTimes, as
   variantColors?: Record<string, string>
   // How long the run was set to simulate, in minutes; the replay bar shows it as "Run for".
   runMinutes?: number
+  // Run (and Stop while running), at the right end of the replay bar next to Sim setting.
+  runControls?: ReactNode
 }) {
   const { jobs, t0, total } = useMemo(
     () => parseLog(completionLog, releaseTimes ?? {}, finishTimes ?? {}, variantColors ?? {}, assemblies ?? {}, dismantles ?? {}),
@@ -310,6 +312,10 @@ export default function JobReplay({ completionLog, releaseTimes, finishTimes, as
       const { release, finish, visits } = j
       if (j.gone !== null && time >= j.gone) return undefined // used up in an assembly
       const firstStart = visits[0]?.start ?? Infinity
+      // A line with no End: the job finished in its last Buffer and stays
+      // there (the visit runs past its finish, to the end of the run).
+      const last = visits[visits.length - 1]
+      const held = !!last && finish !== null && last.end > finish
       const atStart = (): Place | undefined => {
         const target = sourceOf(j)
         return target && { target, after: true, came: release ?? 0, leaves: firstStart, rank: firstStart, latest: false, status: 'Released — waiting for its first station' }
@@ -318,7 +324,13 @@ export default function JobReplay({ completionLog, releaseTimes, finishTimes, as
       // the start is still at Start, before the first moves of that same
       // minute (e.g. Job 1 into a free Station 1) happen.
       if (time <= 0 && sources.length > 0) return release !== null && release <= 0 ? atStart() : undefined
-      if (finish !== null && time >= finish) {
+      if (finish !== null && time >= finish && !held && !drain && last) {
+        // A line with no End: finished jobs collect just right of the last
+        // box they left, like End (the job finished last, with the count).
+        const target = find(last)
+        return target && { target, after: true, came: finish, leaves: finish, rank: finish, latest: true, status: 'Finished' }
+      }
+      if (finish !== null && time >= finish && !held) {
         return drain && { target: drain, after: false, came: finish, leaves: finish, rank: finish, latest: true, status: 'Finished' }
       }
       if (!visits.length || time < firstStart) {
@@ -331,6 +343,11 @@ export default function JobReplay({ completionLog, releaseTimes, finishTimes, as
       const target = find(v)
       if (!target) return undefined
       const nextMove = visits[i + 1]?.start ?? finish ?? Infinity
+      // Collected in the last Buffer: like End, its circle shows the job
+      // that came in last, with the count of all jobs in it.
+      if (held && i === visits.length - 1) {
+        return { target, after: false, came: v.start, leaves: v.end, rank: v.start, latest: true, status: 'Collected — stays in the last buffer' }
+      }
       if (time < v.end) {
         // Being worked on / riding. Parts on an Assembly never cover the
         // main part (the circle shown).
@@ -389,7 +406,21 @@ export default function JobReplay({ completionLog, releaseTimes, finishTimes, as
     return (j: Job) => names.get(j.prefix) ?? j.prefix
   }, [variantColors])
 
-  if (total <= 0) return null
+  // No job moved in this run (e.g. too short for any to finish): nothing to play, but
+  // the bar stays, greyed out, with this run's figures and Sim setting.
+  if (total <= 0) {
+    return (
+      <Panel position="bottom-center">
+        <div className="w-[min(900px,calc(100vw-80px))]">
+          <IdleReplayBar
+            runStartMs={t0 > 0 ? wallMs(t0) : undefined}
+            runMin={runMinutes}
+            settings={<div className="flex items-center gap-1.5"><SimSettingsMenu compact up onConfig={() => openSimDialog('config')} onTimer={() => openSimDialog('timer')} />{runControls}</div>}
+          />
+        </div>
+      </Panel>
+    )
+  }
 
   const clock = (t: number) => (Number.isFinite(t) ? fmtReplayClock(wallMs(t0), t) : '—')
   const boxName = (t: ReplayTarget) => (t.machine > 1 ? `${t.station} #${t.machine}` : t.station)
@@ -490,7 +521,7 @@ export default function JobReplay({ completionLog, releaseTimes, finishTimes, as
             elapsedMin={time}
             startMs={wallMs(t0)}
             runMin={runMinutes ?? total}
-            settings={<SimSettingsMenu compact up onConfig={() => openSimDialog('config')} onTimer={() => openSimDialog('timer')} />}
+            settings={<div className="flex items-center gap-1.5"><SimSettingsMenu compact up onConfig={() => openSimDialog('config')} onTimer={() => openSimDialog('timer')} />{runControls}</div>}
           />
         </div>
       </Panel>

@@ -1889,6 +1889,12 @@ class ManufacturingSimulation:
                 else:
                     release, in_box = (lambda: None), None
                 box_place, carried = None, None
+                if nxt is None and step.get("holds_parts"):
+                    # Last box of a line with no End: the part stays in the
+                    # buffer for the rest of the run (it can fill up and block
+                    # the station before it) and counts as finished below.
+                    self._hold_in_last_buffer(trace)
+                    continue
                 if nxt is None:
                     release()
                 elif into_room:
@@ -2864,9 +2870,22 @@ class ManufacturingSimulation:
         """A job leaves a Buffer box: its trace entry ends now, so the Job
         Trace and Canvas replay show it sitting in the box for that long."""
         entry["process_end_time_real"] = self._real_stamp()
+        # Completed parts of a Buffer: parts that left it, after the warm-up.
+        if self.env.now >= self.sim_config.get("WARMUP_TIME", 0):
+            station = self.stations_data[entry["station_name"]]
+            station["buffer_parts_left"] = station.get("buffer_parts_left", 0) + 1
         waited = self.env.now - start
         if waited > 0:
             entry["delay_reason"] = f"Waited {round(waited, 2)} min in buffer"
+
+    def _hold_in_last_buffer(self, entry: Dict[str, Any]) -> None:
+        """A part stays in a Buffer that ends the line (no End): its trace
+        entry runs to the end of the run, so the replay shows it sitting in
+        the box. It never leaves, so it is not one of the Buffer's
+        Completed parts (those that left it)."""
+        end = self.simulation_state["start_date"] + timedelta(minutes=self.sim_config.get("SIM_TIME", self.env.now))
+        entry["process_end_time_real"] = end.strftime("%Y-%m-%d %H:%M:%S")
+        entry["delay_reason"] = "Stays in the last buffer (no End)"
 
     def _reject_job(
         self,
@@ -3946,6 +3965,12 @@ class ManufacturingSimulation:
             out[name] = buffer_states(
                 levels["occupied"], levels["full"], self._station_shift_cfg.get(name, self.sim_config),
                 cfg.get("shifts_per_day", 1), self.simulation_state["start_date"], end, start)
+            # Parts, as for a station: in the buffer at the end of the run;
+            # left it (moved on) after the warm-up; scrap — a buffer never
+            # scraps a part, always 0.
+            out[name]["current_parts"] = len(box.items)
+            out[name]["completed_parts"] = cfg.get("buffer_parts_left", 0)
+            out[name]["scrapped_parts"] = 0
         return out
 
     def _station_states(self) -> Dict[str, Dict[str, float]]:
@@ -4161,7 +4186,8 @@ class ManufacturingSimulation:
             # Statistical analysis per Buffer, averaged over replications.
             "buffer_states": {
                 name: {key: stats_lib.mean([r.get("buffer_states", {}).get(name, {}).get(key, 0.0) for r in results])
-                       for key in ("empty", "occupied", "full", "operating_time")}
+                       for key in ("empty", "occupied", "full", "operating_time",
+                                   "current_parts", "completed_parts", "scrapped_parts")}
                 for name in results[0].get("buffer_states", {})
             },
             # Statistical analysis per station, averaged over replications.

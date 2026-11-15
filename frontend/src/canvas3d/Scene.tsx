@@ -1,7 +1,7 @@
 import { Canvas, useThree, type GLProps } from '@react-three/fiber'
 import { OrbitControls, Grid } from '@react-three/drei'
 import { Maximize2, Minimize2 } from 'lucide-react'
-import { Suspense, useState, useCallback, useRef, useMemo, useEffect } from 'react'
+import { Suspense, useState, useCallback, useRef, useMemo, useEffect, type ReactNode } from 'react'
 import MachineBox from './MachineBox'
 import CameraRig from './CameraRig'
 import FactoryShell from './FactoryShell'
@@ -25,9 +25,12 @@ import MachineDetail from './MachineDetail'
 import type { Machine3D, Operator3D, Connection3D, StepLabel, Prop3D } from './layout'
 import { buildStationActivity, activeCount, type AnimState } from './stationActivity'
 import type { AssemblyInfo, DismantleInfo } from './jobTimeline'
-import type { StationConfig, OperatorConfig } from '@/types'
+import type { StationConfig, OperatorConfig, WorkerPoolStat } from '@/types'
+import WorkerFigure from './WorkerFigure'
+import { planWorkers, travelMs } from './workerSchedule'
+import { makeRouter, type Box } from './walkPath'
 import SimSettingsMenu, { openSimDialog } from '@/components/run/SimSettingsMenu'
-import ReplayBar, { DEFAULT_REPLAY_SPEED, REPLAY_SPEEDS, fmtReplayClock } from '@/components/run/ReplayBar'
+import ReplayBar, { DEFAULT_REPLAY_SPEED, IdleReplayBar, REPLAY_SPEEDS, fmtReplayClock } from '@/components/run/ReplayBar'
 
 export interface TimelineRefs {
   playing: React.MutableRefObject<boolean>
@@ -46,6 +49,8 @@ export interface TimelineRefs {
 }
 
 interface SceneProps {
+  // Run (and Stop while running), at the right end of the replay bar next to Sim setting.
+  runControls?: ReactNode
   machines: Machine3D[]
   operators: Operator3D[]
   connections: Connection3D[]
@@ -65,6 +70,10 @@ interface SceneProps {
   outcomes?: { rejected: number; scrapped: number }
   // How long the run was set to simulate, in minutes; the replay bar shows it as "Run for".
   runMinutes?: number
+  // When the run started (its first job release), for the bar of a run in which no job moved.
+  runStartMs?: number
+  // run.result.worker_pool_stats: which stations each pool Worker served; the Workers walk to them in the replay.
+  workerPool?: Record<string, WorkerPoolStat>
 }
 
 const WEBGL_PROPS = { antialias: true, toneMapping: CineonToneMapping }
@@ -101,6 +110,7 @@ function Floor({ isDark, size, centerX, centerZ }: { isDark: boolean; size: numb
 }
 
 export default function Scene({
+  runControls,
   machines,
   operators,
   connections,
@@ -108,11 +118,13 @@ export default function Scene({
   stationsData,
   isDark,
   completionLog,
+  workerPool,
   assemblies,
   dismantles,
   variantColors,
   outcomes,
   runMinutes,
+  runStartMs,
 }: SceneProps) {
   const [selectedMachine, setSelectedMachine] = useState<Machine3D | null>(null)
   const [topView, setTopView] = useState(false)
@@ -244,6 +256,31 @@ export default function Scene({
       stations: (stations = allStations) => () => state(stations.some(s => busy(s) > 0)),
     }
   }, [completionLog])
+
+  // Each pool Worker's visits to stations over the run (an estimate, see workerSchedule.ts).
+  const workerPlan = useMemo(() => {
+    if (!completionLog || !workerPool) return null
+    const activity = buildStationActivity(completionLog)
+    let end = activity.globalStart
+    for (const { ends } of activity.byStation.values()) for (const e of ends) if (isFinite(e) && e > end) end = e
+    return { segs: planWorkers(activity, workerPool), globalStart: activity.globalStart, travel: travelMs(end - activity.globalStart) }
+  }, [completionLog, workerPool])
+  // What a walking Worker goes round: every machine and every prop except the Workers themselves.
+  const router = useMemo(() => {
+    const size: Record<string, [number, number]> = { Workplace: [1.0, 0.7], 'Worker Controller': [0.6, 0.6], Source: [1.6, 0.8], Drain: [1.6, 0.8] }
+    const boxes: Box[] = [
+      ...machines.map(m => ({ x: m.position[0], z: m.position[2], hw: m.width / 2 + 0.3, hd: 1.0 })),
+      ...props.filter(p => size[p.stationType]).map(p => ({ x: p.position[0], z: p.position[2], hw: size[p.stationType][0], hd: size[p.stationType][1] })),
+    ]
+    return makeRouter(boxes)
+  }, [machines, props])
+  const workerSlots = useMemo(() => props.filter(p => p.stationType === 'Worker' && p.label && workerPlan?.segs.has(p.label)).map(p => p.id), [props, workerPlan])
+  const stationSpot = useCallback((station: string): [number, number] | undefined => {
+    // Workers work at the Workplace that feeds the station, standing just in front of it.
+    const wp = props.find(p => p.stationType === 'Workplace' && p.stations?.includes(station))
+    // Never at the station itself: with no Workplace the Worker stays at its own spot.
+    return wp ? [wp.position[0], wp.position[2] + 1.3] : undefined
+  }, [props])
 
   const machineById = useMemo(() => new Map(machines.map(m => [m.id, m])), [machines])
 
@@ -436,7 +473,22 @@ export default function Scene({
         </group>
 
         <group name="cat:props">
-        {props.map(p => (
+        {props.map(p => workerPlan && p.stationType === 'Worker' && p.label && workerPlan.segs.has(p.label) ? (
+          <WorkerFigure
+            key={p.id}
+            id={p.id}
+            route={router}
+            slot={workerSlots.indexOf(p.id)}
+            slots={workerSlots.length}
+            home={p.position}
+            segs={workerPlan.segs.get(p.label)!}
+            spot={stationSpot}
+            globalStart={workerPlan.globalStart}
+            travel={workerPlan.travel}
+            clock={simClockMsRef}
+            anchor={tagAnchors.find(a => a.id === p.id)}
+          />
+        ) : (
           <group key={p.id}>
             <group position={p.position}>
               <Suspense fallback={null}>
@@ -549,8 +601,8 @@ export default function Scene({
       </div>
 
       {completionLog && (
-        <div className="absolute top-14 left-4 z-10 rounded-lg border border-gray-200 bg-white/95 px-3 py-2 text-xs text-gray-600 shadow-sm backdrop-blur-sm">
-          <div className="flex items-center gap-4 font-medium">
+        <div className="absolute bottom-[5.75rem] right-[max(14px,calc(50%-450px))] z-10 flex max-w-[calc(100%-28px)] flex-wrap items-center gap-x-4 gap-y-1 rounded-full border border-gray-200 bg-white/95 px-4 py-1.5 text-xs text-gray-600 shadow-sm backdrop-blur-sm">
+          <div className="flex flex-wrap items-center gap-4 font-medium">
             <span className="flex items-center gap-1.5"><i className="h-2.5 w-2.5 rounded-full bg-[#f5c518]" />Waiting <b ref={waitingEl} className="tabular-nums text-gray-900">0</b></span>
             <span className="flex items-center gap-1.5"><i className="h-2.5 w-2.5 rounded-full bg-[#32c76a]" />Processing <b ref={processingEl} className="tabular-nums text-gray-900">0</b></span>
             <span className="flex items-center gap-1.5">Finished <b ref={doneEl} className="tabular-nums text-gray-900">0</b></span>
@@ -568,19 +620,27 @@ export default function Scene({
             )}
           </div>
           {variantColors && Object.keys(variantColors).length > 1 && (
-            <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] text-gray-600">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 border-l border-gray-200 pl-4 text-[10px] text-gray-600">
               {Object.entries(variantColors).map(([name, hex]) => (
                 <span key={name} className="flex items-center gap-1"><i className="h-2 w-2 rounded-sm" style={{ background: hex }} />{name}</span>
               ))}
             </div>
           )}
-          <p className="mt-1 max-w-[19rem] text-[10px] leading-snug text-gray-500">
-            Numbers come from the run's job log. Parts glide between stations for readability; the engine has no travel time.
-          </p>
         </div>
       )}
 
-      {completionLog && (
+      {/* No job moved in this run (e.g. too short for any to finish): no timeline to play, but
+          the bar stays, greyed out, with this run's figures and Sim setting — as in Build. */}
+      {completionLog && zeroMsUI <= 0 && (
+        <div className="absolute bottom-4 left-1/2 z-10 w-[min(900px,calc(100%-28px))] -translate-x-1/2">
+          <IdleReplayBar
+            runStartMs={runStartMs}
+            runMin={runMinutes}
+            settings={<div className="flex items-center gap-1.5"><SimSettingsMenu compact up onConfig={() => openSimDialog('config')} onTimer={() => openSimDialog('timer')} />{runControls}</div>}
+          />
+        </div>
+      )}
+      {completionLog && zeroMsUI > 0 && (
         <div className="absolute bottom-4 left-1/2 z-10 w-[min(900px,calc(100%-28px))] -translate-x-1/2">
           <ReplayBar
             playing={playingUI}
@@ -615,7 +675,7 @@ export default function Scene({
             elapsedMin={curMinutes}
             startMs={zeroMsUI}
             runMin={runMinutes ?? totalMsUI / 60000}
-            settings={<SimSettingsMenu compact up onConfig={() => openSimDialog('config')} onTimer={() => openSimDialog('timer')} />}
+            settings={<div className="flex items-center gap-1.5"><SimSettingsMenu compact up onConfig={() => openSimDialog('config')} onTimer={() => openSimDialog('timer')} />{runControls}</div>}
           />
         </div>
       )}

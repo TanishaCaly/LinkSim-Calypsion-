@@ -205,7 +205,7 @@ export function buildScene3D(
   const machineNodes = nodes.filter(n => !PROP_TYPES.has(typeOf(n)))
   const groupSize = new Map<string, number>()
   for (const n of machineNodes) groupSize.set(baseOf(n), (groupSize.get(baseOf(n)) ?? 0) + 1)
-  const maxDuration = Math.max(...machineNodes.map(n => n.data.cycleTime ?? 0), 1)
+  const maxDuration = Math.max(...machineNodes.map(n => n.data.processTime ?? 0), 1)
 
   const machines: Machine3D[] = []
   const machineOf = new Map<string, Machine3D>() // node id -> machine
@@ -221,7 +221,7 @@ export function buildScene3D(
 
     const stats = statsMap.get(base)
     const util = stats?.station_utilization ?? 0
-    const height = 1.2 + ((n.data.cycleTime ?? 0) / maxDuration) * 0.8
+    const height = 1.2 + ((n.data.processTime ?? 0) / maxDuration) * 0.8
     const [x, z] = at(n)
     const dx = nodesOf(out.get(n.id))
       .filter(t => !PROP_TYPES.has(typeOf(t)))
@@ -253,8 +253,12 @@ export function buildScene3D(
   // operator_per_station is an explicit count (0 is real: a Buffer or
   // machine-only station has none), so there is no `|| 1` fallback.
   const operators: Operator3D[] = []
+  // Stations a Workplace feeds are staffed by the Worker pool (the Worker props below), as in Build:
+  // drawing their per-station operators too would show the same people twice.
+  const poolStaffed = new Set(nodes.filter(w => typeOf(w) === 'Workplace').flatMap(w => nodesOf(into.get(w.id)).map(baseOf)))
   for (const n of machineNodes) {
     const m = machineOf.get(n.id)!
+    if (poolStaffed.has(m.baseName)) continue
     const cfg = stationsData[m.baseName]
     const opCount = cfg?.operator_per_station ?? n.data.operators ?? 1
     // shift1 is a per-station shift-time override, not an operator name.
@@ -302,6 +306,7 @@ export function buildScene3D(
       sawEnd = true
       prop.label = n.data.label
     } else if (type === 'Workplace') {
+      prop.label = n.data.label
       prop.stations = nodesOf(into.get(n.id)).map(baseOf)
     } else if (type === 'Worker Controller') {
       prop.label = n.data.label
@@ -325,6 +330,8 @@ export function buildScene3D(
     const pa = propOf.get(e.source)
     const pb = propOf.get(e.target)
     if (!(a || pa) || !(b || pb)) continue
+    // Staffing links (Worker / Worker Controller / Workplace) are hidden in Build, so no tube here either.
+    if (POOL_TYPES.has(typeOf(byId.get(e.source)!)) || POOL_TYPES.has(typeOf(byId.get(e.target)!))) continue
     // A prop has no height of its own — its end of the tube meets the machine's.
     const fromY = a?.position[1] ?? b?.position[1] ?? 0.4
     const toY = b?.position[1] ?? a?.position[1] ?? 0.4

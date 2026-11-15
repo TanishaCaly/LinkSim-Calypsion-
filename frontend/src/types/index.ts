@@ -107,6 +107,9 @@ export interface ProcessStep {
   // visits only ONE of them, picked by the previous station's Exit
   // Controller. Absent on a plain step.
   branch?: number
+  // A Buffer at the end of a line with no End: parts stay in it (it can
+  // fill up and block the station before it) and count as finished.
+  holds_parts?: boolean
 }
 
 export interface OperatorConfig {
@@ -303,6 +306,11 @@ export interface BufferStateStat {
   occupied: number
   full: number
   operating_time: number
+  // Parts, as for a station: in the buffer at the end of the run, left it
+  // after the warm-up, scrap (always 0). Absent on runs made before.
+  current_parts?: number
+  completed_parts?: number
+  scrapped_parts?: number
 }
 
 // Parts delivered by each Start (Start -> product -> count) and collected at
@@ -506,14 +514,13 @@ export interface StationNodeData {
   // doesn't lose its type-specific fields (e.g. Assembly Count).
   stationType?: string
   capacity: number
-  cycleTime: number
+  // Process Time (min): the time the machine works on one job. Saved as the
+  // route step's duration, which the engine uses as-is. (Cycle Time is a
+  // result — wait + setup + process + blocked — never an input.)
+  processTime: number
   operators: number
-  // Display-only fields shown alongside Cycle Time on the Station panel —
-  // not yet read by the simulation engine (Cycle Time keeps feeding the
-  // engine's process duration exactly as before). setupTime saves to the
-  // scenario's existing 'Setup time' station field.
+  // Saves to the scenario's existing 'Setup time' station field.
   setupTime?: number
-  processTime?: number
   // Minutes to fix this station after a breakdown (MTTR). Saves to the
   // scenario's existing 'Repair Time' station field — previously only
   // editable outside Canvas (Excel import or the ScenarioManager grid),
@@ -540,7 +547,7 @@ export interface StationNodeData {
   // 'Dismantle'; see DismantleConfig for what the simulation uses.
   dismantle?: DismantleConfig
   // Conveyor belt speed (m/min). Its transport time is conveyorLength /
-  // conveyorSpeed, used instead of cycleTime for Conveyor stations.
+  // conveyorSpeed, used instead of processTime for Conveyor stations.
   conveyorSpeed?: number
   // Conveyor dimensions (m) and capacity (units). Width/Height are display only.
   conveyorLength?: number

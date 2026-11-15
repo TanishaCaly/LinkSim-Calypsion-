@@ -1,7 +1,4 @@
 import { Fragment, type ReactNode } from 'react'
-import { Cpu } from 'lucide-react'
-import flow from './flow.html?raw'
-import calypsion from '@/assets/calypsion-logo.png'
 import './auth.css'
 
 const STEPS = ['Build', 'Run', 'Replay', 'Improve']
@@ -10,7 +7,7 @@ const STEPS = ['Build', 'Run', 'Replay', 'Improve']
 export default function AuthShell({ eyebrow, title, sub, children }: {
   eyebrow: string
   title: string
-  sub: string
+  sub?: string
   children: ReactNode
 }) {
   return (
@@ -18,21 +15,20 @@ export default function AuthShell({ eyebrow, title, sub, children }: {
       <aside className="brand" aria-hidden="true">
         <div className="top">
           <div className="mark">
-            <span className="lg"><Cpu size={22} strokeWidth={2} /></span>
-            <div>LinkSim<small>Manufacturing DES</small></div>
+            <img src="/linksim-mark.png" alt="" style={{ width: 40, height: 40, objectFit: 'contain' }} />
+            <div>LinkSim<sup style={{ fontSize: 15, marginLeft: 2, opacity: 0.8, position: 'relative', top: -2 }}>™</sup><small>Manufacturing DES</small></div>
           </div>
           <div className="co">
-            <img src={calypsion} alt="" />
+            <img src="/linksim-mark.png" alt="" />
             <div><small>Powered by</small>Calypsion Innovations</div>
           </div>
         </div>
 
         <div>
           <div className="copy">
-            <h2>Run the line<br />before you <em>build it.</em></h2>
+            <h2>Build any line.<br />Simulate anything.<br /><em>Optimize everything.</em></h2>
             <p>Draw a production line, simulate it, and see exactly which station holds everything back.</p>
           </div>
-          <div className="line" dangerouslySetInnerHTML={{ __html: flow }} />
         </div>
 
         <div className="steps">
@@ -49,10 +45,10 @@ export default function AuthShell({ eyebrow, title, sub, children }: {
         <div className="box">
           <div className="eyebrow">{eyebrow}</div>
           <h1>{title}</h1>
-          <p className="sub">{sub}</p>
+          {sub && <p className="sub">{sub}</p>}
           {children}
         </div>
-        <div className="foot">LinkSim · Powered by Calypsion Innovations</div>
+        <div className="foot">LinkSim · Powered by <b>Calypsion Innovations</b></div>
       </main>
     </div>
   )

@@ -1,4 +1,4 @@
-import { useMemo, useState, useRef } from 'react'
+import { useEffect, useMemo, useState, useRef } from 'react'
 import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { Plus, Upload, Trash2, FileText, X, Save, PlusCircle, Search } from 'lucide-react'
@@ -257,7 +257,7 @@ export function UploadDialog({ open, onClose }: { open: boolean; onClose: () => 
         {mode === 'flat' && (
           <div className="space-y-3">
             <div>
-              <Label>Routing CSV (Part_Name / Machine / Cycle_Time…)</Label>
+              <Label>Routing CSV (Part_Name / Machine / Process_Time…)</Label>
               <Input
                 type="file"
                 accept=".csv"
@@ -2120,6 +2120,15 @@ export default function ScenarioManager() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { setActiveScenario, setActiveRun, showToast, setJustReset } = useAppStore()
+
+  // Coming to Scenarios closes the open scenario (as New canvas does): the top
+  // bar shows "No scenario open", Workspace opens blank and Analysis / Interfaces
+  // & AI show nothing until a scenario is opened again.
+  useEffect(() => {
+    setActiveScenario(null)
+    setActiveRun(null)
+    setJustReset(false)
+  }, [setActiveScenario, setActiveRun, setJustReset])
 
   const handleViewFile = async (id: number) => {
     try {

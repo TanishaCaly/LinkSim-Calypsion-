@@ -26,6 +26,21 @@ export interface SimConfigOverride {
   [key: string]: unknown
 }
 
+/** Simulation time a run starts with: 8 hours (minutes). */
+export const DEFAULT_SIM_TIME = 480
+
+/** Every day of the week (Monday=0 ... Sunday=6, as the engine counts). */
+export const ALL_DAYS = [0, 1, 2, 3, 4, 5, 6]
+
+/** Saved into every NEW scenario (Workspace save or file import, unless the
+ * file sets them): each shift works every day, with no break. Older
+ * scenarios without these keys keep the engine's old defaults (Mon-Fri for
+ * Shift 1/2, a 30-min break per shift), so their results don't change. */
+export const NEW_SCENARIO_CALENDAR: SimConfigOverride = {
+  WORKING_DAYS_1: ALL_DAYS, WORKING_DAYS_2: ALL_DAYS, WORKING_DAYS_3: ALL_DAYS,
+  BREAKS_1: [], BREAKS_2: [], BREAKS_3: [],
+}
+
 export const simulationsApi = {
   triggerRun: (scenarioId: number, overrides: SimConfigOverride = {}) => {
     const { num_replications = 1, ...sim_config_override } = overrides

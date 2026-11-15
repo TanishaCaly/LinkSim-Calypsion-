@@ -2035,3 +2035,46 @@ def test_worker_controller_shift_is_clock_time():
     # The part is on DIS from 06:02; Op1 is called at exactly 12:00, when
     # the shift opens, so the 2 min of work end at 12:02.
     assert first["process_end_time_real"][11:16] == "12:02"
+
+
+def test_last_buffer_without_end_keeps_parts():
+    # Station 1 (5 min) -> Buffer 1 (room 3), no End: parts stay in the
+    # buffer and count as finished. Once 3 are in it, Station 1 is blocked.
+    stations = {
+        "Station 1": _station(operator_per_station=0, **{"Enable Failures": False}),
+        "Buffer 1": _station(operator_per_station=0, **{"Station Type": "Buffer", "Buffer Capacity": 3}),
+    }
+    flow = {"v": [{"operation": "a", "resource": "Station 1", "duration": 5.0},
+                  {"operation": "b", "resource": "Buffer 1", "duration": 0.0, "holds_parts": True}]}
+    result, sim = _run_sim(stations, flow, {"v": 10}, sim_time=100.0)
+    assert result["simulation_state"]["completed_jobs"] == 3
+    b = result["buffer_states"]["Buffer 1"]
+    assert b["current_parts"] == 3 and b["completed_parts"] == 0
+    assert result["station_states"]["Station 1"]["blocked"] > 0
+
+
+def test_last_buffer_with_end_still_lets_parts_go():
+    # Same line, Buffer 1 -> End (no holds_parts): parts leave, all 10 finish.
+    stations = {
+        "Station 1": _station(operator_per_station=0, **{"Enable Failures": False}),
+        "Buffer 1": _station(operator_per_station=0, **{"Station Type": "Buffer", "Buffer Capacity": 3}),
+    }
+    flow = {"v": [{"operation": "a", "resource": "Station 1", "duration": 5.0},
+                  {"operation": "b", "resource": "Buffer 1", "duration": 0.0}]}
+    result, _ = _run_sim(stations, flow, {"v": 10}, sim_time=100.0)
+    assert result["simulation_state"]["completed_jobs"] == 10
+
+
+def test_start_alone_counts_parts_as_finished():
+    # Only a Start (no steps): each part counts as finished when released.
+    stations = {"Start": _station(operator_per_station=0, **{"Station Type": "Source"})}
+    result, _ = _run_sim(stations, {"v": []}, {"v": 10}, sim_time=480.0)
+    assert result["simulation_state"]["completed_jobs"] == 10
+
+
+def test_line_ending_at_a_station_without_end():
+    # Start -> Station 1, nothing after: a part is finished when it leaves Station 1.
+    stations = {"Station 1": _station(operator_per_station=0, **{"Enable Failures": False})}
+    flow = {"v": [{"operation": "a", "resource": "Station 1", "duration": 5.0}]}
+    result, _ = _run_sim(stations, flow, {"v": 10}, sim_time=480.0)
+    assert result["simulation_state"]["completed_jobs"] == 10

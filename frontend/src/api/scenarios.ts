@@ -1,5 +1,6 @@
 import api from './client'
 import type { Scenario, ScenarioCreate, ScenarioListItem, UploadResponse } from '../types'
+import { NEW_SCENARIO_CALENDAR } from './simulations'
 
 export const scenariosApi = {
   list: (skip = 0, limit = 50) =>
@@ -79,7 +80,7 @@ export const scenariosApi = {
       variant_intervals: parsed.variant_intervals ?? {},
       setup_matrix: parsed.setup_matrix ?? {},
       operators_data: parsed.operators,
-      simulation_config: parsed.simulation_config ?? {},
+      simulation_config: { ...NEW_SCENARIO_CALENDAR, ...(parsed.simulation_config ?? {}) },
       source_filename: file.name,
       source_file: fileBytes,
     } as any)
@@ -98,7 +99,7 @@ export const scenariosApi = {
       variant_intervals: parsed.variant_intervals ?? {},
       setup_matrix: parsed.setup_matrix ?? {},
       operators_data: parsed.operators,
-      simulation_config: parsed.simulation_config ?? {},
+      simulation_config: { ...NEW_SCENARIO_CALENDAR, ...(parsed.simulation_config ?? {}) },
       source_filename: file.name,
       source_file: fileBytes,
     } as any)
@@ -128,7 +129,7 @@ export const scenariosApi = {
       processflow_data: parsed.processflow,
       variant_quantities: parsed.variant_quantities,
       operators_data: parsed.operators,
-      simulation_config: parsed.simulation_config ?? {},
+      simulation_config: { ...NEW_SCENARIO_CALENDAR, ...(parsed.simulation_config ?? {}) },
       source_filename: `${name}_bundle.json`,
       source_file: bundleBytes,
     } as any)

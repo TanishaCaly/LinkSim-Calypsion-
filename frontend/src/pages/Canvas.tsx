@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import ReactFlow, {
-  addEdge, Background, Controls, MiniMap,
+  addEdge, Background, Controls, MiniMap, Panel,
   useNodesState, useEdgesState, useEdges,
   type Connection, type Edge, type Node, type NodeTypes, type ReactFlowInstance,
   Handle, Position, MarkerType, ConnectionMode, SelectionMode,
@@ -15,10 +15,11 @@ import {
   ChevronDown, Check,
 } from 'lucide-react'
 import { scenariosApi } from '@/api/scenarios'
-import { simulationsApi } from '@/api/simulations'
+import { simulationsApi, type SimConfigOverride, DEFAULT_SIM_TIME, NEW_SCENARIO_CALENDAR } from '@/api/simulations'
 import { useAppStore } from '@/store/useAppStore'
 import SimDialogsHost from '@/components/run/SimDialogsHost'
 import SimSettingsMenu, { openSimDialog } from '@/components/run/SimSettingsMenu'
+import { IdleReplayBar } from '@/components/run/ReplayBar'
 import { useRunSimulation } from '@/hooks/useRunSimulation'
 import { STATUS_LEGEND } from '@/lib/status'
 import { Button } from '@/components/ui/button'
@@ -27,7 +28,7 @@ import Scene from '@/canvas3d/Scene'
 import { buildScene3D } from '@/canvas3d/layout'
 import { stressLine } from '@/canvas3d/devStress'
 import { inferStationType } from '@/lib/stationTypes'
-import type { StationNodeData, ScenarioCreate, StationConfig, MuRow, AssemblyConfig, AssemblyTableKind, AssemblyTableRow, DismantleConfig, DismantleRow, CanvasLayout, WorkerStat, StationStateStat, BufferStateStat, PartsFlow } from '@/types'
+import type { StationNodeData, ScenarioCreate, StationConfig, MuRow, AssemblyConfig, AssemblyTableKind, AssemblyTableRow, DismantleConfig, DismantleRow, CanvasLayout, CanvasLayoutBox, WorkerStat, StationStateStat, BufferStateStat, PartsFlow, Scenario } from '@/types'
 import { defaultVariantColor, unusedVariantColor, jobPrefix } from '@/lib/variantColors'
 
 // ─── Detailed Object Palette icons ───────────────────────────────────────────
@@ -355,7 +356,7 @@ interface FlowNodeData {
   // Worker Controller X" instead of leaving a pooled station looking
   // identical to one using the plain static shift1/2/3 assignment.
   workerController?: string
-  // Buffer-only stats (from StationStat) — a Buffer has no cycle time/parallel
+  // Buffer-only stats (from StationStat) — a Buffer has no process time/parallel
   // machines/shifts of its own, it just holds jobs, so the View-mode panel
   // shows these instead for a Buffer node.
   bufferCapacity?: number
@@ -793,7 +794,7 @@ function PropertyEditor({
   const nodeType = inferStationType(node.data.label, node.data.stationType)
   // A Connector is a routing junction, a Conveyor is transport, and a
   // Source/Drain is just where jobs enter/leave the line — none of these are
-  // a machine, so the machine fields below (capacity, cycle time, operators,
+  // a machine, so the machine fields below (capacity, process time, operators,
   // shifts, parallel machines) don't apply to them (the engine ignores those
   // fields for Connector/Conveyor; Source/Drain have no real engine semantics
   // at all yet — see sim_core.py's Station Type handling). Showing them
@@ -967,19 +968,19 @@ function PropertyEditor({
       // A Workplace is never its own processflow step (see the save
       // mutation's stepDuration — always 0 for Workplace) and its Operators
       // count is never read either, since real staffing comes from the
-      // Worker Controller's pool. Cycle Time/Operators would silently do
+      // Worker Controller's pool. Process Time/Operators would silently do
       // nothing here, so only Name is shown.
       : isWorkplace
         ? [{ key: 'label', label: 'Name', type: 'text' }]
         // A Buffer/Queue node has no process/setup duration and no
         // operator of its own — it's a waiting slot, not a work station —
-        // so Cycle/Setup/Process Time and Operators would all be inert
+        // so Setup/Process Time and Operators would all be inert
         // here, same reasoning as Workplace above.
         : isBuffer
           ? [{ key: 'label', label: 'Name', type: 'text' }]
           : [
             { key: 'label',       label: 'Name',              type: 'text'   },
-            { key: 'cycleTime',   label: 'Cycle Time (min)',   type: 'number' },
+            { key: 'processTime',   label: 'Process Time (min)', type: 'number' },
             { key: 'setupTime',   label: 'Setup Time (min)',   type: 'number' },
             { key: 'operators',   label: 'Operators',          type: 'number' },
             { key: 'repairTime',  label: 'Repair Time (min)',  type: 'number' },
@@ -1063,7 +1064,7 @@ function PropertyEditor({
               )}
             </div>
           )
-          // Text fields (Name) stay full-width; number fields (Cycle/Setup/
+          // Text fields (Name) stay full-width; number fields (Setup/
           // Process Time, Operators, ...) are paired two-per-row so they
           // don't each burn a full row of vertical space.
           const textFields = fields.filter((f) => f.type !== 'number')
@@ -2285,6 +2286,26 @@ function PropertyEditor({
               <p className="text-[10px] text-gray-400 mt-1.5">
                 Last run · of {st.operating_time.toFixed(0)} min operating time (shift time minus breaks).
               </p>
+              {/* Parts, as on a station: in the buffer at the end of the run;
+                  moved on from it after the warm-up; scrap (always 0). */}
+              {st.completed_parts !== undefined && (() => {
+                const count = (n: number) => (Number.isInteger(n) ? String(n) : n.toFixed(1))
+                const parts = [
+                  { label: 'Current parts', value: st.current_parts ?? 0 },
+                  { label: 'Completed parts', value: st.completed_parts ?? 0 },
+                  { label: 'Scrap count', value: st.scrapped_parts ?? 0 },
+                ]
+                return (
+                  <div className="mt-2.5 space-y-1 border-t border-gray-100 pt-2">
+                    {parts.map((p) => (
+                      <div key={p.label} className="flex items-center justify-between text-xs">
+                        <span className="text-gray-600">{p.label}</span>
+                        <span className="font-semibold text-gray-800 tabular-nums">{count(p.value)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )
+              })()}
             </div>
           )
         })()}
@@ -2625,7 +2646,7 @@ function buildEditableGraph(
             parallelGroup: cfg?.['Parallel Group'] || (capacity > 1 ? resourceName : undefined),
             stationType: cfg?.['Station Type'],
             capacity: capacity > 1 ? 1 : capacity,
-            cycleTime: step.duration,
+            processTime: step.duration,
             operators: cfg?.operator_per_station ?? 1,
             shiftsPerDay: normalizeShiftsPerDay(cfg?.shifts_per_day),
             // An older conveyor saved with Length + Transport Time (no Speed)
@@ -2723,7 +2744,7 @@ function buildEditableGraph(
           savedName: controllerBase,
           stationType: 'Worker Controller',
           capacity: 1,
-          cycleTime: 0,
+          processTime: 0,
           operators: 0,
           controllerEnabled: controllerCfg['Enabled'] ?? true,
           assignmentStrategy: controllerCfg['Assignment Strategy'] ?? 'first_available',
@@ -2748,7 +2769,7 @@ function buildEditableGraph(
             label: w.name || `Worker ${wi + 1}`,
             stationType: 'Worker',
             capacity: 1,
-            cycleTime: 0,
+            processTime: 0,
             operators: 0,
             assignedOperator: w.name || undefined,
             travelTime: w.travel_time ?? 0,
@@ -2777,7 +2798,7 @@ function buildEditableGraph(
             label: `${stationBase} Workplace`,
             stationType: 'Workplace',
             capacity: 1,
-            cycleTime: 0,
+            processTime: 0,
             operators: 0,
           },
         })
@@ -2805,6 +2826,26 @@ const WIRING_TYPES = ['Worker', 'Worker Controller', 'Workplace']
 
 function isWiringNode(n: Node<StationNodeData>): boolean {
   return WIRING_TYPES.includes(inferStationType(n.data.label, n.data.stationType))
+}
+
+// A box left out of the line: every box of the flow (not the Worker /
+// Worker Controller / Workplace wiring) needs a line coming in (all but
+// Start), or jobs never get there. A line may end anywhere without an End:
+// a part is finished when it leaves the last box (a last Buffer keeps it;
+// a Start alone: finished when released). The first such box, as the
+// message to show.
+function lineProblem(nodes: Node<StationNodeData>[], edges: Edge[]): string | undefined {
+  const flow = nodes.filter((n) => !isWiringNode(n))
+  const ids = new Set(flow.map((n) => n.id))
+  const flowEdges = edges.filter((e) => ids.has(e.source) && ids.has(e.target))
+  for (const n of flow) {
+    const type = inferStationType(n.data.label, n.data.stationType)
+    const hasIn = flowEdges.some((e) => e.target === n.id)
+    if (type !== 'Source' && !hasIn) {
+      return `${n.data.label} has no line coming into it — connect it from the box before it`
+    }
+  }
+  return undefined
 }
 
 function edgeProducts(e: Edge): string[] | undefined {
@@ -2895,6 +2936,14 @@ function graphRouteSig(
     else if (toEnd && !fromStart) last.add(nameOf(a))
     else if (!fromStart && !toEnd) pairs.add(`${nameOf(a)}>${nameOf(b)}`)
   }
+  // A Buffer ending the line with no End is a last box too.
+  for (const e of edges) {
+    if (!isFlowEdge(e, byId) || !lineIsFor(e, product, shown)) continue
+    const b = byId.get(e.target)!
+    if (typeOf(b) === 'Buffer' && !edges.some((o) => o.source === b.id && isFlowEdge(o, byId) && lineIsFor(o, product, shown))) {
+      last.add(nameOf(b))
+    }
+  }
   return routeShape(pairs, first, last)
 }
 
@@ -2980,6 +3029,8 @@ function routeFromGraph(
       steps.push({
         operation: `${base}_op`, resource: base, duration: stepDuration(n),
         ...(branchOf[groupKey(n)] !== undefined ? { branch: branchOf[groupKey(n)] } : {}),
+        // A Buffer with no line going on (no End): its parts stay in it.
+        ...(nodeType === 'Buffer' && destNodes.length === 0 ? { holds_parts: true } : {}),
       })
       for (const d of destNodes) next.push(d)
     }
@@ -2995,6 +3046,16 @@ function stationBoxData(name: string, stationsData: Record<string, StationConfig
     { box: [{ operation: name, resource: name, duration }] }, 'box', { [name]: stationsData[name] },
   )
   return nodes[0].data
+}
+
+// A box's saved settings. Drawings saved before the rename keep the box's
+// time under its old name "cycleTime" (it always was the Process Time) —
+// read it as processTime. Such a drawing may also hold an old unused
+// "processTime" display field; the "cycleTime" value is the real one.
+function savedBoxData(data: CanvasLayoutBox['data']): Partial<StationNodeData> {
+  if (!data || !('cycleTime' in data)) return data ?? {}
+  const { cycleTime, ...rest } = data as Partial<StationNodeData> & { cycleTime?: number }
+  return { ...rest, processTime: cycleTime }
 }
 
 // The saved drawing, back as boxes and lines. Settings come from the saved
@@ -3014,9 +3075,10 @@ function graphFromLayout(
     const key = stationsData[box.name] ? box.name : baseStationName(box.name)
     const cfg = stationsData[key]
     if (!cfg && !['Source', 'Drain', ...WIRING_TYPES].includes(box.type)) continue
+    const saved = savedBoxData(box.data)
     const data: StationNodeData = cfg
-      ? { ...box.data, ...stationBoxData(key, stationsData, box.data?.cycleTime ?? 0), label: box.name, savedName: key, capacity: 1, boxId: box.id }
-      : { capacity: 1, cycleTime: 0, operators: 0, shiftsPerDay: [1], ...box.data, label: box.name, boxId: box.id }
+      ? { ...saved, ...stationBoxData(key, stationsData, saved.processTime ?? 0), label: box.name, savedName: key, capacity: 1, boxId: box.id }
+      : { capacity: 1, processTime: 0, operators: 0, shiftsPerDay: [1], ...saved, label: box.name, boxId: box.id }
     nodes.push({ id: box.id, type: 'station', position: { x: box.x, y: box.y }, data })
   }
   const ids = new Set(nodes.map((n) => n.id))
@@ -3111,11 +3173,11 @@ function wholeScenarioGraph(
   const drainName = Object.keys(stationsData).find((k) => stationsData[k]?.['Station Type'] === 'Drain') ?? 'End'
   const start: Node<StationNodeData> = {
     id: 'start', type: 'station', position: { x: 0, y: 0 },
-    data: { label: sourceName, stationType: 'Source', capacity: 1, cycleTime: 0, operators: 0, shiftsPerDay: [1] },
+    data: { label: sourceName, stationType: 'Source', capacity: 1, processTime: 0, operators: 0, shiftsPerDay: [1] },
   }
   const end: Node<StationNodeData> = {
     id: 'end', type: 'station', position: { x: 0, y: 0 },
-    data: { label: drainName, stationType: 'Drain', capacity: 1, cycleTime: 0, operators: 0, shiftsPerDay: [1] },
+    data: { label: drainName, stationType: 'Drain', capacity: 1, processTime: 0, operators: 0, shiftsPerDay: [1] },
   }
   for (const p of Object.keys(processflow)) {
     const g = buildEditableGraph(processflow, p, stationsData)
@@ -3735,7 +3797,7 @@ function loadScenarioGraph(
   // saved MU table and Exit Controller.
   const nodes = drawnNodes.map((drawn) => {
     const time = shownTime[drawn.data.savedName ?? drawn.data.label]
-    const n = time !== undefined ? { ...drawn, data: { ...drawn.data, cycleTime: time } } : drawn
+    const n = time !== undefined ? { ...drawn, data: { ...drawn.data, processTime: time } } : drawn
     if (inferStationType(n.data.label, n.data.stationType) !== 'Source') return n
     const cfg = scenario.stations_data?.[n.data.label]
     if (!cfg) return n
@@ -3946,7 +4008,7 @@ function RoutesPanel({ products, stations, colors, initial, problemsOf, onApply,
       </div>
       <div className="p-3 space-y-3">
         <p className="text-[10px] text-gray-400">Tick the stations each product goes through — the order comes from the drawing.</p>
-        <div className="rounded-lg border border-gray-200 overflow-hidden">
+        <div className="rounded-lg border border-gray-200 max-h-[45vh] overflow-auto">
           <table className="w-full text-xs">
             <thead>
               <tr className="bg-gray-50 border-b border-gray-200 text-gray-500">
@@ -4830,6 +4892,15 @@ export default function Canvas() {
     }
   }), [nodes, activeScenario])
   const replayState = (activeRun?.result as { simulation_state?: { job_release_times?: Record<string, unknown>; job_finish_times?: Record<string, unknown>; assemblies?: Record<string, AssemblyRecord>; dismantles?: Record<string, DismantleRecord> } } | null)?.simulation_state
+  // When the run started: its first job release ("2025-01-01 06:00:00", local time).
+  const runStartMs = useMemo(() => {
+    let first = Infinity // a loop: a big run has hundreds of thousands of jobs
+    for (const t of Object.values(replayState?.job_release_times ?? {})) {
+      const ms = typeof t === 'string' ? new Date(t.replace(' ', 'T')).getTime() : NaN
+      if (ms < first) first = ms
+    }
+    return Number.isFinite(first) ? first : undefined
+  }, [replayState])
 
   // The store's copy of the scenario can be older than the saved one — the
   // Scenarios page saves straight to the server without touching it. Fetch
@@ -4872,7 +4943,7 @@ export default function Canvas() {
     setNodes(finalNodes)
     setEdges(loadedEdges)
     loadedLinesRef.current = linesByProduct(Object.keys(activeScenario.processflow_data ?? {}), finalNodes, loadedEdges)
-    loadedTimesRef.current = Object.fromEntries(finalNodes.map((n) => [n.id, n.data.cycleTime]))
+    loadedTimesRef.current = Object.fromEntries(finalNodes.map((n) => [n.id, n.data.processTime]))
     setScenarioName(activeScenario.name)
     setBuildVariant(selectedVariant)
     setSavedSignature(canvasSignatureOf(finalNodes, loadedEdges))
@@ -4981,14 +5052,14 @@ export default function Canvas() {
       const avgY = nds.length > 0 ? nds.reduce((sum, n) => sum + n.position.y, 0) / nds.length : 160
       const position = dropPosition ?? { x: nds.length > 0 ? rightmostX + 220 : 80, y: avgY }
       // Non-machine types start with values that match how the engine treats
-      // them: a Connector never processes (0 cycle time, no operator) and a
+      // them: a Connector never processes (0 process time, no operator) and a
       // Conveyor moves rather than works (transport time, no operator).
       const data: StationNodeData =
         typeName === 'Connector' || typeName === 'Worker' || typeName === 'Worker Controller'
-          ? { label, stationType: typeName, capacity: 1, cycleTime: 0, operators: 0, shiftsPerDay: [1] }
+          ? { label, stationType: typeName, capacity: 1, processTime: 0, operators: 0, shiftsPerDay: [1] }
           : typeName === 'Conveyor'
-            ? { label, stationType: typeName, capacity: 1, cycleTime: 0, operators: 0, conveyorSpeed: 1, conveyorCapacity: 1, shiftsPerDay: [1] }
-            : { label, stationType: typeName, capacity: 1, cycleTime: 30, operators: 1, shiftsPerDay: [1] }
+            ? { label, stationType: typeName, capacity: 1, processTime: 0, operators: 0, conveyorSpeed: 1, conveyorCapacity: 1, shiftsPerDay: [1] }
+            : { label, stationType: typeName, capacity: 1, processTime: 30, operators: 1, shiftsPerDay: [1] }
       return [
         ...nds,
         {
@@ -5231,7 +5302,7 @@ export default function Canvas() {
           type: 'station',
           position: { x: station.position.x, y: station.position.y + 170 },
           data: {
-            label, stationType: 'Workplace', capacity: 1, cycleTime: 0, operators: 1,
+            label, stationType: 'Workplace', capacity: 1, processTime: 0, operators: 1,
             // Mirrors the station's own shift availability — a Workplace only
             // ever exists to staff its one station, so it should never be
             // "available" on a shift the station itself doesn't run.
@@ -5336,7 +5407,11 @@ export default function Canvas() {
   }
 
   const saveMutation = useMutation({
-    mutationFn: async () => {
+    // name: the name to save under (the name box's, unless given).
+    // simCfg: the Sim setting a new scenario is created with (this one's,
+    // unless given — e.g. a timer just applied, not in state yet).
+    mutationFn: async (vars?: { name?: string; simCfg?: SimConfigOverride }) => {
+      const saveName = vars?.name ?? scenarioName
       // Each station's settings as saved right now (fetched fresh, so edits
       // made meanwhile in the Scenarios page are kept). Save starts from
       // these and only changes what this Canvas manages — settings it
@@ -5565,8 +5640,8 @@ export default function Canvas() {
         // ScenarioManager's Grid mode (an editable "Start (min)" column that
         // silently does nothing).
         if (t === 'Connector' || t === 'Worker' || t === 'Worker Controller' || t === 'Workplace' || t === 'Source' || t === 'Drain') return 0
-        if (t === 'Conveyor') return conveyorTransportTime(n.data) ?? n.data.cycleTime
-        return n.data.cycleTime
+        if (t === 'Conveyor') return conveyorTransportTime(n.data) ?? n.data.processTime
+        return n.data.processTime
       }
 
       // The product this Save writes from the Canvas: the one picked in
@@ -5596,7 +5671,7 @@ export default function Canvas() {
           : undefined
         if (!box) return step
         const changed = inferStationType(box.data.label, box.data.stationType) === 'Conveyor'
-          || box.data.cycleTime !== loadedTimesRef.current[box.id]
+          || box.data.processTime !== loadedTimesRef.current[box.id]
         return changed ? { ...step, duration: stepDuration(box) } : step
       })
 
@@ -5710,7 +5785,7 @@ export default function Canvas() {
         }
         layout.routes = Object.fromEntries(Object.entries(processflow).map(([v, st]) => [v, routeSig(st)]))
         return scenariosApi.update(activeScenario.id, {
-          name: scenarioName, stations_data: stationsData, processflow_data: processflow,
+          name: saveName, stations_data: stationsData, processflow_data: processflow,
           variant_quantities: variantQty,
           variant_intervals: savedScenario.variant_intervals ?? {},
           canvas_layout: layout,
@@ -5721,15 +5796,18 @@ export default function Canvas() {
       const variantQty: Record<string, number> = { [variant]: 200 }
       layout.routes = { [variant]: routeSig(steps) }
       return scenariosApi.create({
-        name: scenarioName, stations_data: stationsData, processflow_data: processflow,
+        name: saveName, stations_data: stationsData, processflow_data: processflow,
         variant_quantities: variantQty,
         canvas_layout: layout,
         operators_data: { Op1: { 'Skill Rating': 3, 'Availability (%)': 100 } },
+        // Defaults, with what was set in Sim setting before this first save.
         simulation_config: {
-          SIM_TIME: 10080, SHIFT_DURATION: 480,
+          SIM_TIME: DEFAULT_SIM_TIME, SHIFT_DURATION: 480,
           SHIFT_1_START: 6, SHIFT_1_END: 14, SHIFT_2_START: 14, SHIFT_2_END: 22,
           SHIFT_3_START: 22, SHIFT_3_END: 6, STATION_DOWNTIME: 0, ACTIVE_PROCESSING_TIME: 480,
-        },
+          ...NEW_SCENARIO_CALENDAR,
+          ...(vars?.simCfg ?? sim.simCfg),
+        } as ScenarioCreate['simulation_config'],
       })
     },
     onSuccess: (scenario) => {
@@ -5753,7 +5831,7 @@ export default function Canvas() {
       setEdges(savedEdges)
       setSavedSignature(canvasSignatureOf(savedNodes, savedEdges))
       loadedLinesRef.current = linesByProduct(Object.keys(scenario.processflow_data ?? {}), savedNodes, savedEdges)
-      loadedTimesRef.current = Object.fromEntries(savedNodes.map((n) => [n.id, n.data.cycleTime]))
+      loadedTimesRef.current = Object.fromEntries(savedNodes.map((n) => [n.id, n.data.processTime]))
       // The canvas now shows this saved product.
       if (savedVariantRef.current) {
         setBuildVariant(savedVariantRef.current)
@@ -5770,8 +5848,10 @@ export default function Canvas() {
   // the user in Canvas so they can keep editing other stations.
   // onSaved: just save and then do this (switching product), instead of
   // going to Run / running.
-  const handleSave = (navigateAfter: boolean, onSaved?: () => void) => {
-    if (!scenarioName.trim()) {
+  // name: save under this name instead of the name box's.
+  // simCfg: the Sim setting to create a new scenario with (see saveMutation).
+  const handleSave = (navigateAfter: boolean, onSaved?: (scenario: Scenario) => void, name?: string, simCfg?: SimConfigOverride) => {
+    if (!(name ?? scenarioName).trim()) {
       showToast('Please enter a scenario name before saving', 'error')
       return
     }
@@ -5779,8 +5859,11 @@ export default function Canvas() {
       showToast('Add at least one station before saving', 'error')
       return
     }
-    if (edges.length === 0) {
-      showToast('Connect your stations before saving (drag from one box to the next)', 'error')
+    // No lines at all is fine for a Start alone; any other box without a
+    // line coming in is caught by lineProblem below.
+    const notInLine = lineProblem(nodes, edges)
+    if (notInLine) {
+      showToast(notInLine, 'error')
       return
     }
     // Every Assembly box (also one never opened: its defaults count too).
@@ -5863,11 +5946,11 @@ export default function Canvas() {
       showToast(groupProblem, 'error')
       return
     }
-    saveMutation.mutate(undefined, {
+    saveMutation.mutate({ name, simCfg }, {
       onSuccess: (scenario) => {
         if (onSaved) {
           showToast(`"${scenario.name}" saved`)
-          onSaved()
+          onSaved(scenario)
           return
         }
         showToast(navigateAfter ? `"${scenario.name}" saved` : 'Station saved — running simulation…')
@@ -5876,6 +5959,44 @@ export default function Canvas() {
       },
     })
   }
+
+  // Save the canvas if it needs it, then `then(the saved scenario's id)`.
+  // No name yet: it is named after the date and time ("Scenario
+  // 11-11-2026 23:38:05"), shown in the name box so it can be renamed later.
+  // A problem (not connected, ...) shows the same error as Save, and
+  // `then` is not called. Nothing on the canvas, or nothing changed since
+  // the last save: no save, `then` straight away (id: the open scenario's,
+  // if any).
+  const saveThen = (then: (scenarioId: number | undefined) => void, simCfg?: SimConfigOverride) => {
+    if (saveMutation.isPending) return
+    const renamed = !!activeScenario && scenarioName.trim() !== '' && scenarioName !== activeScenario.name
+    if (nodes.length === 0 || !(canvasDirty || renamed)) { then(activeScenario?.id); return }
+    let name = scenarioName.trim()
+    if (!name) {
+      const d = new Date()
+      const p2 = (x: number) => String(x).padStart(2, '0')
+      name = `Scenario ${p2(d.getDate())}-${p2(d.getMonth() + 1)}-${d.getFullYear()} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`
+      setScenarioName(name)
+    }
+    handleSave(false, (scenario) => then(scenario.id), name, simCfg)
+  }
+  // Leaving the Workspace (a top tab or Log out) saves the canvas first, so
+  // a layout built here is never lost.
+  const leaveWorkspace = (go: () => void) => saveThen(() => go())
+  // Run (top bar, or Save & Run in Simulation Timer with its new `cfg`):
+  // a new or changed scenario is saved first, the same way, then run —
+  // a run always uses the saved version.
+  const runNow = (cfg?: SimConfigOverride) => saveThen((scenarioId) => {
+    if (scenarioId == null) { showToast('Add at least one station before running', 'error'); return }
+    sim.start(cfg, scenarioId)
+  }, cfg && { ...sim.simCfg, ...cfg })
+  const leaveWorkspaceRef = useRef(leaveWorkspace)
+  leaveWorkspaceRef.current = leaveWorkspace
+  const setLeaveGuard = useAppStore((st) => st.setLeaveGuard)
+  useEffect(() => {
+    setLeaveGuard((go) => leaveWorkspaceRef.current(go))
+    return () => setLeaveGuard(null)
+  }, [setLeaveGuard])
 
   // Build: open another product's line. With unsaved changes on the canvas,
   // ask first (Save / Discard / Cancel).
@@ -6187,17 +6308,18 @@ export default function Canvas() {
   }
 
   const onBuild = mode === 'build'
-  // Run (and Stop while running) sit in the top bar next to the other actions, in Build and in 3D alike.
-  const replayShown = !!completionLog && (mode === 'view' || activeRun?.status === 'completed')
+  // Run (and Stop while running) sit at the right end of the replay bar, next to Sim setting, in Build and in 3D alike.
+  // The replay bar is always there, in Build and 3D, and carries Sim setting. With no run to
+  // replay (a new or not-yet-run scenario, an empty Workspace) it is greyed out: only Sim
+  // setting works, and its Start / End / Run for / Elapsed show "—".
   const runButtons = (
     <>
-      {/* The replay bar carries Sim setting once there is a run to replay; until then it sits here. */}
-      {!replayShown && <SimSettingsMenu pill onConfig={() => openSimDialog('config')} onTimer={() => openSimDialog('timer')} />}
       <Button
-        onClick={() => sim.start()}
-        disabled={sim.isRunning || canvasDirty || !activeScenario}
-        title={canvasDirty ? 'Save the scenario first — a run uses the saved version' : 'Run the saved scenario'}
-        className="rounded-full px-4"
+        onClick={() => runNow()}
+        disabled={sim.isRunning || saveMutation.isPending}
+        title={canvasDirty || !activeScenario ? 'Saves the scenario, then runs it' : 'Run the saved scenario'}
+        size="sm"
+        className="h-[30px] rounded-lg px-3 text-xs"
       >
         {sim.isRunning ? <><RefreshCw className="h-3.5 w-3.5 mr-1.5 animate-spin" />Running{sim.progress ? ` ${Math.round(sim.progress.pct)}%` : '…'}</> : <><Play className="h-3.5 w-3.5 mr-1.5" />Run</>}
       </Button>
@@ -6206,7 +6328,8 @@ export default function Canvas() {
           variant="outline"
           onClick={sim.stop}
           disabled={sim.stopPending || !sim.canStop}
-          className="rounded-full border-red-200 px-4 text-red-600 hover:bg-red-50"
+          size="sm"
+          className="h-[30px] rounded-lg border-red-200 px-3 text-xs text-red-600 hover:bg-red-50"
           title="Stop this run at its next checkpoint — partial results are kept"
         >
           <Square className="h-3.5 w-3.5 mr-1.5" />
@@ -6214,6 +6337,13 @@ export default function Canvas() {
         </Button>
       )}
     </>
+  )
+  const replayShown = !!completionLog && (mode === 'view' ? scene3D.machines.length > 0 : activeRun?.status === 'completed')
+  const idleReplayBar = replayShown ? null : (
+    <IdleReplayBar
+      startDate={sim.simCfg.SIMULATION_START_DATE}
+      settings={<div className="flex items-center gap-1.5"><SimSettingsMenu compact up onConfig={() => openSimDialog('config')} onTimer={() => openSimDialog('timer')} />{runButtons}</div>}
+    />
   )
   const on3d = mode === 'view'
   const segBtn = (active: boolean, disabled?: boolean) =>
@@ -6274,10 +6404,10 @@ export default function Canvas() {
               className="h-9 mb-1"
             />
             {[
-              { group: 'Flow', labels: ['Source', 'Drain', 'Connector'] },
+              { group: 'Flow', labels: ['Source', 'Drain'] },
               { group: 'Processing', labels: ['Station', 'Parallel Station', 'Assembly', 'Dismantle', 'Robot'] },
               { group: 'Material', labels: ['Buffer', 'Conveyor', 'Movable Part'] },
-              { group: 'People', labels: ['Workplace', 'Worker', 'Worker Controller'] },
+              { group: 'Operator', labels: ['Workplace', 'Worker', 'Worker Controller'] },
             ].map(({ group, labels }) => {
               const q = paletteQuery.trim().toLowerCase()
               const items = labels
@@ -6350,7 +6480,6 @@ export default function Canvas() {
                     Run #{activeRun.id} overlaid
                   </span>
                 )}
-                {activeScenario && runButtons}
                 <Button variant="outline" onClick={() => navigate('/run')} className="rounded-full px-4">
                   Go to Results
                 </Button>
@@ -6450,7 +6579,6 @@ export default function Canvas() {
                   Check flow
                 </Button>
               )}
-              {runButtons}
               <Button
                 disabled={saveMutation.isPending}
                 onClick={() => handleSave(true)}
@@ -6466,10 +6594,14 @@ export default function Canvas() {
 
         {/* Flow + property panel */}
         <div className="flex-1 flex min-h-0">
-          <div className="flex-1 min-h-0" style={{ height: '100%' }}>
+          <div className="relative flex-1 min-h-0" style={{ height: '100%' }}>
+            {mode === 'view' && idleReplayBar && (
+              <div className="absolute bottom-4 left-1/2 z-10 w-[min(900px,calc(100%-28px))] -translate-x-1/2">{idleReplayBar}</div>
+            )}
             {mode === 'view' ? (
                 scene3D.machines.length > 0 ? (
                   <Scene
+                    runControls={runButtons}
                     machines={scene3D.machines}
                     operators={scene3D.operators}
                     connections={scene3D.connections}
@@ -6479,11 +6611,13 @@ export default function Canvas() {
                     operatorsData={activeScenario!.operators_data}
                     isDark={isDark}
                     completionLog={completionLog}
+                    workerPool={activeRun?.result?.worker_pool_stats}
                     assemblies={assemblies3D}
                     dismantles={dismantles3D}
                     variantColors={variantColors}
                     outcomes={outcomes3D}
                     runMinutes={activeRun?.simulation_time ?? undefined}
+                    runStartMs={runStartMs}
                   />
                 ) : (
                   <div className="flex items-center justify-center h-full text-gray-400">
@@ -6586,7 +6720,13 @@ export default function Canvas() {
                     targets={replayTargets}
                     variantColors={variantColors}
                     runMinutes={activeRun?.simulation_time ?? undefined}
+                    runControls={runButtons}
                   />
+                )}
+                {idleReplayBar && (
+                  <Panel position="bottom-center">
+                    <div className="w-[min(900px,calc(100vw-80px))]">{idleReplayBar}</div>
+                  </Panel>
                 )}
               </ReactFlow>
               </div>
@@ -6704,7 +6844,7 @@ export default function Canvas() {
         </div>
 
         {/* Run + settings, shared with the Analysis page */}
-        {activeScenario && <SimDialogsHost sim={sim} />}
+        <SimDialogsHost sim={sim} onRun={runNow} />
       </div>
       </div>
     </div>

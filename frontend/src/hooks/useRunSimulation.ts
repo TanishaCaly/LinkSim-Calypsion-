@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
-import { simulationsApi } from '@/api/simulations'
+import { simulationsApi, DEFAULT_SIM_TIME } from '@/api/simulations'
 import type { SimConfigOverride } from '@/api/simulations'
 import { scenariosApi } from '@/api/scenarios'
 import { useAppStore } from '@/store/useAppStore'
@@ -17,7 +17,7 @@ import type { RunDetail, SimConfig } from '@/types'
 export function useRunSimulation() {
   const { activeScenario, activeRun, setActiveRun, setActiveScenario, showToast, justReset, setJustReset } = useAppStore()
   const [displayRun, setDisplayRun] = useState<RunDetail | null>(activeRun)
-  const [simCfg, setSimCfg] = useState<SimConfigOverride>({ SIM_TIME: 10080, num_replications: 1 })
+  const [simCfg, setSimCfg] = useState<SimConfigOverride>({ SIM_TIME: DEFAULT_SIM_TIME, num_replications: 1 })
 
   // Load whatever shift hours/working-days/breaks/names were last saved on
   // THIS scenario (e.g. from a previous Simulation Config session), instead
@@ -160,9 +160,11 @@ export function useRunSimulation() {
     // simCfg (e.g. "Apply & Run" in the Simulation Timer) can pass the new
     // value directly, instead of racing React's async state update by
     // reading simCfg from closure right after calling its setter.
-    mutationFn: (overrideCfg?: SimConfigOverride) => simulationsApi.triggerRun(activeScenario!.id, overrideCfg ?? simCfg),
+    // scenarioId: a scenario just saved, before activeScenario shows it.
+    mutationFn: ({ overrideCfg, scenarioId }: { overrideCfg?: SimConfigOverride; scenarioId?: number }) =>
+      simulationsApi.triggerRun(scenarioId ?? activeScenario!.id, overrideCfg ?? simCfg),
     onSuccess: (data) => {
-      showToast('Simulation started')
+      showToast('Simulation started', 'success', `Run #${data.id}` + (activeScenario ? ` · ${activeScenario.name}` : ''))
       setProgress({ pct: 0, msg: 'Queued…' })
       setJustReset(false)
       startStream(data.id)
@@ -197,8 +199,9 @@ export function useRunSimulation() {
 
   useEffect(() => { return stopStream }, [])
 
-  /** Start a run (optionally with a settings override that was just edited). */
-  const start = (overrideCfg?: SimConfigOverride) => triggerMutation.mutate(overrideCfg)
+  /** Start a run (optionally with a settings override that was just edited, and the id of a
+   * scenario just saved, before activeScenario has it). */
+  const start = (overrideCfg?: SimConfigOverride, scenarioId?: number) => triggerMutation.mutate({ overrideCfg, scenarioId })
 
   /** Ask the engine to stop the run that is streaming (or the one on screen). */
   const stop = () => {
@@ -214,7 +217,7 @@ export function useRunSimulation() {
     setDisplayRun(null)
     setActiveRun(null)
     setJustReset(true)
-    setSimCfg({ SIM_TIME: 10080, num_replications: 1 })
+    setSimCfg({ SIM_TIME: DEFAULT_SIM_TIME, num_replications: 1 })
     showToast('Reset — showing no run')
   }
 

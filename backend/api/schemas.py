@@ -1,9 +1,15 @@
 """
 Pydantic request/response schemas for LinkSim API.
 """
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Union
-from pydantic import BaseModel, Field
+from datetime import datetime, timezone
+from typing import Annotated, Any, Dict, List, Optional, Union
+from pydantic import AfterValidator, BaseModel, Field
+
+
+# The database stores times in UTC without saying so (datetime.utcnow). Sent
+# as-is ("2026-11-11T19:24:12") a browser reads them as its own local time —
+# 5.5 h off in India. Marked as UTC ("...Z"), the browser shows the PC's time.
+UTCDateTime = Annotated[datetime, AfterValidator(lambda d: d.replace(tzinfo=timezone.utc) if d.tzinfo is None else d)]
 
 
 # ---------------------------------------------------------------------------
@@ -42,8 +48,8 @@ class ScenarioResponse(BaseModel):
     id: int
     name: str
     description: Optional[str]
-    created_at: datetime
-    updated_at: datetime
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
     stations_data: Dict[str, Any]
     processflow_data: Dict[str, Any]
     variant_quantities: Dict[str, int]
@@ -60,8 +66,8 @@ class ScenarioListItem(BaseModel):
     id: int
     name: str
     description: Optional[str]
-    created_at: datetime
-    updated_at: datetime
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
 
     model_config = {"from_attributes": True}
 
@@ -119,8 +125,8 @@ class RunResponse(BaseModel):
     id: int
     scenario_id: int
     status: str
-    created_at: datetime
-    completed_at: Optional[datetime]
+    created_at: UTCDateTime
+    completed_at: Optional[UTCDateTime]
     completed_jobs: Optional[int]
     in_progress_jobs: Optional[int] = 0
     simulation_time: Optional[float]

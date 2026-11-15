@@ -24,24 +24,35 @@ function Sketch({ columns, bottleneck }: { columns: string[][]; bottleneck: stri
     return <div className="flex h-full items-center justify-center text-xs text-ls-mute">No route yet</div>
   }
   const W = 300
-  const colW = Math.min(46, (W - 24) / cols.length)
+  const MIN_GAP = 10 // keeps every connector visible, even on long routes
+  const colW = Math.min(58, (W - 24 - MIN_GAP * (cols.length - 1)) / cols.length)
   const gap = cols.length > 1 ? (W - 24 - colW * cols.length) / (cols.length - 1) : 0
   const x0 = (i: number) => 12 + i * (colW + gap)
-  const boxH = 20
-  const mid = 55
+  const boxH = 26
+  const mid = 50
+  const yOf = (n: number, j: number) => mid - (n * boxH + (n - 1) * 6) / 2 + j * (boxH + 6)
+  const more = columns.length - cols.length
   return (
-    <svg viewBox={`0 0 ${W} 110`} className="h-full w-full" preserveAspectRatio="xMidYMid meet">
-      {cols.slice(1).map((_, i) => (
-        <path
-          key={`l${i}`}
-          d={`M${x0(i) + colW} ${mid}H${x0(i + 1)}`}
-          stroke="var(--ls-accent)" strokeWidth="1.8" strokeDasharray="4 4" fill="none"
-        />
-      ))}
+    <svg viewBox={`0 0 ${W} 100`} className="h-full w-full" preserveAspectRatio="xMidYMid meet">
+      {cols.slice(1).flatMap((names, i) =>
+        names.slice(0, 3).map((_, j) => {
+          const yc = yOf(Math.min(names.length, 3), j) + boxH / 2
+          const xa = x0(i) + colW
+          const xb = x0(i + 1)
+          return (
+            <path
+              key={`l${i}-${j}`}
+              d={`M${xa} ${mid}H${(xa + xb) / 2}V${yc}H${xb}`}
+              stroke="var(--ls-accent)" strokeWidth="1.8" strokeDasharray="4 4" fill="none"
+            />
+          )
+        })
+      )}
+      {more > 0 && <text x={W - 12} y="96" textAnchor="end" fontSize="9" fill="var(--ls-mute)">+{more} more steps</text>}
       {cols.map((names, i) => {
         const shown = names.slice(0, 3)
         return shown.map((n, j) => {
-          const y = mid - (shown.length * boxH + (shown.length - 1) * 6) / 2 + j * (boxH + 6)
+          const y = yOf(shown.length, j)
           const hot = bottleneck !== null && n === bottleneck
           return (
             <rect
@@ -77,14 +88,19 @@ export default function ScenarioCard({
       className="group flex cursor-pointer flex-col overflow-hidden rounded-[14px] bg-ls-card shadow-md transition-all duration-200 hover:-translate-y-1 hover:shadow-lg"
     >
       <div className="h-1 w-full bg-gradient-to-r from-ls-accent to-ls-purple" />
-      <div className="relative h-[110px] bg-ls-canvas">
-        {summary ? <Sketch columns={summary.columns} bottleneck={summary.bottleneck} /> : <div className="h-full animate-pulse bg-ls-chip/50" />}
-        {badge && (
-          <span className={cn('absolute left-3 top-3 inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold', badge.cls)}>
-            <span className={cn('h-1.5 w-1.5 rounded-full', badge.dot)} />
-            {badge.label}
-          </span>
-        )}
+      <div className="bg-ls-canvas">
+        {/* The status badge has its own row, so it never sits on top of the route sketch. */}
+        <div className="flex h-8 items-end px-3">
+          {badge && (
+            <span className={cn('inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold', badge.cls)}>
+              <span className={cn('h-1.5 w-1.5 rounded-full', badge.dot)} />
+              {badge.label}
+            </span>
+          )}
+        </div>
+        <div className="h-[100px]">
+          {summary ? <Sketch columns={summary.columns} bottleneck={summary.bottleneck} /> : <div className="h-full animate-pulse bg-ls-chip/50" />}
+        </div>
       </div>
 
       <div className="flex flex-1 flex-col gap-3 p-4">

@@ -16,7 +16,10 @@ import re
 import pandas as pd
 from typing import Dict, List, Any, Union, Optional
 
-from .csv_parser import CsvParser, _clean_str, _safe_float, _find_col, _is_blank_row, _station_row_from
+from .csv_parser import (
+    CsvParser, _clean_str, _safe_float, _find_col, _is_blank_row, _station_row_from,
+    _process_time_col, _no_process_time_error,
+)
 
 _csv = CsvParser()
 
@@ -234,17 +237,22 @@ class ExcelParser:
         """
         Pull {operation, resource, duration} rows out of a process-flow-style
         sheet. Column names are matched loosely (case-insensitive substring),
-        so headers like "Resource (Station)" or "Duration (min)" still map
-        to the right field instead of silently coming back blank/zero.
+        so headers like "Resource (Station)" or "Process Time (min)" still map
+        to the right field instead of silently coming back blank/zero. The
+        time is read only from the Process Time column (never Cycle Time or
+        Duration); a step without one -> ValueError.
         """
         records = df.to_dict("records")
+        pt_col = _process_time_col(df.columns)
         steps = []
         for row in records:
             if _is_blank_row(row):
                 break  # stop at a spacer row; anything after is not data
             operation = _clean_str(_find_col(row, "operation", "operation name"))
             resource  = _clean_str(_find_col(row, "resource", "station", "machine"))
-            duration  = _safe_float(_find_col(row, "duration", "cycle time", "cycle_time", "process time"), 0)
+            if operation and pt_col is None:
+                raise _no_process_time_error(df.columns)
+            duration  = _safe_float(row.get(pt_col), 0) if pt_col is not None else 0
             if operation:
                 steps.append({"operation": operation, "resource": resource, "duration": duration})
         return steps

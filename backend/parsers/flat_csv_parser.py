@@ -2,13 +2,14 @@
 Flat CSV parser — handles single-file process routing CSVs.
 
 Expected columns (case-insensitive):
-  Part_Name | Part_Number | Annual_Volume | Process_Name | Machine | Cycle_Time
+  Part_Name | Part_Number | Annual_Volume | Process_Name | Machine | Process_Time
 
 Mapping to LinkSim internals:
   Part_Name   → variant name
   Process_Name → operation name
   Machine      → resource / station name
-  Cycle_Time   → operation duration (minutes)
+  Process_Time → operation duration (minutes the machine works on one job;
+                 a Cycle_Time column is never read as the process time)
   Annual_Volume → variant quantity (divided by WORKING_DAYS_PER_YEAR to get
                   a daily target; rounded to nearest integer, minimum 1)
 
@@ -42,7 +43,7 @@ class FlatCsvParser:
         df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
         return df
 
-    REQUIRED_COLUMNS = ["part_name", "process_name", "machine", "cycle_time"]
+    REQUIRED_COLUMNS = ["part_name", "process_name", "machine", "process_time"]
 
     def parse_all(self, source: Union[str, bytes]) -> Dict[str, Any]:
         """
@@ -53,10 +54,15 @@ class FlatCsvParser:
         """
         df = self.parse(source)
         missing_cols = [c for c in self.REQUIRED_COLUMNS if c not in df.columns]
+        if "process_time" in missing_cols and "cycle_time" in df.columns:
+            raise ValueError(
+                "Process_Time column not found — the Cycle_Time column is not used. "
+                "Please add a 'Process_Time' column (minutes the machine works on one job)."
+            )
         if missing_cols:
             raise ValueError(
                 f"Missing required column(s): {', '.join(missing_cols)}. "
-                f"Expected columns: Part_Name, Part_Number, Annual_Volume, Process_Name, Machine, Cycle_Time "
+                f"Expected columns: Part_Name, Part_Number, Annual_Volume, Process_Name, Machine, Process_Time "
                 f"(case-insensitive). Found: {', '.join(df.columns) or '(none)'}."
             )
         return {
@@ -110,7 +116,7 @@ class FlatCsvParser:
             part     = _clean_str(row.get("part_name")).lower()
             op       = _clean_str(row.get("process_name"))
             resource = _clean_str(row.get("machine"))
-            duration = _safe_float(row.get("cycle_time"), 0)
+            duration = _safe_float(row.get("process_time"), 0)
             if part and op:
                 flow.setdefault(part, []).append({
                     "operation": op,

@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
-import { NavLink, Outlet, useNavigate } from 'react-router-dom'
-import { BarChart3, FolderOpen, GitBranch, Sparkles, Cpu, Sun, Moon, LogOut } from 'lucide-react'
+import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
+import { BarChart3, FolderOpen, GitBranch, Sparkles, Sun, Moon, LogOut, Check, AlertCircle } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAppStore } from '@/store/useAppStore'
 import { authApi } from '@/api/auth'
@@ -15,8 +15,9 @@ const nav = [
 const TOAST_MS = 3000
 
 export default function Layout() {
-  const { toast, clearToast, theme, toggleTheme, activeScenario } = useAppStore()
+  const { toast, clearToast, theme, toggleTheme, activeScenario, leaveGuard } = useAppStore()
   const navigate = useNavigate()
+  const location = useLocation()
 
   // Notifications close by themselves after 3 s. Each new one (a fresh
   // object, even with the same text) restarts the 3 s.
@@ -26,9 +27,14 @@ export default function Layout() {
     return () => clearTimeout(timer)
   }, [toast, clearToast])
 
-  async function handleLogout() {
+  async function logout() {
     await authApi.logout().catch(() => {})
     navigate('/login', { replace: true })
+  }
+  // Leaving the Workspace saves it first (see leaveGuard).
+  function handleLogout() {
+    if (leaveGuard) leaveGuard(() => { void logout() })
+    else void logout()
   }
 
   const iconButton =
@@ -42,11 +48,9 @@ export default function Layout() {
         style={{ boxShadow: '0 1px 0 var(--ls-line2), 0 4px 14px -8px rgba(16,24,40,0.10)' }}
       >
         <div className="flex items-center gap-3">
-          <div className="flex h-8 w-8 items-center justify-center rounded-[10px] bg-ls-dark">
-            <Cpu className="h-[18px] w-[18px] text-ls-card" />
-          </div>
+          <img src="/linksim-mark.png" alt="" className="h-9 w-9 object-contain" />
           <div className="leading-none">
-            <span className="font-display text-lg font-bold tracking-tight">LinkSim</span>
+            <span className="font-display text-lg font-bold tracking-tight">LinkSim<sup className="relative -top-[2px] ml-0.5 text-[14px] font-semibold opacity-80">™</sup></span>
             <p className="mt-0.5 text-[10.5px] text-ls-mute max-[1060px]:hidden">Manufacturing DES</p>
           </div>
         </div>
@@ -65,6 +69,11 @@ export default function Layout() {
               to={to}
               end={to === '/'}
               title={label}
+              onClick={(e) => {
+                if (!leaveGuard || location.pathname === to) return
+                e.preventDefault()
+                leaveGuard(() => navigate(to))
+              }}
               className={({ isActive }) =>
                 cn(
                   'flex h-[38px] items-center gap-2 whitespace-nowrap rounded-full px-4 text-[13.5px] font-semibold transition-colors max-[1060px]:px-3',
@@ -102,13 +111,18 @@ export default function Layout() {
       {/* Toast */}
       {toast && (
         <div
+          key={toast.message + (toast.detail ?? '')}
           onClick={clearToast}
-          className={cn(
-            'fixed left-1/2 top-[76px] z-50 max-w-sm -translate-x-1/2 cursor-pointer rounded-xl px-4 py-2.5 text-[13px] shadow-lg',
-            toast.type === 'error' ? 'bg-red-600 text-white' : 'bg-ls-dark text-ls-card'
-          )}
+          className="toast fixed bottom-6 right-6 z-50 flex w-max max-w-sm cursor-pointer items-center gap-3 overflow-hidden rounded-[14px] border border-ls-line bg-ls-card py-3 pl-3 pr-5 text-[13px] text-ls-ink shadow-[0_10px_28px_rgba(16,24,40,.14)]"
         >
-          {toast.message}
+          <span className={cn('flex h-7 w-7 shrink-0 items-center justify-center rounded-full', toast.type === 'error' ? 'bg-red-50 text-red-600' : 'bg-emerald-50 text-emerald-600')}>
+            {toast.type === 'error' ? <AlertCircle className="h-4 w-4" /> : <Check className="h-4 w-4" />}
+          </span>
+          <div className="min-w-0">
+            <b className="block font-semibold leading-tight">{toast.message}</b>
+            {toast.detail && <small className="mt-0.5 block truncate text-xs leading-tight text-ls-ink2">{toast.detail}</small>}
+          </div>
+          <i className={cn('toast-bar absolute bottom-0 left-0 h-[3px] w-full', toast.type === 'error' ? 'bg-red-500' : 'bg-ls-accent')} style={{ animationDuration: `${TOAST_MS}ms` }} />
         </div>
       )}
     </div>

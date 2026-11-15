@@ -5,7 +5,7 @@ import { statusOf, STATUS_LEGEND, type StatusKey } from '@/lib/status'
 import type { StationStat } from '@/types'
 import { ChartKey, Insight, Stats, useTip } from './ChartKit'
 
-// Station utilization as ranked lanes: busiest first, a tick for the operator's share, and
+// Station utilization as ranked lanes: busiest first, and
 // status chips to filter by band. Replaces the two bar charts; the numbers are the same.
 
 export default function StationLanes({ stats, onData }: {
@@ -24,6 +24,9 @@ export default function StationLanes({ stats, onData }: {
   const count = (k: StatusKey) => stats.filter((s) => statusOf(s.station_utilization).key === k).length
   const rows = ranked.filter((s) => filter === 'all' || statusOf(s.station_utilization).key === filter)
   const topSt = statusOf(top.station_utilization)
+  // Same digits rule as Throughput by station: 2 decimals, more when every station is tiny.
+  const dg = top.station_utilization < 0.01 ? 5 : top.station_utilization < 0.1 ? 4 : 2
+  const f = (v: number) => v.toFixed(dg)
 
   return (
     <Card className="mb-5">
@@ -36,7 +39,7 @@ export default function StationLanes({ stats, onData }: {
               onClick={() => onData({
                 title: 'Station & operator utilization',
                 columns: ['Station', 'Utilization', 'Operator', 'Jobs'],
-                rows: ranked.map((x) => [x.station_name, `${x.station_utilization.toFixed(1)}%`, `${x.operator_utilization.toFixed(1)}%`, String(x.completed_jobs)]),
+                rows: ranked.map((x) => [x.station_name, `${f(x.station_utilization)}%`, `${f(x.operator_utilization)}%`, String(x.completed_jobs)]),
               })}
               className="rounded-lg bg-ls-page px-2.5 py-1 text-[11.5px] font-semibold text-ls-ink2 hover:bg-ls-chip"
             >
@@ -44,7 +47,7 @@ export default function StationLanes({ stats, onData }: {
             </button>
           )}
         </div>
-        <p className="text-xs text-ls-mute">Ranked busiest first · the tick marks the operator's share</p>
+        <p className="text-xs text-ls-mute">Ranked busiest first</p>
       </CardHeader>
       <CardContent>
         <Stats items={[
@@ -70,8 +73,8 @@ export default function StationLanes({ stats, onData }: {
             return (
               <div
                 key={s.station_name}
-                {...bind(<><div>{s.station_name} · {st.label}</div><div className="font-normal opacity-80">{u.toFixed(1)}% station · {s.operator_utilization.toFixed(1)}% operator · {s.completed_jobs} jobs</div></>)}
-                className="grid grid-cols-[22px_120px_1fr_54px] items-center gap-2.5 border-t border-ls-line py-[7px] first:border-t-0"
+                {...bind(<><div>{s.station_name} · {st.label}</div><div className="font-normal opacity-80">{f(u)}% station · {f(s.operator_utilization)}% operator · {s.completed_jobs} jobs</div></>)}
+                className="grid grid-cols-[22px_120px_1fr_66px] items-center gap-2.5 border-t border-ls-line py-[7px] first:border-t-0"
               >
                 <span className="text-xs font-bold text-ls-mute">{i + 1}</span>
                 <span className="truncate text-[13px] font-semibold text-ls-ink">{s.station_name}</span>
@@ -83,17 +86,14 @@ export default function StationLanes({ stats, onData }: {
                       background: `color-mix(in srgb, ${st.color} 68%, var(--ls-card))`,
                     }}
                   />
-                  {s.operator_utilization > 0 && (
-                    <i className="absolute -top-[3px] h-[22px] w-0.5 rounded-sm bg-ls-ink/60" style={{ left: `${Math.min(100, (s.operator_utilization / max) * 100)}%` }} />
-                  )}
                 </div>
-                <span className="text-right text-[13px] font-bold" style={{ color: u > 0 ? st.color : 'var(--ls-mute)' }}>{u > 0 ? `${u.toFixed(1)}%` : '—'}</span>
+                <span className="text-right text-[13px] font-bold" style={{ color: u > 0 ? st.color : 'var(--ls-mute)' }}>{u > 0 ? `${f(u)}%` : '—'}</span>
               </div>
             )
           })}
         </div>
 
-        <div className="mt-1 grid grid-cols-[22px_120px_1fr_54px] gap-2.5 text-[10.5px] text-ls-mute">
+        <div className="mt-1 grid grid-cols-[22px_120px_1fr_66px] gap-2.5 text-[10.5px] text-ls-mute">
           <span /><span />
           <div className="flex justify-between">
             {Array.from({ length: Math.floor(max / step) + 1 }, (_, i) => <span key={i}>{i * step}%</span>)}
@@ -105,7 +105,7 @@ export default function StationLanes({ stats, onData }: {
           colors={[...STATUS_LEGEND].sort((a, b) => order(a.key) - order(b.key)).map((g) => ({ color: g.color, label: g.label, note: g.range }))}
           x="Utilization, % of the run (scale along the bottom)"
           y="Stations, busiest first"
-          measure="Utilization is the share of the run a station spent working. The dark tick on each bar is the share its operator was busy."
+          measure="Utilization is the share of the run a station spent working."
         />
         <Insight>
           {top.station_utilization >= 70

@@ -9,7 +9,6 @@ import { Badge } from '@/components/ui/badge'
 import { Progress } from '@/components/ui/progress'
 import type { RunDetail, StationStat, WorkerPoolStat, StationStateStat, BufferStateStat, PartsFlow } from '@/types'
 import { SimConfigDialog, SimTimerDialog } from '@/components/run/SimDialogs'
-import SimSettingsMenu from '@/components/run/SimSettingsMenu'
 import { useRunSimulation } from '@/hooks/useRunSimulation'
 import { StateCharts, BottleneckPanel, StationThroughput } from '@/components/run/RunInsights'
 import { SectionHeading, SectionNav } from '@/components/run/Sections'
@@ -2440,7 +2439,7 @@ export default function RunDashboard() {
         <div className="print-main flex-1 min-w-0 p-6 overflow-auto">
           {/* Header */}
           <div className="print:hidden flex items-center justify-between flex-wrap gap-3 mb-5 max-w-full">
-            <div className="flex min-w-0 flex-wrap items-center gap-x-5 gap-y-2">
+            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-5 gap-y-2">
             <div className="min-w-0 shrink-0">
               <h1 className="text-xl font-bold text-gray-900">{activeScenario.name}</h1>
               <p className="text-sm text-gray-400 mt-0.5">
@@ -2453,7 +2452,7 @@ export default function RunDashboard() {
               </p>
             </div>
             {displayRun?.status === 'completed' && (
-              <div className="flex gap-0.5 rounded-xl bg-ls-line p-[3px]">
+              <div className="mx-auto flex gap-0.5 rounded-xl bg-ls-line p-[3px]">
                 {TABS.map((t) => (
                   <button
                     key={t.key}
@@ -2467,7 +2466,6 @@ export default function RunDashboard() {
             )}
             </div>
             <div className="flex gap-2 flex-wrap justify-end">
-              <SimSettingsMenu small onConfig={() => setConfigOpen(true)} onTimer={() => setTimerOpen(true)} />
               {displayRun?.status === 'completed' && (
                 <Button variant="outline" size="sm" onClick={() => window.print()}>
                   <Printer className="h-4 w-4 mr-1.5" />
@@ -2487,13 +2485,6 @@ export default function RunDashboard() {
                   {stopPending ? 'Stopping…' : 'Stop'}
                 </Button>
               )}
-              <Button size="sm" onClick={() => start()} disabled={isRunning}>
-                {isRunning ? (
-                  <><RefreshCw className="h-4 w-4 mr-1.5 animate-spin" />Running…</>
-                ) : (
-                  <><Play className="h-4 w-4 mr-1.5" />Run Simulation</>
-                )}
-              </Button>
             </div>
           </div>
 
@@ -2771,7 +2762,7 @@ export default function RunDashboard() {
           {!displayRun && !isRunning && (
             <div className="text-center py-24 text-gray-400">
               <Play className="h-14 w-14 text-gray-200 mx-auto mb-4" />
-              <p className="font-medium text-gray-500 mb-1">Click "Run Simulation" to start</p>
+              <p className="font-medium text-gray-500 mb-1">Run a simulation from the Workspace to see results here</p>
               <p className="text-sm text-gray-400">Charts and station breakdowns will appear here once a run completes</p>
             </div>
           )}

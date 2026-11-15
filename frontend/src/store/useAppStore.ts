@@ -21,9 +21,15 @@ interface AppStore {
   setPollingId: (id: ReturnType<typeof setInterval> | null) => void
 
   // Toast
-  toast: { message: string; type: 'success' | 'error' } | null
-  showToast: (message: string, type?: 'success' | 'error') => void
+  toast: { message: string; type: 'success' | 'error'; detail?: string } | null
+  showToast: (message: string, type?: 'success' | 'error', detail?: string) => void
   clearToast: () => void
+
+  // Set by the Workspace while it is open: called before leaving it (a top
+  // tab or Log out). It saves the canvas, then calls go(); on a problem it
+  // shows the error and does not call go(), so the user stays.
+  leaveGuard: ((go: () => void) => void) | null
+  setLeaveGuard: (g: ((go: () => void) => void) | null) => void
 
   // Theme
   theme: 'light' | 'dark'
@@ -42,6 +48,13 @@ function applyTheme(t: 'light' | 'dark') {
 }
 applyTheme(initialTheme)
 
+// Paper is white: print in the light theme, then put the dark one back.
+if (typeof window !== 'undefined') {
+  let wasDark = false
+  window.addEventListener('beforeprint', () => { wasDark = document.documentElement.classList.contains('dark'); document.documentElement.classList.remove('dark') })
+  window.addEventListener('afterprint', () => { if (wasDark) document.documentElement.classList.add('dark') })
+}
+
 export const useAppStore = create<AppStore>((set) => ({
   activeScenario: null,
   setActiveScenario: (s) => set({ activeScenario: s }),
@@ -56,8 +69,11 @@ export const useAppStore = create<AppStore>((set) => ({
   setPollingId: (id) => set({ pollingId: id }),
 
   toast: null,
-  showToast: (message, type = 'success') => set({ toast: { message, type } }),
+  showToast: (message, type = 'success', detail) => set({ toast: { message, type, detail } }),
   clearToast: () => set({ toast: null }),
+
+  leaveGuard: null,
+  setLeaveGuard: (g) => set({ leaveGuard: g }),
 
   theme: initialTheme,
   toggleTheme: () => set((s) => {

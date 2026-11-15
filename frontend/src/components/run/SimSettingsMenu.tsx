@@ -23,11 +23,13 @@ export default function SimSettingsMenu({ onConfig, onTimer, up, small, compact,
 
   useEffect(() => {
     if (!open) return
-    const away = (e: MouseEvent) => { if (!box.current?.contains(e.target as Node)) setOpen(false) }
+    const away = (e: PointerEvent) => { if (!box.current?.contains(e.target as Node)) setOpen(false) }
     const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
-    document.addEventListener('mousedown', away)
+    // Capture phase: the canvas (pan/zoom) stops its clicks from bubbling up,
+    // so a plain listener never heard a click on the canvas.
+    document.addEventListener('pointerdown', away, true)
     document.addEventListener('keydown', esc)
-    return () => { document.removeEventListener('mousedown', away); document.removeEventListener('keydown', esc) }
+    return () => { document.removeEventListener('pointerdown', away, true); document.removeEventListener('keydown', esc) }
   }, [open])
 
   const pick = (fn: () => void) => () => { setOpen(false); fn() }

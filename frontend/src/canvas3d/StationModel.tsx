@@ -109,6 +109,8 @@ export default function StationModel({ url, getState, inPlace = false }: Station
     const template = templateFor(`${url}|${inPlace}`, scene, animated)
     const object = template.object.clone(true)
     object.position.copy(template.offset)
+    // The Workplace model has a person built in; the people in 3D are the Worker nodes, as in Build.
+    if (url === STATION_MODELS.Workplace) object.getObjectByName('worker')?.traverse((o) => { o.visible = false })
     return object
   }, [url, inPlace, scene, animated])
   const scaleNodes = useMemo(

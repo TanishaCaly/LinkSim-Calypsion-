@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { CalendarDays, ChevronLeft, ChevronRight, Clock, RefreshCw, Settings, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import type { SimConfigOverride } from '@/api/simulations'
+import { ALL_DAYS, DEFAULT_SIM_TIME, type SimConfigOverride } from '@/api/simulations'
 
 // ─── SimConfig dialog ─────────────────────────────────────────────────────────
 
@@ -18,6 +18,9 @@ interface SimConfigDialogProps {
   value: SimConfigOverride
   onChange: (v: SimConfigOverride) => void
   onClose: () => void
+  /** No scenario open yet (a new one): a shift with no saved days/breaks
+   * shows every day and no break — what a new scenario is saved with. */
+  fresh?: boolean
 }
 
 export interface RunProgress { pct: number; msg: string; simTimeNow?: number; simTimeTotal?: number }
@@ -44,7 +47,8 @@ function fmtHour(h: number): string {
 const HOUR_OPTIONS = Array.from({ length: 24 }, (_, h) => h)
 
 // Python weekday() numbering used by the backend: Monday=0 ... Sunday=6.
-// Matches SimulationUtils.working_days' fallback when a shift has no
+// For a saved scenario without WORKING_DAYS_n (older ones; new ones save
+// every day, see NEW_SCENARIO_CALENDAR). Matches SimulationUtils.working_days' fallback when a shift has no
 // explicit WORKING_DAYS_n set — Shift 1/2 default to Mon-Fri, Shift 3
 // defaults to every day, same as the engine's original assumption. Any
 // shift beyond the original 3 defaults to Mon-Fri, same as 1/2.
@@ -68,7 +72,8 @@ interface ShiftEntry {
   breaks: BreakWindow[]
 }
 
-// Matches backend/parsers/yaml_parser.py's _SIM_CONFIG_DEFAULTS — one
+// For a saved scenario without BREAKS_n (older ones; new ones save no
+// breaks, see NEW_SCENARIO_CALENDAR). Matches backend/parsers/yaml_parser.py's _SIM_CONFIG_DEFAULTS — one
 // default break per shift so a run has a realistic rest/lunch break out of
 // the box, even before the user opens this dialog. A 4th+ shift gets no
 // default break (empty), consistent with having no default hours either.
@@ -81,7 +86,7 @@ const DEFAULT_BREAKS: Record<number, BreakWindow[]> = {
 /** Build the initial ShiftEntry[] from a SimConfigOverride, covering
  * whichever SHIFT_n_START keys are present (at least 3, or more if the
  * scenario was saved with extra shifts already). */
-function shiftEntriesFromConfig(value: SimConfigOverride): ShiftEntry[] {
+function shiftEntriesFromConfig(value: SimConfigOverride, fresh = false): ShiftEntry[] {
   let maxNum = 3
   for (let i = 4; value[`SHIFT_${i}_START`] != null; i++) maxNum = i
   return Array.from({ length: maxNum }, (_, i) => {
@@ -91,8 +96,8 @@ function shiftEntriesFromConfig(value: SimConfigOverride): ShiftEntry[] {
       name: (value[`SHIFT_${num}_NAME`] as string | undefined) ?? '',
       start: (value[`SHIFT_${num}_START`] as number | undefined) ?? SHIFT_DEFAULTS[num]?.start ?? 8,
       end: (value[`SHIFT_${num}_END`] as number | undefined) ?? SHIFT_DEFAULTS[num]?.end ?? 16,
-      workingDays: (value[`WORKING_DAYS_${num}`] as number[] | undefined) ?? DEFAULT_WORKING_DAYS[num] ?? [0, 1, 2, 3, 4],
-      breaks: (value[`BREAKS_${num}`] as BreakWindow[] | undefined) ?? DEFAULT_BREAKS[num] ?? [],
+      workingDays: (value[`WORKING_DAYS_${num}`] as number[] | undefined) ?? (fresh ? ALL_DAYS : DEFAULT_WORKING_DAYS[num] ?? [0, 1, 2, 3, 4]),
+      breaks: (value[`BREAKS_${num}`] as BreakWindow[] | undefined) ?? (fresh ? [] : DEFAULT_BREAKS[num] ?? []),
     }
   })
 }
@@ -562,20 +567,29 @@ function DateTimePicker({ value, onChange, className }: { value: string; onChang
 }
 
 export function SimTimerDialog({
-  open, value, onChange, onClose, progress, onRun, isRunning, completionLog,
+  open, value, onChange, onClose, progress, onRun, isRunning, completionLog, fresh = false,
 }: SimConfigDialogProps & { progress?: RunProgress | null; onRun?: (cfg: SimConfigOverride) => void; isRunning?: boolean; completionLog?: Record<string, unknown[]> | null }) {
-  const [startDate, setStartDate] = useState(() =>
-    value.SIMULATION_START_DATE ? String(value.SIMULATION_START_DATE).slice(0, 16) : toDatetimeLocalValue(new Date())
-  )
-  const [endDateStr, setEndDateStr] = useState(() => {
-    const start = value.SIMULATION_START_DATE ? new Date(String(value.SIMULATION_START_DATE)) : new Date()
-    const mins = value.SIM_TIME ?? 10080
-    const d = new Date(start)
-    d.setMinutes(d.getMinutes() + mins)
+  // Start/End from the current settings: the saved start (or now) and its
+  // run length (8 hours unless set).
+  const startFrom = (v: SimConfigOverride) =>
+    v.SIMULATION_START_DATE ? String(v.SIMULATION_START_DATE).slice(0, 16) : toDatetimeLocalValue(new Date())
+  const endFrom = (v: SimConfigOverride) => {
+    const d = v.SIMULATION_START_DATE ? new Date(String(v.SIMULATION_START_DATE)) : new Date()
+    d.setMinutes(d.getMinutes() + Number(v.SIM_TIME ?? DEFAULT_SIM_TIME))
     return toDatetimeLocalValue(d)
-  })
-  const [activePreset, setActivePreset] = useState<number | null>(null)
+  }
+  const [startDate, setStartDate] = useState(() => startFrom(value))
+  const [endDateStr, setEndDateStr] = useState(() => endFrom(value))
   const [warmup, setWarmup] = useState(String(value.WARMUP_TIME ?? 0))
+  // The dialog stays mounted: each time it opens, show the current settings
+  // (not the ones from when the page loaded).
+  useEffect(() => {
+    if (!open) return
+    setStartDate(startFrom(value))
+    setEndDateStr(endFrom(value))
+    setWarmup(String(value.WARMUP_TIME ?? 0))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open])
 
   // Replay controls for the last completed run's recorded timeline — the
   // backend runs SimPy as a single batch job with no live-pause capability,
@@ -653,8 +667,7 @@ export function SimTimerDialog({
     return Number.isFinite(mins) && mins > 0 ? mins : null
   })()
 
-  const applyPreset = (i: number, mins: number) => {
-    setActivePreset(i)
+  const applyPreset = (mins: number) => {
     const d = new Date(startDate)
     d.setMinutes(d.getMinutes() + mins)
     setEndDateStr(toDatetimeLocalValue(d))
@@ -676,7 +689,7 @@ export function SimTimerDialog({
   // the same engine defaults SimConfigDialog uses), so the weekday check and
   // "snap to shift start" below reflect the real config, not a guess.
   const shift1Start = (value.SHIFT_1_START as number | undefined) ?? SHIFT_DEFAULTS[1].start
-  const shift1WorkingDays = (value.WORKING_DAYS_1 as number[] | undefined) ?? DEFAULT_WORKING_DAYS[1]
+  const shift1WorkingDays = (value.WORKING_DAYS_1 as number[] | undefined) ?? (fresh ? ALL_DAYS : DEFAULT_WORKING_DAYS[1])
   const shift1Name = (value.SHIFT_1_NAME as string | undefined)?.trim() || 'Shift 1'
 
   const startDateObj = startDate ? new Date(startDate) : null
@@ -702,7 +715,7 @@ export function SimTimerDialog({
   const buildConfig = (): SimConfigOverride => ({
     ...value,
     SIMULATION_START_DATE: startDate ? `${startDate}:00` : undefined,
-    SIM_TIME: durationMins ?? Number(value.SIM_TIME ?? 10080),
+    SIM_TIME: durationMins ?? Number(value.SIM_TIME ?? DEFAULT_SIM_TIME),
     WARMUP_TIME: Math.max(0, Number(warmup) || 0),
   })
 
@@ -863,7 +876,7 @@ export function SimTimerDialog({
               <label className="text-xs font-semibold text-gray-400 uppercase tracking-widest block mb-2">End Date &amp; Time</label>
               <DateTimePicker
                 value={endDateStr}
-                onChange={(v) => { setEndDateStr(v); setActivePreset(null) }}
+                onChange={(v) => setEndDateStr(v)}
               />
               <p className="text-[10px] text-gray-400 mt-1.5">
                 The real calendar date the simulated clock stops at. Run length is computed from the gap to Start Date.
@@ -873,12 +886,13 @@ export function SimTimerDialog({
             <div className="border-t border-gray-100 pt-4">
               <p className="text-xs font-semibold text-gray-400 uppercase tracking-widest mb-3">Quick Fill</p>
               <div className="grid grid-cols-5 gap-2">
-                {PRESETS.map((p, i) => (
+                {PRESETS.map((p) => (
                   <button
                     key={p.label}
-                    onClick={() => applyPreset(i, p.SIM_TIME)}
+                    onClick={() => applyPreset(p.SIM_TIME)}
                     className={`flex flex-col items-center py-3 rounded-xl border text-sm transition-all duration-150 ${
-                      activePreset === i
+                      // Selected whenever the run length matches it, the default 8 h included.
+                      durationMins === p.SIM_TIME
                         ? 'border-blue-500 bg-blue-50 text-blue-700 shadow-sm'
                         : 'border-gray-100 bg-gray-50 hover:border-blue-200 hover:bg-blue-50/50 text-gray-600'
                     }`}
@@ -973,14 +987,13 @@ export function SimTimerDialog({
   )
 }
 
-export function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDialogProps) {
-  const [custom, setCustom] = useState(String(value.SIM_TIME ?? 10080))
+export function SimConfigDialog({ open, value, onChange, onClose, fresh = false }: SimConfigDialogProps) {
+  const [custom, setCustom] = useState(String(value.SIM_TIME ?? DEFAULT_SIM_TIME))
   const [reps, setReps] = useState(String(value.num_replications ?? 1))
-  const [activePreset, setActivePreset] = useState<number | null>(null)
   // Arbitrary-length list of shift configs (hours, working days, breaks,
   // display name) — replaces the old fixed 1/2/3 Record shape so "+ Add
   // shift" is just pushing another entry, not a structural change.
-  const [shifts, setShifts] = useState<ShiftEntry[]>(() => shiftEntriesFromConfig(value))
+  const [shifts, setShifts] = useState<ShiftEntry[]>(() => shiftEntriesFromConfig(value, fresh))
 
   // SimConfigDialog stays mounted permanently (only `open` toggles
   // visibility, see its render call in RunDashboard), so the useState
@@ -990,7 +1003,7 @@ export function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDia
   // whatever `shifts` was first computed from, not the current `value` —
   // which is why saved shift names appeared to "reset" to Shift 1/2/3.
   useEffect(() => {
-    if (open) setShifts(shiftEntriesFromConfig(value))
+    if (open) setShifts(shiftEntriesFromConfig(value, fresh))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open])
 
@@ -1005,10 +1018,8 @@ export function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDia
   const addShift = () => {
     setShifts(prev => {
       const num = Math.max(...prev.map(s => s.num)) + 1
-      // Matches every other shift's convention (see DEFAULT_BREAKS /
-      // backend _SIM_CONFIG_DEFAULTS): one 30-min break roughly mid-shift,
-      // so a newly added shift behaves realistically out of the box too.
-      return [...prev, { num, name: '', start: 8, end: 16, workingDays: [0, 1, 2, 3, 4], breaks: [{ start: 12, duration: 30 }] }]
+      // A newly added shift works every day, with no break.
+      return [...prev, { num, name: '', start: 8, end: 16, workingDays: ALL_DAYS, breaks: [] }]
     })
   }
   const removeShift = (num: number) => {
@@ -1062,12 +1073,13 @@ export function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDia
           <div>
             <p className="text-xs font-semibold text-gray-400 uppercase tracking-widest mb-3">Duration Presets</p>
             <div className="grid grid-cols-5 gap-2">
-              {PRESETS.map((p, i) => (
+              {PRESETS.map((p) => (
                 <button
                   key={p.label}
-                  onClick={() => { setActivePreset(i); setCustom(String(p.SIM_TIME)) }}
+                  onClick={() => setCustom(String(p.SIM_TIME))}
                   className={`flex flex-col items-center py-3 rounded-xl border text-sm transition-all duration-150 ${
-                    activePreset === i
+                    // Selected whenever the time matches it, the default 480 included.
+                    Number(custom) === p.SIM_TIME
                       ? 'border-blue-500 bg-blue-50 text-blue-700 shadow-sm'
                       : 'border-gray-100 bg-gray-50 hover:border-blue-200 hover:bg-blue-50/50 text-gray-600'
                   }`}
@@ -1087,7 +1099,7 @@ export function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDia
             <div className="flex items-center border border-gray-200 rounded-xl bg-gray-50 focus-within:border-blue-400 focus-within:bg-white transition-colors overflow-hidden">
               <button
                 type="button"
-                onClick={() => { setCustom(v => String(Math.max(60, Number(v) - 60))); setActivePreset(null) }}
+                onClick={() => setCustom(v => String(Math.max(60, Number(v) - 60)))}
                 className="px-3 py-2.5 text-blue-500 hover:bg-blue-50 hover:text-blue-700 text-lg font-bold transition-colors select-none"
               >−</button>
               <input
@@ -1095,12 +1107,12 @@ export function SimConfigDialog({ open, value, onChange, onClose }: SimConfigDia
                 min={60}
                 max={525600}
                 value={custom}
-                onChange={e => { setCustom(e.target.value); setActivePreset(null) }}
+                onChange={e => setCustom(e.target.value)}
                 className="flex-1 text-center text-sm text-gray-900 bg-transparent focus:outline-none [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
               />
               <button
                 type="button"
-                onClick={() => { setCustom(v => String(Math.min(525600, Number(v) + 60))); setActivePreset(null) }}
+                onClick={() => setCustom(v => String(Math.min(525600, Number(v) + 60)))}
                 className="px-3 py-2.5 text-blue-500 hover:bg-blue-50 hover:text-blue-700 text-lg font-bold transition-colors select-none"
               >+</button>
             </div>

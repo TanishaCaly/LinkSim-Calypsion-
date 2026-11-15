@@ -1,4 +1,4 @@
-import { Cpu, Lock } from 'lucide-react'
+import { Lock } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { clearToken } from '@/api/client'
 
@@ -12,10 +12,8 @@ export default function SubscriptionExpired() {
     <div className="min-h-screen flex items-center justify-center bg-ls-page p-6">
       <div className="w-full max-w-sm">
         <div className="flex flex-col items-center mb-8">
-          <div className="w-12 h-12 rounded-[14px] bg-ls-dark flex items-center justify-center shadow-md mb-3">
-            <Cpu className="h-6 w-6 text-ls-card" />
-          </div>
-          <h1 className="text-xl font-bold text-gray-900">LinkSim</h1>
+          <img src="/linksim-mark.png" alt="" className="mb-3 h-14 w-14 object-contain" />
+          <h1 className="text-xl font-bold text-gray-900">LinkSim<sup className="relative -top-[2px] ml-0.5 text-[14px] font-semibold opacity-80">™</sup></h1>
           <p className="text-sm text-gray-400 mt-0.5">Manufacturing DES</p>
         </div>
 

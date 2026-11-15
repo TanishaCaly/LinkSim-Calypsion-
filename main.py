@@ -119,9 +119,12 @@ if _STATIC_DIR and os.path.isdir(_STATIC_DIR):
 
     # Python takes file types from the Windows registry, where some PCs list
     # .js as text/plain — the browser then refuses the page's script (blank
-    # page). Set the types the page needs explicitly.
+    # page) — and knows no type at all for fonts and 3D models. Set the types
+    # the page needs explicitly.
     for _type, _ext in (("text/javascript", ".js"), ("text/css", ".css"), ("text/html", ".html"),
-                        ("image/svg+xml", ".svg"), ("application/json", ".json")):
+                        ("image/svg+xml", ".svg"), ("application/json", ".json"),
+                        ("font/woff2", ".woff2"), ("font/woff", ".woff"), ("model/gltf-binary", ".glb"),
+                        ("image/png", ".png"), ("image/jpeg", ".jpg")):
         mimetypes.add_type(_type, _ext)
 
     @app.get("/{path:path}", include_in_schema=False)

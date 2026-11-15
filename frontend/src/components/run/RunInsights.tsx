@@ -252,17 +252,20 @@ export function StationThroughput({ stats, bottleneck, lineOutput }: { stats: St
   const mx = Math.max(...rows.map((r) => r.throughput), lineOutput ?? 0, 0.0001) * 1.08
   const top = rows[0]
   const slow = rows[rows.length - 1]
-  const ticks = [0, 0.25, 0.5, 0.75, 1].map((f) => +(mx * f).toFixed(2))
+  // small rates need more decimals, or every station reads the same (0.0061 vs 0.0058)
+  const d = mx < 0.01 ? 5 : mx < 0.1 ? 4 : 2
+  const f = (v: number) => v.toFixed(d)
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map((q) => +(mx * q).toFixed(d))
   return (
     <Card className="mb-5">
       <CardHeader className="pb-1">
         <CardTitle className="text-sm font-semibold text-ls-ink2">Throughput by station</CardTitle>
-        <p className="text-xs text-ls-mute">Ranked by jobs per hour{lineOutput != null ? ' · the dashed line is what the whole line delivered' : ''}</p>
+        <p className="text-xs text-ls-mute">Ranked by jobs per hour</p>
       </CardHeader>
       <CardContent>
         <Stats items={[
-          { value: top.throughput.toFixed(2), label: `jobs/hr · highest, ${top.station_name}` },
-          ...(lineOutput != null ? [{ value: lineOutput.toFixed(2), label: 'jobs/hr · line output' }] : []),
+          { value: f(top.throughput), label: `jobs/hr · highest, ${top.station_name}` },
+          ...(lineOutput != null ? [{ value: f(lineOutput), label: 'jobs/hr · line output' }] : []),
         ]} />
         <div>
           {rows.map((r, i) => {
@@ -272,8 +275,8 @@ export function StationThroughput({ stats, bottleneck, lineOutput }: { stats: St
               <div
                 key={r.station_name}
                 data-tip={`${r.station_name}${isB ? ' · bottleneck' : ''}
-${r.throughput.toFixed(2)} jobs/hr${lineOutput != null ? ` (line output ${lineOutput.toFixed(2)} jobs/hr)` : ''}`}
-                className="grid grid-cols-[22px_120px_1fr_54px] items-center gap-2.5 border-t border-ls-line py-[7px] first:border-t-0"
+${f(r.throughput)} jobs/hr${lineOutput != null ? ` (line output ${f(lineOutput)} jobs/hr)` : ''}`}
+                className="grid grid-cols-[22px_120px_1fr_62px] items-center gap-2.5 border-t border-ls-line py-[7px] first:border-t-0"
               >
                 <span className="text-xs font-bold text-ls-mute">{i + 1}</span>
                 <span className={cn('truncate text-[13px] text-ls-ink', isB ? 'font-bold' : 'font-semibold')}>{r.station_name}</span>
@@ -285,14 +288,13 @@ ${r.throughput.toFixed(2)} jobs/hr${lineOutput != null ? ` (line output ${lineOu
                       background: `color-mix(in srgb, ${c} 68%, var(--ls-card))`,
                     }}
                   />
-                  {lineOutput != null && <i className="absolute -top-[3px] h-[22px] w-0.5 rounded-sm bg-ls-ink/60" style={{ left: `${Math.min(100, (lineOutput / mx) * 100)}%` }} />}
                 </div>
-                <span className="text-right text-[13px] font-bold" style={{ color: r.throughput > 0 ? c : 'var(--ls-mute)' }}>{r.throughput > 0 ? r.throughput.toFixed(2) : '—'}</span>
+                <span className="text-right text-[13px] font-bold" style={{ color: r.throughput > 0 ? c : 'var(--ls-mute)' }}>{r.throughput > 0 ? f(r.throughput) : '—'}</span>
               </div>
             )
           })}
         </div>
-        <div className="mt-1 grid grid-cols-[22px_120px_1fr_54px] gap-2.5 text-[10.5px] text-ls-mute">
+        <div className="mt-1 grid grid-cols-[22px_120px_1fr_62px] gap-2.5 text-[10.5px] text-ls-mute">
           <span /><span />
           <div className="flex justify-between">{ticks.map((t, i) => <span key={i}>{t}</span>)}</div>
           <span />
@@ -301,14 +303,13 @@ ${r.throughput.toFixed(2)} jobs/hr${lineOutput != null ? ` (line output ${lineOu
           colors={[
             { color: 'color-mix(in srgb, var(--ls-accent) 68%, var(--ls-card))', label: 'Station', note: 'jobs it finished per hour' },
             { color: 'color-mix(in srgb, var(--ls-bad) 68%, var(--ls-card))', label: 'Bottleneck', note: 'the busiest station' },
-            ...(lineOutput != null ? [{ color: 'var(--ls-ink)', label: 'Line output', note: 'jobs per hour the whole line delivered', dashed: true }] : []),
           ]}
           x="Jobs per hour (scale along the bottom)"
           y="Stations, most jobs first"
           measure="Throughput is the number of jobs a station finished per hour of the run."
         />
         <Insight>
-          <b className="text-ls-ink">{slow.station_name} handled the least,</b> {slow.throughput.toFixed(2)} jobs/hr{lineOutput != null ? `; the line delivered ${lineOutput.toFixed(2)} jobs/hr` : ''}.{bottleneck ? ` ${bottleneck} is the bottleneck (shown in red).` : ''}
+          <b className="text-ls-ink">{slow.station_name} handled the least,</b> {f(slow.throughput)} jobs/hr{lineOutput != null ? `; the line delivered ${f(lineOutput)} jobs/hr` : ''}.{bottleneck ? ` ${bottleneck} is the bottleneck (shown in red).` : ''}
         </Insight>
       </CardContent>
     </Card>

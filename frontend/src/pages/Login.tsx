@@ -42,7 +42,7 @@ export default function Login() {
   if (checkingAuto) return null
 
   return (
-    <AuthShell eyebrow="Welcome back" title="Sign in to LinkSim" sub="Pick up where your last run left off.">
+    <AuthShell eyebrow="Welcome back" title="Sign in to LinkSim">
       <form onSubmit={handleSubmit}>
         <div className="field">
           <label htmlFor="username">Username</label>

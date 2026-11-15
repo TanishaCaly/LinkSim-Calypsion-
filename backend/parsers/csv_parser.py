@@ -77,6 +77,31 @@ def _normalize_col(name: str) -> str:
     return re.sub(r"[\s_-]+", " ", name.strip().lower())
 
 
+def _process_time_col(columns) -> Optional[Any]:
+    """The process-flow table's Process Time column — the minutes a machine
+    works on one job. Only a column named Process Time (any case, spaces/
+    underscores/hyphens, e.g. "Process Time (min)") is read: a Cycle Time
+    column (wait + setup + process + blocked) or a Duration column is never
+    taken as the process time."""
+    for col in columns:
+        if "process time" in _normalize_col(str(col)):
+            return col
+    return None
+
+
+def _no_process_time_error(columns) -> ValueError:
+    """The import error for a process-flow table without a Process Time column."""
+    if any("cycle time" in _normalize_col(str(c)) for c in columns):
+        return ValueError(
+            "Process Time column not found in the process flow — the Cycle Time column is not used. "
+            "Please add a 'Process Time' column (minutes the machine works on one job)."
+        )
+    return ValueError(
+        "Process Time column not found in the process flow. "
+        "Please add a 'Process Time' column (minutes the machine works on one job)."
+    )
+
+
 def _find_col(row: Dict[str, Any], *candidates: str) -> Any:
     """
     Look up a value in a row dict by trying each candidate key, first as an
@@ -295,9 +320,10 @@ class CsvParser:
 
     def parse_processflow(self, source: Union[str, bytes]) -> Dict[str, List[Dict]]:
         """
-        Expected columns: Variant, Operation, Resource, Duration
+        Expected columns: Variant, Operation, Resource, Process Time
         A (Variant, Operation) repeated on several rows becomes one step using
-        the first row's Resource and Duration.
+        the first row's Resource and Process Time. No Process Time column ->
+        ValueError (Cycle Time / Duration columns are not read).
 
         Returns: {variant: [{operation, resource, duration}, ...]}
         Variant names are normalised to lowercase for consistent matching.
@@ -307,13 +333,16 @@ class CsvParser:
         # a variant's steps must stay in the sequence they appear in the sheet.
         groups: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
         order: Dict[str, List[str]] = {}
+        pt_col = _process_time_col(records[0].keys()) if records else None
         for row in records:
             variant = _clean_str(row.get("Variant", row.get("variant"))).lower()
             if not variant:
                 continue  # skip blank/trailing rows
+            if pt_col is None:
+                raise _no_process_time_error(row.keys())
             operation = _clean_str(row.get("Operation", row.get("operation")))
             resource = _clean_str(row.get("Resource", row.get("resource")))
-            duration = _safe_float(_find_col(row, "Duration", "duration", "process time", "cycle time"), 0)
+            duration = _safe_float(row.get(pt_col), 0)
 
             groups.setdefault(variant, {})
             order.setdefault(variant, [])
