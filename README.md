@@ -195,6 +195,33 @@ Every job gets a stable ID (e.g. `ProductA-003`) and a full per-station record:
 
 ---
 
+## Licensing
+
+Licenses come from the Calypsion licensing server (https://license.calypsion.com,
+product `LINKSIM`); see `backend/licensing.py`. Set with `LINKSIM_LICENSE`:
+
+| Mode | Used by | How it works |
+|---|---|---|
+| `off` | development (default) | nothing is restricted |
+| `machine` | desktop build (default when `LINKSIM_DESKTOP=1`) | one license for the PC, entered **before** login, saved in the data folder |
+| `user` | hosted web version | each account enters its own key **after** login; saved in the `user_licenses` table; one seat per account |
+
+The licensing API key (Backoffice → Settings → API clients, scoped to LINKSIM)
+goes in `LINKSIM_LICENSE_API_KEY` — in the web server's environment, or into the
+desktop build via `packaging/build.ps1`. Never commit it.
+
+Web server example:
+
+```bash
+LINKSIM_LICENSE=user LINKSIM_LICENSE_API_KEY=lsk_... uvicorn main:app --port 8000
+```
+
+The license's features gate the app: `sim.run`, `import.excel`, `insights.ai`,
+`view.3d`, `limit.stations`, `limit.scenarios`. A feature the license doesn't
+mention is not restricted.
+
+---
+
 ## Known gaps / not yet built
 
 - **AI Insights is rule-based, not machine learning** — deterministic thresholds and formulas, no LLM call anywhere.

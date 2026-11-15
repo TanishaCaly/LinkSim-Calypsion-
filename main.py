@@ -50,7 +50,8 @@ from backend.api.routes import (
     license_router,
     require_license,
 )
-from backend.licensing import ENABLED as LICENSE_ENABLED, manager as license_manager
+from backend.api.routes.license import require_license_before_login
+from backend import licensing
 
 
 @asynccontextmanager
@@ -62,10 +63,11 @@ async def lifespan(app: FastAPI):
         n = fail_unfinished_runs(db)
     if n:
         logger.info(f"Marked {n} unfinished run(s) from before the restart as failed")
-    # Desktop build: check the license in the background (it may wait on the
-    # network); the activation page waits for the result.
-    if LICENSE_ENABLED:
-        threading.Thread(target=license_manager.refresh, daemon=True).start()
+    # Desktop build: check the PC's license in the background (it may wait on
+    # the network); the activation page waits for the result. On the web each
+    # user's license is checked when they first use LinkSim.
+    if licensing.MODE == "machine":
+        threading.Thread(target=licensing.manager.refresh, daemon=True).start()
     yield
 
 
@@ -99,11 +101,11 @@ app.add_middleware(
 )
 
 # License routes are open (the activation page runs before anything else).
-# Everything else needs a valid license first (desktop build only, see
-# backend/licensing.py); auth routes are open past that so you can log in,
-# every other router also requires a valid session token.
+# Desktop: everything else needs the PC's license first, login included.
+# Web: sign in first, then every other router needs the user's license (see
+# backend/licensing.py). Every other router also requires a session token.
 app.include_router(license_router)
-app.include_router(auth_router, dependencies=[Depends(require_license)])
+app.include_router(auth_router, dependencies=[Depends(require_license_before_login)])
 
 _auth_dep = [Depends(require_license), Depends(require_auth)]
 app.include_router(scenarios_router, dependencies=_auth_dep)

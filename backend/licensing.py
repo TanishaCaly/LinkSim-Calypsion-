@@ -1,24 +1,31 @@
 """
-License check for the desktop build, against the Calypsion licensing server
+License check against the Calypsion licensing server
 (https://license.calypsion.com, product LINKSIM).
 
+Two modes (LINKSIM_LICENSE):
+  - machine: the desktop build. One license for the PC, entered before
+    login, kept in <data dir>/license.json. Default when LINKSIM_DESKTOP=1.
+  - user: the hosted web version. Each user account enters its own key
+    after login; kept in the user_licenses table. Each account takes one
+    seat on the license.
+  - off: development (the default otherwise). Nothing is restricted.
+
 How it works:
-  - Each PC gets a stable machine fingerprint. Activating a key on it takes
-    one seat on the server (POST /v1/activations).
+  - Each PC (or web account) gets a stable fingerprint. Activating a key on
+    it takes one seat on the server (POST /v1/activations).
   - The server answers with a signed token (Ed25519). Every token is checked
     here — signature, our nonce, our fingerprint, product — before it is
     trusted, so a faked or replayed answer can never unlock LinkSim.
-  - The last good token is kept in <data dir>/license.json. LinkSim checks in
+  - The last good token is saved (file or database). LinkSim checks in
     again after the token's revalidate_after; if the server can't be reached
     it keeps working from the saved token until offline_until.
   - A signed "not valid" answer (revoked, suspended, expired, ...) drops the
     saved token at once. Unsigned errors can only ever lock, never unlock.
-  - Air-gapped PCs: write an activation request, support turns it into a
-    .lic file on the backoffice, and the .lic is imported here.
+  - Air-gapped PCs (desktop only): write an activation request, support
+    turns it into a .lic file on the backoffice, and the .lic is imported.
 
-On by default in the desktop build (LINKSIM_DESKTOP=1), off in development;
-LINKSIM_LICENSE=on/off overrides either way. The API key is put into the
-build by packaging/build.ps1 (LINKSIM_LICENSE_API_KEY), never into git.
+The API key (LINKSIM_LICENSE_API_KEY) is put into the desktop build by
+packaging/build.ps1, and set in the web server's environment — never in git.
 """
 import base64
 import hashlib
@@ -63,7 +70,9 @@ HTTP_TIMEOUT_SECONDS = 10
 
 _DESKTOP = os.getenv("LINKSIM_DESKTOP", "").strip() == "1"
 _SWITCH = os.getenv("LINKSIM_LICENSE", "").strip().lower()
-ENABLED = _SWITCH == "on" or (_DESKTOP and _SWITCH != "off")
+MODE = {"on": "machine", "machine": "machine", "user": "user", "off": "off"}.get(
+    _SWITCH, "machine" if _DESKTOP else "off")
+ENABLED = MODE != "off"
 
 # Shown on the activation page, keyed by the server's reason codes plus our own.
 MESSAGES = {
@@ -73,17 +82,17 @@ MESSAGES = {
     "suspended": "This license is suspended. Please contact Calypsion.",
     "not_started": "This license is not active yet.",
     "draft": "This license has not been issued yet. Please contact Calypsion.",
-    "seat_limit": "This license is already in use on the maximum number of PCs. "
-                  "Deactivate it on another PC, or contact Calypsion.",
-    "not_activated": "This PC is no longer activated for this license. Activate it again.",
-    "fingerprint_required": "This license must be activated on this PC.",
+    "seat_limit": "This license is already in use on the maximum number of PCs or accounts. "
+                  "Remove it from one of them, or contact Calypsion.",
+    "not_activated": "This license was removed from here. Activate it again.",
+    "fingerprint_required": "This license must be activated first.",
     "unknown_key": "This license key was not recognised. Check it and try again.",
     "offline_expired": "LinkSim could not reach the license server for too long. "
                        "Connect to the internet and retry.",
     "clock_tampered": "Your PC's date and time look wrong. Correct them and retry.",
     "unreachable": "Could not reach the license server. Check your internet connection and retry.",
     "bad_response": "The license server's answer could not be verified. Please contact Calypsion.",
-    "wrong_machine": "This license file was made for a different PC.",
+    "wrong_machine": "This license was activated for a different PC or account.",
     "server_error": "The license server reported an error. Please try again later.",
 }
 
@@ -236,7 +245,7 @@ def _post(path: str, body: dict) -> Optional[dict]:
     """POST to the /v1 API. Returns the JSON body (None for 204), raises
     LicenseError for a 4xx and _Unreachable for network errors and 5xx."""
     if not _api_key():
-        raise LicenseError("server_error", "This LinkSim build has no license API key (see packaging/build.ps1).")
+        raise LicenseError("server_error", "LinkSim has no license API key (LINKSIM_LICENSE_API_KEY; desktop: packaging/build.ps1).")
     req = urllib.request.Request(
         SERVER_URL + path,
         data=json.dumps(body).encode(),
@@ -267,49 +276,104 @@ def _post(path: str, body: dict) -> Optional[dict]:
         raise _Unreachable(str(e)) from e
 
 
-def _request_body(key: str, fingerprint: str, nonce: str) -> dict:
-    return {"key": key, "fingerprint": fingerprint, "nonce": nonce, "app_version": APP_VERSION,
-            "hostname": socket.gethostname(), "platform": _platform()}
-
-
 # ── Saved state ───────────────────────────────────────────────────────
+# read() -> {"key", "envelope", "last_seen"}. The key is kept even when the
+# token is dropped, so the activation page can offer it again (e.g. after a
+# suspension is lifted). last_seen only moves forward, for clock rollback
+# detection.
 
-def _cache_path() -> str:
-    return os.path.join(_data_dir(), "license.json")
+class FileStore:
+    """Desktop: <data dir>/license.json."""
+
+    def _path(self) -> str:
+        return os.path.join(_data_dir(), "license.json")
+
+    def read(self) -> dict:
+        try:
+            with open(self._path(), encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def write(self, key: Optional[str], envelope: Optional[dict]) -> None:
+        data = {"key": key, "envelope": envelope, "last_seen": max(self.read().get("last_seen", 0), time.time())}
+        tmp = self._path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, self._path())
+
+    def clear(self) -> None:
+        try:
+            os.remove(self._path())
+        except FileNotFoundError:
+            pass
 
 
-def _read_cache() -> dict:
-    try:
-        with open(_cache_path(), encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+class UserStore:
+    """Web version: the user's row in user_licenses (created on first use,
+    with a random fingerprint for the account)."""
 
+    def __init__(self, user_id: int):
+        self.user_id = user_id
 
-def _write_cache(key: Optional[str], envelope: Optional[dict]) -> None:
-    """key is kept even when the token is dropped, so the activation page can
-    offer it again (e.g. after a suspension is lifted). last_seen only moves
-    forward, for clock rollback detection."""
-    old = _read_cache()
-    data = {"key": key, "envelope": envelope, "last_seen": max(old.get("last_seen", 0), time.time())}
-    tmp = _cache_path() + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-    os.replace(tmp, _cache_path())
+    def _row(self, db):
+        from backend.storage.models import UserLicense
 
+        row = db.get(UserLicense, self.user_id)
+        if row is None:
+            row = UserLicense(user_id=self.user_id, fingerprint=secrets.token_hex(32), last_seen=0)
+            db.add(row)
+            db.commit()
+        return row
 
-def _clear_cache() -> None:
-    try:
-        os.remove(_cache_path())
-    except FileNotFoundError:
-        pass
+    def fingerprint(self) -> str:
+        from backend.storage.database import SessionLocal
+
+        with SessionLocal() as db:
+            return self._row(db).fingerprint
+
+    def username(self) -> str:
+        from backend.storage.database import SessionLocal
+        from backend.storage.models import User
+
+        with SessionLocal() as db:
+            user = db.get(User, self.user_id)
+            return user.username if user else str(self.user_id)
+
+    def read(self) -> dict:
+        from backend.storage.database import SessionLocal
+
+        with SessionLocal() as db:
+            row = self._row(db)
+            return {"key": row.license_key, "envelope": row.envelope, "last_seen": row.last_seen or 0}
+
+    def write(self, key: Optional[str], envelope: Optional[dict]) -> None:
+        from backend.storage.database import SessionLocal
+
+        with SessionLocal() as db:
+            row = self._row(db)
+            row.license_key, row.envelope = key, envelope
+            row.last_seen = max(row.last_seen or 0, time.time())
+            db.commit()
+
+    def clear(self) -> None:
+        # A fresh fingerprint next time: the old seat is gone anyway.
+        from backend.storage.database import SessionLocal
+        from backend.storage.models import UserLicense
+
+        with SessionLocal() as db:
+            db.query(UserLicense).filter(UserLicense.user_id == self.user_id).delete()
+            db.commit()
 
 
 class LicenseManager:
-    """The license state of this PC, shared by the API routes."""
+    """The license state of this PC (desktop) or of one user account (web),
+    shared by the API routes."""
 
-    def __init__(self):
+    def __init__(self, store=None, user_id: Optional[int] = None):
+        self.store = store or FileStore()
+        self.user_id = user_id
         self._lock = threading.Lock()
         self._refreshing = False
         self._ready = threading.Event()
@@ -324,8 +388,17 @@ class LicenseManager:
     @property
     def fingerprint(self) -> str:
         if self._fingerprint is None:
-            self._fingerprint = machine_fingerprint()
+            self._fingerprint = (self.store.fingerprint() if isinstance(self.store, UserStore)
+                                 else machine_fingerprint())
         return self._fingerprint
+
+    def _request_body(self, key: str, nonce: str) -> dict:
+        # hostname/platform show up under License → Activations in the backoffice.
+        if isinstance(self.store, UserStore):
+            where = {"hostname": f"web: {self.store.username()}", "platform": "LinkSim Web"}
+        else:
+            where = {"hostname": socket.gethostname(), "platform": _platform()}
+        return {"key": key, "fingerprint": self.fingerprint, "nonce": nonce, "app_version": APP_VERSION, **where}
 
     @property
     def ok(self) -> bool:
@@ -339,7 +412,7 @@ class LicenseManager:
 
     def _deny(self, err: LicenseError, drop_token: bool) -> None:
         if drop_token:
-            _write_cache(self.key, None)
+            self.store.write(self.key, None)
         self._set("invalid", err.reason, detail=str(err))
 
     # The startup check and the periodic check-in.
@@ -356,7 +429,7 @@ class LicenseManager:
                 self._ready.set()
 
     def _refresh(self) -> None:
-        cache = _read_cache()
+        cache = self.store.read()
         self.key = cache.get("key")
         envelope = cache.get("envelope")
         if not self.key:
@@ -370,7 +443,7 @@ class LicenseManager:
 
         nonce = secrets.token_hex(16)
         try:
-            env = _post("/v1/licenses/validate", _request_body(self.key, self.fingerprint, nonce))
+            env = _post("/v1/licenses/validate", self._request_body(self.key, nonce))
             token = verify_online(env, nonce, self.fingerprint)
         except (_Unreachable, LicenseError) as e:
             # A server that is down, misconfigured or answering garbage is
@@ -385,7 +458,7 @@ class LicenseManager:
             else:
                 self._set("invalid", "unreachable")
             return
-        _write_cache(self.key, env)
+        self.store.write(self.key, env)
         self._set("valid", "valid", token)
 
     def _use_saved(self, envelope: dict, cache: dict, network: str) -> None:
@@ -394,7 +467,7 @@ class LicenseManager:
         except LicenseError as e:
             self._deny(e, drop_token=e.reason not in ("clock_tampered", "offline_expired"))
             return
-        _write_cache(self.key, envelope)   # moves last_seen forward
+        self.store.write(self.key, envelope)   # moves last_seen forward
         if network:
             logger.info("License server unreachable (%s) — using the saved license", network)
         self._set("offline" if network else "valid", "valid", token)
@@ -437,16 +510,16 @@ class LicenseManager:
         with self._lock:
             nonce = secrets.token_hex(16)
             try:
-                env = _post("/v1/activations", _request_body(key, self.fingerprint, nonce))
+                env = _post("/v1/activations", self._request_body(key, nonce))
                 token = verify_online(env, nonce, self.fingerprint)
             except _Unreachable:
                 raise LicenseError("unreachable")
             self.key = key
-            _write_cache(key, env)
+            self.store.write(key, env)
             self._set("valid", "valid", token)
 
     def deactivate(self) -> None:
-        """Free this PC's seat so the key can be used on another PC."""
+        """Free this PC's (or account's) seat so the key can be used elsewhere."""
         with self._lock:
             if self.key and self.state != "unlicensed":
                 try:
@@ -457,8 +530,9 @@ class LicenseManager:
                     # Already gone on the server (unknown key, not activated): just forget it here.
                     if e.reason == "server_error":
                         raise
-            _clear_cache()
+            self.store.clear()
             self.key = None
+            self._fingerprint = None
             self._set("unlicensed", "unlicensed")
 
     def offline_request(self, key: str) -> str:
@@ -474,15 +548,17 @@ class LicenseManager:
         except ValueError:
             raise LicenseError("bad_response", "This is not a LinkSim license file.")
         with self._lock:
-            token = verify_offline(envelope, self.fingerprint, _read_cache().get("last_seen", 0))
+            token = verify_offline(envelope, self.fingerprint, self.store.read().get("last_seen", 0))
             self.key = token["license"]["key"]
-            _write_cache(self.key, envelope)
+            self.store.write(self.key, envelope)
             self._set("valid", "valid", token)
 
     def status(self) -> dict[str, Any]:
         lic = (self.token or {}).get("license") or {}
         return {
             "enabled": ENABLED,
+            "mode": MODE,
+            "signed_in": True,
             "state": self.state,
             "reason": self.reason,
             "message": self.detail,
@@ -499,7 +575,34 @@ class LicenseManager:
         }
 
 
+# Desktop: the PC's license.
 manager = LicenseManager()
+
+# Web: one per user account, loaded (and checked with the server) on first use.
+_user_managers: dict[int, LicenseManager] = {}
+_user_managers_lock = threading.Lock()
+
+
+def for_user(user_id: int) -> LicenseManager:
+    with _user_managers_lock:
+        m = _user_managers.get(user_id)
+        if m is None:
+            m = _user_managers[user_id] = LicenseManager(UserStore(user_id), user_id)
+            fresh = True
+        else:
+            fresh = False
+    if fresh:
+        m.refresh()
+    else:
+        m.wait_ready()   # a request racing the first check waits for it
+    return m
+
+
+def status_signed_out() -> dict[str, Any]:
+    """Web version, nobody signed in yet: log in first, then enter a key."""
+    return {"enabled": ENABLED, "mode": MODE, "signed_in": False, "state": "unlicensed",
+            "reason": "unlicensed", "message": "", "key": None, "offline_until": None,
+            "air_gapped": False, "license": None}
 
 
 # ── Features ──────────────────────────────────────────────────────────
@@ -516,21 +619,23 @@ LIMIT_STATIONS = "limit.stations"
 LIMIT_SCENARIOS = "limit.scenarios"
 
 
-def feature(code: str):
+# `m` is the request's license (the PC's or the user's); None = licensing off.
+
+def feature(m: Optional[LicenseManager], code: str):
     """The license's value for a feature (bool, or int for limits); None when
     the license doesn't say or licensing is off."""
-    if not ENABLED or not manager.ok:
+    if m is None or not ENABLED or not m.ok:
         return None
-    return (((manager.token or {}).get("license") or {}).get("features") or {}).get(code)
+    return (((m.token or {}).get("license") or {}).get("features") or {}).get(code)
 
 
-def allows(code: str) -> bool:
-    value = feature(code)
+def allows(m: Optional[LicenseManager], code: str) -> bool:
+    value = feature(m, code)
     return value is None or bool(value)   # false, or a limit of 0, means no
 
 
-def limit(code: str) -> Optional[int]:
+def limit(m: Optional[LicenseManager], code: str) -> Optional[int]:
     """None = unlimited. The server sends a limit that is switched off in the
     edition as 0."""
-    value = feature(code)
+    value = feature(m, code)
     return value if isinstance(value, int) and not isinstance(value, bool) else None

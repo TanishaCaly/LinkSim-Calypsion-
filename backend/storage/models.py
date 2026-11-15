@@ -37,6 +37,24 @@ class User(Base):
     is_active = Column(Boolean, nullable=False, default=True)
 
 
+class UserLicense(Base):
+    """
+    Web version (LINKSIM_LICENSE=user): the license key a user entered and the
+    last good signed token from the licensing server (see backend/licensing.py).
+    fingerprint is a random ID for this account — the licensing server counts
+    one seat per account by it.
+    """
+    __tablename__ = "user_licenses"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    fingerprint = Column(String(64), nullable=False)
+    license_key = Column(String(64), nullable=True)
+    envelope = Column(JSON, nullable=True)
+    # Highest wall-clock time seen, for clock rollback detection.
+    last_seen = Column(Float, nullable=False, default=0)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class Scenario(Base):
     """
     A simulation scenario: one complete set of inputs (stations, operators, flow, config).

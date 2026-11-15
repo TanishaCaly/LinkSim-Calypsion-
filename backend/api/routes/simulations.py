@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from backend.storage import crud, get_db
 from backend.storage.crud import get_station_stats
 from backend.api.auth import require_auth
-from backend.api.routes.license import check_station_limit, require_feature
+from backend.api.routes.license import check_station_limit, current_license, require_feature
 from backend import licensing
 from backend.api.schemas import RunRequest, RunResponse, RunDetailResponse, StationStatResponse
 from backend.engine import ManufacturingSimulation
@@ -38,12 +38,13 @@ def trigger_run(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     user_id: int = Depends(require_auth),
+    license=Depends(current_license),
 ):
     scenario = crud.get_scenario(db, scenario_id, user_id=user_id)
     if not scenario:
         raise HTTPException(status_code=404, detail="Scenario not found")
     # Also stops scenarios saved before a downgrade to a smaller edition.
-    check_station_limit(scenario.stations_data)
+    check_station_limit(license, scenario.stations_data)
 
     run = crud.create_run(db, scenario_id, num_replications=req.num_replications)
     progress_store.init(run.id)

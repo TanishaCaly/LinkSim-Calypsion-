@@ -5,7 +5,7 @@ import { BarChart3, FolderOpen, GitBranch, Sparkles, Sun, Moon, LogOut, Check, A
 import { cn } from '@/lib/utils'
 import { useAppStore } from '@/store/useAppStore'
 import { authApi } from '@/api/auth'
-import { licenseApi } from '@/api/license'
+import { licenseQuery } from '@/api/license'
 
 const nav = [
   { to: '/canvas', icon: GitBranch, label: 'Workspace' },
@@ -20,7 +20,7 @@ export default function Layout() {
   const { toast, clearToast, theme, toggleTheme, activeScenario, leaveGuard } = useAppStore()
   const navigate = useNavigate()
   const location = useLocation()
-  const { data: license } = useQuery({ queryKey: ['license'], queryFn: licenseApi.status, staleTime: 60_000 })
+  const { data: license } = useQuery(licenseQuery())
 
   // Notifications close by themselves after 3 s. Each new one (a fresh
   // object, even with the same text) restarts the 3 s.

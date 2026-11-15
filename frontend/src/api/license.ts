@@ -1,7 +1,11 @@
-import api from './client'
+import api, { getToken } from './client'
 
 export interface LicenseStatus {
   enabled: boolean
+  // machine = desktop (the PC's license, before login); user = web (each
+  // account's own license, after login)
+  mode: 'off' | 'machine' | 'user'
+  signed_in: boolean
   state: 'unlicensed' | 'valid' | 'offline' | 'invalid'
   reason: string
   message: string
@@ -18,6 +22,10 @@ export interface LicenseStatus {
 }
 
 export const isLicensed = (s: LicenseStatus) => !s.enabled || s.state === 'valid' || s.state === 'offline'
+
+// On the web the license belongs to the signed-in user, so the cache is per session.
+export const licenseQueryKey = () => ['license', getToken()]
+export const licenseQuery = () => ({ queryKey: licenseQueryKey(), queryFn: licenseApi.status, staleTime: 60_000 })
 
 export const licenseApi = {
   status: () => api.get<LicenseStatus>('/license/status').then((r) => r.data),

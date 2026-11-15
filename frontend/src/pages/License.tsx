@@ -1,19 +1,21 @@
 import { useState, type ChangeEvent, type FormEvent } from 'react'
-import { useLocation, useNavigate } from 'react-router-dom'
+import { Navigate, useLocation, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { isLicensed, licenseApi, type LicenseStatus } from '@/api/license'
+import { isLicensed, licenseApi, licenseQuery, licenseQueryKey, type LicenseStatus } from '@/api/license'
+import { authApi } from '@/api/auth'
 import AuthShell from '@/components/auth/AuthShell'
 
 const fmtDate = (unix: number | null | undefined) =>
   unix ? new Date(unix * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) : null
 
-// The activation page (desktop build): enter a license key, see this PC's
-// license, or free its seat to move LinkSim to another PC.
+// The activation page: enter a license key, see the license, or free its
+// seat. Desktop: the PC's license (before login). Web: the signed-in
+// account's license (after login).
 export default function License() {
   const navigate = useNavigate()
   const location = useLocation()
   const queryClient = useQueryClient()
-  const { data: status, error: loadError } = useQuery({ queryKey: ['license'], queryFn: licenseApi.status })
+  const { data: status, error: loadError } = useQuery({ ...licenseQuery(), staleTime: 0 })
 
   const [key, setKey] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -30,7 +32,7 @@ export default function License() {
     setBusy(true)
     try {
       const s = await action()
-      queryClient.setQueryData(['license'], s)
+      queryClient.setQueryData(licenseQueryKey(), s)
       return s
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Something went wrong')
@@ -40,7 +42,14 @@ export default function License() {
   }
 
   function goToApp() {
-    navigate(wanted && wanted !== '/license' ? wanted : '/login', { replace: true })
+    // Desktop: the login page signs in by itself.
+    const home = status?.mode === 'user' ? '/canvas' : '/login'
+    navigate(wanted && wanted !== '/license' ? wanted : home, { replace: true })
+  }
+
+  async function handleLogout() {
+    await authApi.logout().catch(() => {})
+    navigate('/login', { replace: true })
   }
 
   async function handleActivate(e: FormEvent) {
@@ -85,6 +94,12 @@ export default function License() {
   }
   if (!status) return null
 
+  if (status.mode === 'user' && !status.signed_in) {
+    return <Navigate to="/login" replace state={{ from: '/license' }} />
+  }
+  const web = status.mode === 'user'
+  const here = web ? 'this account' : 'this PC'
+
   if (!status.enabled) {
     return (
       <AuthShell eyebrow="License" title="Licensing is off" sub="This build does not check licenses (development).">
@@ -96,7 +111,7 @@ export default function License() {
   if (isLicensed(status)) {
     const lic = status.license
     return (
-      <AuthShell eyebrow="License" title="LinkSim is activated" sub="This PC has a valid license.">
+      <AuthShell eyebrow="License" title="LinkSim is activated" sub={`${web ? 'Your account' : 'This PC'} has a valid license.`}>
         {status.state === 'offline' && (
           <div className="note">
             The license server can't be reached right now. LinkSim keeps working offline
@@ -112,14 +127,16 @@ export default function License() {
         {error && <div className="err">{error}</div>}
         <button className="go" onClick={goToApp}>Continue to LinkSim <span aria-hidden="true">→</span></button>
         {status.air_gapped ? null : !confirmDeactivate ? (
-          <button className="ghost" onClick={() => setConfirmDeactivate(true)}>Deactivate this PC</button>
+          <button className="ghost" onClick={() => setConfirmDeactivate(true)}>
+            {web ? 'Remove license from this account' : 'Deactivate this PC'}
+          </button>
         ) : (
           <>
             <p className="offhelp" style={{ marginTop: 18 }}>
-              This frees the license so it can be used on another PC. LinkSim will ask for a key again here. Your scenarios are kept.
+              This frees the license so it can be used {web ? 'by another account' : 'on another PC'}. LinkSim will ask for a key again here. Your scenarios are kept.
             </p>
             <button className="ghost danger" disabled={busy} onClick={() => run(licenseApi.deactivate)}>
-              {busy ? 'Deactivating…' : 'Yes, deactivate this PC'}
+              {busy ? 'Removing…' : `Yes, remove it from ${here}`}
             </button>
             <button className="ghost" disabled={busy} onClick={() => setConfirmDeactivate(false)}>Cancel</button>
           </>
@@ -129,7 +146,7 @@ export default function License() {
   }
 
   return (
-    <AuthShell eyebrow="Activate" title="Enter your license key" sub="LinkSim needs a license for this PC.">
+    <AuthShell eyebrow="Activate" title="Enter your license key" sub={`LinkSim needs a license for ${here}.`}>
       <form onSubmit={handleActivate}>
         {status.state === 'invalid' && <div className="err">{status.message}</div>}
         <div className="field">
@@ -156,16 +173,22 @@ export default function License() {
           </button>
         )}
 
-        <p className="alt">
-          {offline ? (
-            <button type="button" className="linkbtn" onClick={() => setOffline(false)}>Hide offline activation</button>
-          ) : (
-            <>No internet on this PC? <button type="button" className="linkbtn" onClick={() => setOffline(true)}>Activate offline</button></>
-          )}
-        </p>
+        {web ? (
+          <p className="alt">
+            Wrong account? <button type="button" className="linkbtn" onClick={handleLogout}>Log out</button>
+          </p>
+        ) : (
+          <p className="alt">
+            {offline ? (
+              <button type="button" className="linkbtn" onClick={() => setOffline(false)}>Hide offline activation</button>
+            ) : (
+              <>No internet on this PC? <button type="button" className="linkbtn" onClick={() => setOffline(true)}>Activate offline</button></>
+            )}
+          </p>
+        )}
       </form>
 
-      {offline && (
+      {offline && !web && (
         <div style={{ marginTop: 18 }}>
           <p className="offhelp">
             1. Enter your key above, then create an activation request and send it to Calypsion support.

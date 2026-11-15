@@ -138,6 +138,16 @@ def logout(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer)):
     return {"status": "ok"}
 
 
+def session_user_id(request: Request, creds: Optional[HTTPAuthorizationCredentials]) -> Optional[int]:
+    """The signed-in user's id, or None. Shared with the license check."""
+    token = creds.credentials if creds is not None else None
+    # The live-progress stream (browser EventSource) can't send headers, so it
+    # passes the token as ?token=… — accepted on that route only.
+    if token is None and request.url.path.endswith("/stream"):
+        token = request.query_params.get("token")
+    return _active_sessions.get(token) if token is not None else None
+
+
 def require_auth(
     request: Request,
     creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
@@ -147,15 +157,9 @@ def require_auth(
     or 403 if the token is valid but the account is deactivated / its
     subscription has expired. Returns the current user's id (not username) so
     route handlers can filter their queries by owner."""
-    token = creds.credentials if creds is not None else None
-    # The live-progress stream (browser EventSource) can't send headers, so it
-    # passes the token as ?token=… — accepted on that route only.
-    if token is None and request.url.path.endswith("/stream"):
-        token = request.query_params.get("token")
-    if token is None or token not in _active_sessions:
+    user_id = session_user_id(request, creds)
+    if user_id is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
-
-    user_id = _active_sessions[token]
 
     if not _SUBSCRIPTION_ENFORCEMENT:
         return user_id

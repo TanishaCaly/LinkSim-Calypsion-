@@ -31,7 +31,7 @@ def signer(monkeypatch, tmp_path):
     monkeypatch.setattr(lic, "machine_fingerprint", lambda: FP)
 
     def sign(nonce=None, valid=True, reason="valid", typ="validation", fingerprint=FP, product="LINKSIM",
-             iat=None, offline_until=..., revalidate_after=None, key=sk):
+             iat=None, offline_until=..., revalidate_after=None, key=sk, features=None):
         now = int(time.time())
         payload = {
             "typ": typ, "valid": valid, "reason": reason, "nonce": nonce,
@@ -43,7 +43,7 @@ def signer(monkeypatch, tmp_path):
                         "customer": {"id": "c1", "name": "Acme"}, "status": "active",
                         "term_type": "subscription", "enforcement": "node_locked", "starts_at": now,
                         "expires_at": now + 365 * 86400, "grace_days": 14, "maintenance_until": None,
-                        "max_activations": 1, "features": {"view.3d": True}},
+                        "max_activations": 1, "features": features or {"view.3d": True}},
         }
         data = json.dumps(payload).encode()
         return {"v": 1, "alg": "EdDSA", "kid": KID, "payload": b64(data), "sig": b64(key.sign(data))}
@@ -190,53 +190,134 @@ def test_air_gapped_license_file(monkeypatch, signer):
 
 # ── Features ──
 
-@pytest.fixture
-def licensed(monkeypatch, signer):
+def licensed_manager(features):
     """A valid license with the given features."""
-    def make(features):
-        m = lic.LicenseManager()
-        m.state = "valid"
-        m.token = {"license": {"features": features}}
-        monkeypatch.setattr(lic, "manager", m)
-        monkeypatch.setattr(lic, "ENABLED", True)
-    return make
+    m = lic.LicenseManager()
+    m.state = "valid"
+    m.token = {"license": {"features": features}}
+    return m
 
 
-def test_feature_values(licensed):
-    licensed({"sim.run": True, "view.3d": False, "limit.stations": 50, "limit.scenarios": 0})
-    assert lic.allows("sim.run") and not lic.allows("view.3d")
-    assert lic.allows("insights.ai")                 # not in the license → not restricted
-    assert lic.limit("limit.stations") == 50
-    assert lic.limit("limit.scenarios") == 0          # switched off in the edition
-    assert lic.limit("limit.other") is None
-    assert lic.limit("sim.run") is None               # a boolean is not a limit
+@pytest.fixture
+def enabled(monkeypatch):
+    monkeypatch.setattr(lic, "ENABLED", True)
+
+
+def test_feature_values(enabled):
+    m = licensed_manager({"sim.run": True, "view.3d": False, "limit.stations": 50, "limit.scenarios": 0})
+    assert lic.allows(m, "sim.run") and not lic.allows(m, "view.3d")
+    assert lic.allows(m, "insights.ai")                 # not in the license → not restricted
+    assert lic.limit(m, "limit.stations") == 50
+    assert lic.limit(m, "limit.scenarios") == 0          # switched off in the edition
+    assert lic.limit(m, "limit.other") is None
+    assert lic.limit(m, "sim.run") is None               # a boolean is not a limit
 
 
 def test_features_unrestricted_when_licensing_off(monkeypatch):
     monkeypatch.setattr(lic, "ENABLED", False)
-    assert lic.allows("view.3d") and lic.limit("limit.stations") is None
+    m = licensed_manager({"view.3d": False, "limit.stations": 1})
+    assert lic.allows(m, "view.3d") and lic.limit(m, "limit.stations") is None
+    assert lic.allows(None, "view.3d")
 
 
-def test_feature_checks(licensed):
+def test_feature_checks(enabled):
     from fastapi import HTTPException
     from backend.api.routes import license as routes
 
-    licensed({"insights.ai": False, "limit.stations": 2, "limit.scenarios": 3})
+    m = licensed_manager({"insights.ai": False, "limit.stations": 2, "limit.scenarios": 3})
     with pytest.raises(HTTPException) as e:
-        routes.require_feature("insights.ai")()
+        routes.require_feature("insights.ai")(m)
     assert e.value.status_code == 403 and e.value.detail["feature"] == "insights.ai"
-    routes.require_feature("sim.run")()
+    routes.require_feature("sim.run")(m)
 
     stations = {
         "Start": {"Station Type": "Source"}, "End": {"Station Type": "Drain"},
         "Op1": {}, "Op2": {"Station Type": "Station"}, "Link": {"Station Type": "Connector"},
     }
     assert routes.count_stations(stations) == 2
-    routes.check_station_limit(stations)
+    routes.check_station_limit(m, stations)
     with pytest.raises(HTTPException):
-        routes.check_station_limit({**stations, "Op3": {"Station Type": "Buffer"}})
+        routes.check_station_limit(m, {**stations, "Op3": {"Station Type": "Buffer"}})
 
-    routes.check_scenario_limit(2)
+    routes.check_scenario_limit(m, 2)
     with pytest.raises(HTTPException) as e:
-        routes.check_scenario_limit(3)
+        routes.check_scenario_limit(m, 3)
     assert "up to 3" in e.value.detail["msg"]
+
+
+# ── Web version (LINKSIM_LICENSE=user) ──
+
+@pytest.fixture
+def web(monkeypatch, signer, tmp_path):
+    """User mode on a throwaway database, with a fake licensing server that
+    gives every key the features in `features`."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from backend.storage import database
+    from backend.storage.models import Base
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'web.db'}", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine, autoflush=False))
+    monkeypatch.setattr(lic, "MODE", "user")
+    monkeypatch.setattr(lic, "ENABLED", True)
+    monkeypatch.setattr(lic, "_user_managers", {})
+
+    features = {}
+    calls = fake_server(monkeypatch, lambda path, body: None if path.endswith("deactivate") else
+                        signer(nonce=body["nonce"], fingerprint=body["fingerprint"], features=dict(features)))
+    return features, calls
+
+
+def test_each_user_has_own_license(web):
+    from backend.storage import database
+    from backend.storage.models import User
+
+    features, calls = web
+    with database.SessionLocal() as db:
+        db.add_all([User(id=1, username="ann", password_hash="x"), User(id=2, username="bob", password_hash="x")])
+        db.commit()
+
+    ann, bob = lic.for_user(1), lic.for_user(2)
+    assert ann.state == bob.state == "unlicensed"
+    ann.activate(KEY)
+    assert ann.ok and not bob.ok
+    assert ann.fingerprint != bob.fingerprint
+    assert calls[-1][1]["hostname"] == "web: ann" and calls[-1][1]["platform"] == "LinkSim Web"
+
+    # Survives a restart: the token comes back from the database.
+    lic._user_managers.clear()
+    assert lic.for_user(1).state == "valid" and lic.for_user(1).key == KEY
+
+    lic.for_user(1).deactivate()
+    assert lic.for_user(1).state == "unlicensed"
+
+
+def test_web_flow_over_http(web, monkeypatch):
+    from fastapi.testclient import TestClient
+    from backend.storage import database
+    import main
+
+    monkeypatch.setattr(main, "SessionLocal", database.SessionLocal)   # main imported its own reference
+    features, _ = web
+    features.update({"limit.scenarios": 1})
+    with TestClient(main.app) as c:
+        assert c.get("/api/license/status").json()["signed_in"] is False
+        token = c.post("/api/auth/signup", json={"username": "ann", "password": "pw"}).json()["token"]
+        h = {"Authorization": f"Bearer {token}"}
+
+        st = c.get("/api/license/status", headers=h).json()
+        assert st["mode"] == "user" and st["signed_in"] and st["state"] == "unlicensed"
+        r = c.get("/api/scenarios/", headers=h)
+        assert r.status_code == 403 and r.json()["detail"] == "License required"
+        assert c.post("/api/license/offline-request", json={"key": KEY}, headers=h).status_code == 404
+
+        assert c.post("/api/license/activate", json={"key": KEY}, headers=h).json()["state"] == "valid"
+        assert c.get("/api/scenarios/", headers=h).status_code == 200
+        assert c.post("/api/scenarios/", json={"name": "a"}, headers=h).status_code == 201
+        r = c.post("/api/scenarios/", json={"name": "b"}, headers=h)
+        assert r.status_code == 403 and "up to 1" in r.json()["detail"]["msg"]
+
+        # Without a session the license routes need a login.
+        assert c.post("/api/license/activate", json={"key": KEY}).status_code == 401
