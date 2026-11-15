@@ -14,7 +14,6 @@ scenarios routes via require_auth below).
 import hashlib
 import os
 import secrets
-from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -24,14 +23,6 @@ from sqlalchemy.orm import Session
 
 from backend.storage import get_db
 from backend.storage.models import User
-
-# New signups get this many days of access before subscription_end_date blocks them.
-_TRIAL_DAYS = 30
-
-# Subscription/active-account enforcement is off by default (LinkSim is still
-# in development — teammates should be able to register/login freely). Flip
-# to "on" once the app is ready to actually gate access.
-_SUBSCRIPTION_ENFORCEMENT = os.getenv("SUBSCRIPTION_ENFORCEMENT", "off").strip().lower() == "on"
 
 # Tester build (desktop_launcher.py sets LINKSIM_DESKTOP=1): no login screen —
 # /auto signs in as one local user. Off in development.
@@ -91,7 +82,6 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)):
         username=username,
         email=payload.email.strip() if payload.email else None,
         password_hash=_hash_password(payload.password),
-        subscription_end_date=datetime.utcnow() + timedelta(days=_TRIAL_DAYS),
     )
     db.add(user)
     db.commit()
@@ -154,22 +144,17 @@ def require_auth(
     db: Session = Depends(get_db),
 ) -> int:
     """FastAPI dependency — raise 401 unless a valid session token is presented,
-    or 403 if the token is valid but the account is deactivated / its
-    subscription has expired. Returns the current user's id (not username) so
-    route handlers can filter their queries by owner."""
+    or 403 if the token is valid but the account is deactivated. Access itself
+    comes from the license (backend/licensing.py). Returns the current user's
+    id (not username) so route handlers can filter their queries by owner."""
     user_id = session_user_id(request, creds)
     if user_id is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
-
-    if not _SUBSCRIPTION_ENFORCEMENT:
-        return user_id
 
     user = db.query(User).filter(User.id == user_id).first()
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account deactivated")
-    if user.subscription_end_date is not None and user.subscription_end_date < datetime.utcnow():
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Subscription expired")
 
     return user_id

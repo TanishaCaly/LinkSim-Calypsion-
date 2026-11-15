@@ -21,10 +21,9 @@ class User(Base):
     every user simply owns their own scenarios (see Scenario.user_id) and
     cannot see anyone else's. Admin/role-based access is a later phase.
 
-    subscription_end_date is nullable: NULL means no expiry (unlimited access,
-    e.g. legacy users created before this field existed, or admin accounts).
-    is_active is a separate manual kill-switch (e.g. for banning an account)
-    independent of the subscription date.
+    is_active is a manual kill-switch (e.g. for banning an account; see
+    backend/scripts/set_user_active.py). Access to LinkSim itself comes from
+    the license (backend/licensing.py).
     """
     __tablename__ = "users"
 
@@ -33,7 +32,6 @@ class User(Base):
     email = Column(String(255), nullable=True, unique=True, index=True)
     password_hash = Column(String(255), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
-    subscription_end_date = Column(DateTime, nullable=True)
     is_active = Column(Boolean, nullable=False, default=True)
 
 

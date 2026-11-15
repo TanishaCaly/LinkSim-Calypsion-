@@ -6,7 +6,6 @@ import RequireLicense from '@/components/RequireLicense'
 import License from '@/pages/License'
 import Login from '@/pages/Login'
 import Signup from '@/pages/Signup'
-import SubscriptionExpired from '@/pages/SubscriptionExpired'
 import ScenarioManager from '@/pages/ScenarioManager'
 import RunDashboard from '@/pages/RunDashboard'
 import Canvas from '@/pages/Canvas'
@@ -27,7 +26,6 @@ export default function App() {
           <Route element={<RequireLicense />}>
             <Route path="login" element={<Login />} />
             <Route path="signup" element={<Signup />} />
-            <Route path="subscription-expired" element={<SubscriptionExpired />} />
             <Route
               element={
                 <RequireAuth>

@@ -38,8 +38,6 @@ def _migrate_users_table():
     statements = []
     if "email" not in existing:
         statements.append("ALTER TABLE users ADD COLUMN email VARCHAR(255)")
-    if "subscription_end_date" not in existing:
-        statements.append("ALTER TABLE users ADD COLUMN subscription_end_date DATETIME")
     if "is_active" not in existing:
         statements.append("ALTER TABLE users ADD COLUMN is_active BOOLEAN DEFAULT 1")
     if not statements:
