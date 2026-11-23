@@ -1,7 +1,7 @@
 import { Canvas, useThree, type GLProps } from '@react-three/fiber'
 import { OrbitControls, Grid } from '@react-three/drei'
 import { Maximize2, Minimize2 } from 'lucide-react'
-import { Suspense, useState, useCallback, useRef, useMemo, useEffect, type ReactNode } from 'react'
+import { Suspense, useState, useCallback, useRef, useMemo, useEffect } from 'react'
 import MachineBox from './MachineBox'
 import CameraRig from './CameraRig'
 import FactoryShell from './FactoryShell'
@@ -29,7 +29,6 @@ import type { StationConfig, OperatorConfig, WorkerPoolStat } from '@/types'
 import WorkerFigure from './WorkerFigure'
 import { planWorkers, travelMs } from './workerSchedule'
 import { makeRouter, type Box } from './walkPath'
-import SimSettingsMenu, { openSimDialog } from '@/components/run/SimSettingsMenu'
 import ReplayBar, { DEFAULT_REPLAY_SPEED, IdleReplayBar, REPLAY_SPEEDS, fmtReplayClock } from '@/components/run/ReplayBar'
 
 export interface TimelineRefs {
@@ -49,8 +48,6 @@ export interface TimelineRefs {
 }
 
 interface SceneProps {
-  // Run (and Stop while running), at the right end of the replay bar next to Sim setting.
-  runControls?: ReactNode
   machines: Machine3D[]
   operators: Operator3D[]
   connections: Connection3D[]
@@ -110,7 +107,6 @@ function Floor({ isDark, size, centerX, centerZ }: { isDark: boolean; size: numb
 }
 
 export default function Scene({
-  runControls,
   machines,
   operators,
   connections,
@@ -524,6 +520,7 @@ export default function Scene({
             dismantles={dismantles}
             variantColors={variantColors}
             timelineRefs={timelineRefs}
+            runMinutes={runMinutes}
           /></group>
         </Suspense>
       </Canvas>
@@ -636,7 +633,7 @@ export default function Scene({
           <IdleReplayBar
             runStartMs={runStartMs}
             runMin={runMinutes}
-            settings={<div className="flex items-center gap-1.5"><SimSettingsMenu compact up onConfig={() => openSimDialog('config')} onTimer={() => openSimDialog('timer')} />{runControls}</div>}
+            settings={null}
           />
         </div>
       )}
@@ -675,7 +672,6 @@ export default function Scene({
             elapsedMin={curMinutes}
             startMs={zeroMsUI}
             runMin={runMinutes ?? totalMsUI / 60000}
-            settings={<div className="flex items-center gap-1.5"><SimSettingsMenu compact up onConfig={() => openSimDialog('config')} onTimer={() => openSimDialog('timer')} />{runControls}</div>}
           />
         </div>
       )}

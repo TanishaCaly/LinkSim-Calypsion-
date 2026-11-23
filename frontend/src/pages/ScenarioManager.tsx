@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, useRef } from 'react'
+import { useMemo, useState, useRef } from 'react'
 import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { Plus, Upload, Trash2, FileText, X, Save, PlusCircle, Search } from 'lucide-react'
@@ -2120,15 +2120,6 @@ export default function ScenarioManager() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { setActiveScenario, setActiveRun, showToast, setJustReset } = useAppStore()
-
-  // Coming to Scenarios closes the open scenario (as New canvas does): the top
-  // bar shows "No scenario open", Workspace opens blank and Analysis / Interfaces
-  // & AI show nothing until a scenario is opened again.
-  useEffect(() => {
-    setActiveScenario(null)
-    setActiveRun(null)
-    setJustReset(false)
-  }, [setActiveScenario, setActiveRun, setJustReset])
 
   const handleViewFile = async (id: number) => {
     try {

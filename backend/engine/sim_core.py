@@ -1175,6 +1175,7 @@ class ManufacturingSimulation:
         # Filled by _check_assemblies (before the run).
         self.assembly_specs: Dict[str, Dict[str, Any]] = {}
         self._assembly_roles: Dict[Tuple[str, str, int], Tuple[str, Optional[str]]] = {}
+        self._split_roles: Dict[Tuple[str, str, int], Dict[str, Tuple[str, Optional[str]]]] = {}
         self.worker_pools = self._init_worker_pools()
         # Build case-insensitive/stripped lookup: normalized_key → original station key
         self._resource_key_map: Dict[str, str] = {
@@ -1846,7 +1847,7 @@ class ManufacturingSimulation:
             if isinstance(nxt, str) and si + 1 < len(slots):
                 next_key = (nxt, slots[si + 1][0])
                 if next_key not in decided:
-                    decided[next_key] = self._decide_assembly_role(nxt, route_type, slots[si + 1][0])
+                    decided[next_key] = self._decide_assembly_role(nxt, route_type, slots[si + 1][0], resource_name)
                 next_role = decided[next_key]
             into_room = next_role is not None and next_role[0] == "part"
 
@@ -2365,7 +2366,12 @@ class ManufacturingSimulation:
         prev = self._resolve_step_resource(steps[slots[si - 1][0]], variant)
         if prev is None:
             return None
-        return str(self.stations_data[prev].get("Parallel Group") or prev)
+        return self._line_name(prev)
+
+    def _line_name(self, station: str) -> str:
+        """The line name a station's jobs come into the next stop on: its
+        parallel group, for a machine of one; else the station itself."""
+        return str(self.stations_data.get(station, {}).get("Parallel Group") or station)
 
     def _assembly_spec(self, name: str, cfg: Dict[str, Any], arrivals: List[Optional[str]]) -> Optional[Dict[str, Any]]:
         """
@@ -2450,13 +2456,16 @@ class ManufacturingSimulation:
         """
         self.assembly_specs: Dict[str, Dict[str, Any]] = {}
         self._assembly_roles: Dict[Tuple[str, str, int], Tuple[str, Optional[str]]] = {}
+        self._split_roles: Dict[Tuple[str, str, int], Dict[str, Tuple[str, Optional[str]]]] = {}
         configured = {
             name: st["Assembly"] for name, st in self.stations_data.items()
             if _station_type(st) == "Assembly" and isinstance(st.get("Assembly"), dict)
         }
         if not configured:
             return
-        arrivals: Dict[str, List[Tuple[str, int, Optional[str]]]] = {name: [] for name in configured}
+        # (variant, step, line it comes in on, every line it may come in on
+        # when the stop before is a split — e.g. Station 1 / Station 2 — else None)
+        arrivals: Dict[str, List[Tuple[str, int, Optional[str], Optional[List[str]]]]] = {name: [] for name in configured}
         for variant, steps in self.processflow_data.items():
             if self.variant_quantities.get(variant, 0) <= 0:
                 continue
@@ -2465,34 +2474,53 @@ class ManufacturingSimulation:
                 for idx in slot:
                     res = self._resolve_step_resource(steps[idx], variant)
                     if res in configured:
-                        arrivals[res].append((variant, idx, self._line_into(variant, steps, slots, si)))
+                        split_lines = None
+                        if si > 0 and len(slots[si - 1]) > 1:
+                            prevs = [self._resolve_step_resource(steps[i], variant) for i in slots[si - 1]]
+                            split_lines = list(dict.fromkeys(self._line_name(p) for p in prevs if p))
+                        arrivals[res].append((variant, idx, self._line_into(variant, steps, slots, si), split_lines))
 
         for name, cfg in configured.items():
-            spec = self._assembly_spec(name, cfg, [f for _, _, f in arrivals[name]])
+            seen = [l for _, _, f, split in arrivals[name] for l in (split or [f])]
+            spec = self._assembly_spec(name, cfg, seen)
             if spec is None:
                 continue
             self.assembly_specs[name] = spec
+
+            def role_for(variant: str, line: Optional[str]) -> Tuple[str, Optional[str]]:
+                if line == spec["main_from"]:
+                    return ("main", None)
+                key = f"fe:{variant}" if spec["type"] == "mu_types" else f"line:{line}"
+                if key not in spec["needs"]:
+                    if spec["type"] == "mu_types":
+                        raise ValueError(f"{name}: {variant} comes in from {line}, but it isn't in the FE table.")
+                    raise ValueError(f"{name}: {variant} comes in from {line}, which isn't one of its lines "
+                                     f"— open the Assembly on the Canvas and save again.")
+                return ("part", key)
+
             main_supply = 0
             supply: Dict[str, int] = {}
-            for variant, idx, line in arrivals[name]:
+            any_split = False
+            for variant, idx, line, split_lines in arrivals[name]:
                 qty = self.variant_quantities.get(variant, 0)
-                if line == spec["main_from"]:
-                    role: Tuple[str, Optional[str]] = ("main", None)
+                role = role_for(variant, line)
+                self._assembly_roles[(name, variant, idx)] = role
+                if split_lines:
+                    # The job's role is decided in the run, by the station it
+                    # actually leaves (see _decide_assembly_role).
+                    any_split = True
+                    self._split_roles[(name, variant, idx)] = {l: role_for(variant, l) for l in split_lines}
+                elif role[0] == "main":
                     main_supply += qty
                 else:
-                    key = f"fe:{variant}" if spec["type"] == "mu_types" else f"line:{line}"
-                    if key not in spec["needs"]:
-                        if spec["type"] == "mu_types":
-                            raise ValueError(f"{name}: {variant} comes in from {line}, but it isn't in the FE table.")
-                        raise ValueError(f"{name}: {variant} comes in from {line}, which isn't one of its lines "
-                                         f"— open the Assembly on the Canvas and save again.")
-                    role = ("part", key)
-                    supply[key] = supply.get(key, 0) + qty
-                self._assembly_roles[(name, variant, idx)] = role
+                    supply[role[1]] = supply.get(role[1], 0) + qty
 
             # Quantities that can't all be used: a warning, not a stop. The
             # main line's parts (main_amount per assembly) all come from
-            # main_supply.
+            # main_supply. Skipped when jobs come in through a split: how
+            # many take each station is only known in the run.
+            if any_split:
+                continue
             main_key = f"line:{spec['main_from']}"
             others = {k: n for k, n in spec["needs"].items() if k != main_key}
             possible = main_supply // spec["main_amount"]
@@ -2509,15 +2537,21 @@ class ManufacturingSimulation:
                 self.simulation_state["warnings"].append(
                     f"{name}: parts for only {possible} assemblies — {', '.join(left)} can never be used.")
 
-    def _decide_assembly_role(self, station: str, route_type: str, idx: int) -> Optional[Tuple[str, Optional[str]]]:
+    def _decide_assembly_role(self, station: str, route_type: str, idx: int,
+                              from_station: Optional[str] = None) -> Optional[Tuple[str, Optional[str]]]:
         """
         This job's role at an Assembly (None: not an Assembly). A main-line
         job is the main part — unless the Assembly takes more than 1 from the
         main line: then, in the order they come, 1 in every main_amount is
         the main part (sits on the machine) and the rest are parts (wait in
         the room). Decided once per job, when it is on its way there.
+        After a split (Station 1 / Station 2), the line is the station the
+        job actually leaves (from_station).
         """
         role = self._assembly_roles.get((station, route_type, idx))
+        split = self._split_roles.get((station, route_type, idx))
+        if split and from_station is not None:
+            role = split.get(self._line_name(from_station), role)
         if role is None or role[0] != "main":
             return role
         spec = self.assembly_specs[station]

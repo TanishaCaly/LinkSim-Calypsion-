@@ -2,7 +2,7 @@
 
 Manufacturing discrete-event simulation (DES) tool. Import real factory data, review the process flow visually, run a realistic simulation (shifts, breakdowns, rework, buffers, changeovers), and get back KPIs, a Gantt timeline, per-job traceability, and rule-based insights.
 
-**Stack:** FastAPI + SimPy + SQLite (backend) · React 19 + TypeScript + Vite + ReactFlow + Recharts (frontend)
+**Stack:** FastAPI + SimPy + PostgreSQL (backend) · React 19 + TypeScript + Vite + ReactFlow + Recharts (frontend)
 
 ---
 
@@ -10,6 +10,7 @@ Manufacturing discrete-event simulation (DES) tool. Import real factory data, re
 
 - Python 3.11 or 3.12
 - Node.js 20 LTS (or newer)
+- PostgreSQL 17
 - Git
 
 ---
@@ -29,15 +30,26 @@ If PowerShell blocks the activation script:
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 ```
 
-### 2. Run the backend
+### 2. Database (PostgreSQL)
+
+Create a `linksim` user and database (and `linksim_test` for the tests), then put the address in `.env` in the project folder (never committed):
+
+```
+DATABASE_URL=postgresql+psycopg://linksim:<password>@127.0.0.1:5432/linksim
+```
+
+The backend runs on PostgreSQL only: without `DATABASE_URL` it stops with a message. Data from an older SQLite `linksim.db` can be copied once with
+`python -m backend.scripts.migrate_sqlite_to_postgres --sqlite linksim.db --postgres <DATABASE_URL>` (it checks every row afterwards).
+
+### 3. Run the backend
 
 ```powershell
-uvicorn main:app --reload --port 8000
+uvicorn main:app --reload --port 8000 --env-file .env
 ```
 
 Check it's alive: `http://localhost:8000/health`
 
-### 3. Frontend (second terminal)
+### 4. Frontend (second terminal)
 
 ```powershell
 cd frontend
@@ -45,7 +57,7 @@ npm install
 npm run dev
 ```
 
-### 4. Open the app
+### 5. Open the app
 
 `http://localhost:5173`
 
@@ -237,5 +249,5 @@ mention is not restricted.
 
 - All KPI formulas live in `backend/engine/formulas.py` — the single source of truth; every other module imports from it, not re-derives.
 - DB schema changes during development were applied via direct `ALTER TABLE` (no Alembic migrations are wired up yet, despite `alembic` being in `requirements.txt`).
-- Run the backend test suite: `pytest backend/tests/`
+- Run the backend test suite: `pytest backend/tests/` — it uses its own database, `linksim_test` (`TEST_DATABASE_URL=` in `.env.postgres`), never the real one.
 - Typecheck the frontend: `cd frontend && npx tsc --noEmit`

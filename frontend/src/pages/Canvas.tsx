@@ -15,7 +15,7 @@ import {
   ChevronDown, Check,
 } from 'lucide-react'
 import { scenariosApi } from '@/api/scenarios'
-import { simulationsApi, type SimConfigOverride, DEFAULT_SIM_TIME, NEW_SCENARIO_CALENDAR } from '@/api/simulations'
+import { type SimConfigOverride, DEFAULT_SIM_TIME, NEW_SCENARIO_CALENDAR } from '@/api/simulations'
 import { useAppStore } from '@/store/useAppStore'
 import SimDialogsHost from '@/components/run/SimDialogsHost'
 import SimSettingsMenu, { openSimDialog } from '@/components/run/SimSettingsMenu'
@@ -756,7 +756,7 @@ function StyledSelect({
 // ─── Property editor ─────────────────────────────────────────────────────────
 
 function PropertyEditor({
-  node, nodes, edges, allEdges, onChange, onDelete, onSaveStation, onAddParallel, onOpenMuTable, startProducts, productColors, onProductColor, products, onAddWorkplace, onRemoveWorkplace, onToggleWire, onAssignOperator, onUnassignOperator, numShifts, shiftNames, operatorsData, workerResults, stationStates, bufferStates, partsFlow,
+  node, nodes, edges, allEdges, onChange, onDelete, onSaveStation, onAddParallel, onOpenMuTable, startProducts, allStartProducts, productColors, onProductColor, products, onAddWorkplace, onRemoveWorkplace, onToggleWire, onAssignOperator, onUnassignOperator, numShifts, shiftNames, operatorsData, workerResults, stationStates, bufferStates, partsFlow,
 }: {
   node: Node<StationNodeData>
   nodes: Node<StationNodeData>[]
@@ -770,6 +770,8 @@ function PropertyEditor({
   onOpenMuTable: (id: string) => void
   // Start only: its products (MU table), for its Exit Controller.
   startProducts: string[]
+  // A Start: every product in the MU table (all Starts) — its Job colour list.
+  allStartProducts: string[]
   // Each product's job colour, and a change of it (Start only).
   productColors: Record<string, string>
   onProductColor: (id: string, mu: string, color: string) => void
@@ -985,6 +987,7 @@ function PropertyEditor({
             { key: 'setupTime',   label: 'Setup Time (min)',   type: 'number' },
             { key: 'operators',   label: 'Operators',          type: 'number' },
             { key: 'repairTime',  label: 'Repair Time (min)',  type: 'number' },
+            { key: 'failureTime', label: 'Failure Time (min)', type: 'number' },
           ]
 
   // An operator is one real person — the same one can't be two separate
@@ -1045,13 +1048,11 @@ function PropertyEditor({
                   // Fields that only exist on some station types (e.g. a
                   // Conveyor's conveyorLength) are undefined on a freshly added
                   // node — Number(undefined) is NaN, which would render an empty
-                  // uneditable box, so fall back to 0. repairTime falls back to
-                  // 10 instead, matching the save mutation's own default — so
-                  // the box always shows the value that will actually be saved,
-                  // never a fake 0 that Save then silently overrides to 10.
-                  // conveyorCapacity likewise falls back to 1, the engine's
-                  // default for a conveyor saved without one.
-                  value={Number(node.data[key as keyof StationNodeData] ?? (key === 'repairTime' ? 10 : key === 'conveyorCapacity' ? 1 : 0))}
+                  // uneditable box, so fall back to 0 (repairTime too, matching
+                  // the save mutation's own default). conveyorCapacity falls
+                  // back to 1, the engine's default for a conveyor saved
+                  // without one.
+                  value={Number(node.data[key as keyof StationNodeData] ?? (key === 'conveyorCapacity' ? 1 : 0))}
                   onCommit={(n) => onChange(node.id, { [key]: n })}
                   className="h-8 text-sm rounded-lg border-gray-200 bg-gray-50 focus:bg-white [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
                 />
@@ -1172,10 +1173,10 @@ function PropertyEditor({
             >
               Open MU table{node.data.muTable ? ` (${node.data.muTable.length})` : ''}
             </button>
-            {startProducts.length > 0 && (
+            {allStartProducts.length > 0 && (
               <div className="mt-2.5 space-y-1.5">
                 <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Job colour</p>
-                {startProducts.map((mu) => (
+                {allStartProducts.map((mu) => (
                   <label key={mu} className="flex items-center gap-2 text-xs text-gray-700">
                     <input
                       type="color"
@@ -2211,11 +2212,9 @@ function PropertyEditor({
             for (const [p, n] of Object.entries(counts ?? {})) byProduct[p] = (byProduct[p] ?? 0) + n
           }
           if (isStart) {
-            const key = node.data.savedName ?? stationKey(node)
-            const starts = nodes.filter((n) => inferStationType(n.data.label, n.data.stationType) === 'Source')
-            // A scenario whose Start isn't a saved station: the only Start delivers all.
-            if (partsFlow.delivered[key]) add(partsFlow.delivered[key])
-            else if (starts.length === 1) Object.values(partsFlow.delivered).forEach((c) => add(c))
+            // Every Start shows all products, as delivered by all Starts
+            // (one MU table for every Start).
+            Object.values(partsFlow.delivered).forEach((c) => add(c))
           } else {
             // Each line in: the parts whose route is a product of that line
             // (every product for a line not tagged), by the part's own name.
@@ -2675,6 +2674,7 @@ function buildEditableGraph(
             dismantle: cfg?.['Dismantle'],
             setupTime: cfg?.['Setup time'],
             repairTime: cfg?.['Repair Time'],
+            failureTime: cfg?.['MTBF'] as number | undefined,
             failurePolicy: cfg?.['Failure Policy'],
             bufferQuantity: cfg?.['Buffer Capacity'],
             bufferUnlimited: cfg?.['Buffer Unlimited'],
@@ -4089,7 +4089,8 @@ function MuTableDialog({ startName, starts, initial, onApply, onClose }: {
       : new Set(names).size !== names.length ? 'Two rows have the same MU — each product needs its own name.'
         : rows.some((r) => !Number.isInteger(r.number) || r.number < 0) ? 'Number must be a whole number, 0 or more.'
           : rows.some((r) => r.interval != null && (!Number.isFinite(r.interval) || r.interval < 0)) ? 'Interval must be 0 or more (empty = all jobs at once).'
-            : rows.some((r) => r.orig === undefined && !r.copyFrom) ? 'Pick which product a new row copies its route from.'
+            // Only when there is a product to copy from (a new canvas has none).
+            : existing.length > 0 && rows.some((r) => r.orig === undefined && !r.copyFrom) ? 'Pick which product a new row copies its route from.'
               : undefined
   // Two products with one colour is allowed, just hard to tell apart.
   const colors = rows.map((r) => (r.color ?? '').toLowerCase())
@@ -4165,8 +4166,8 @@ function MuTableDialog({ startName, starts, initial, onApply, onClose }: {
                       placeholder="Product"
                       className={cellInput}
                     />
-                    {/* A new product starts with a copy of an existing route. */}
-                    {r.orig === undefined && (
+                    {/* A new product starts with a copy of an existing route (none to copy: hidden). */}
+                    {r.orig === undefined && existing.length > 0 && (
                       <select
                         value={r.copyFrom ?? ''}
                         onChange={(e) => update(i, { copyFrom: e.target.value || undefined })}
@@ -4575,7 +4576,7 @@ function normalizeShiftsPerDay(value: number | number[] | undefined): number[] {
 export default function Canvas() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const { activeScenario, activeRun, setActiveScenario, setActiveRun, showToast, setJustReset } = useAppStore()
+  const { activeScenario, activeRun, setActiveScenario, showToast, setJustReset } = useAppStore()
   const isDark = useAppStore(s => s.theme) === 'dark'
   // One run state for the whole page: the Run button (top bar in Build) and the bottom bar share it.
   const sim = useRunSimulation()
@@ -5062,7 +5063,7 @@ export default function Canvas() {
           ? { label, stationType: typeName, capacity: 1, processTime: 0, operators: 0, shiftsPerDay: [1] }
           : typeName === 'Conveyor'
             ? { label, stationType: typeName, capacity: 1, processTime: 0, operators: 0, conveyorSpeed: 1, conveyorCapacity: 1, shiftsPerDay: [1] }
-            : { label, stationType: typeName, capacity: 1, processTime: 30, operators: 1, shiftsPerDay: [1] }
+            : { label, stationType: typeName, capacity: 1, processTime: 30, operators: 0, setupTime: 0, repairTime: 0, failureTime: 0, shiftsPerDay: [1] }
       return [
         ...nds,
         {
@@ -5413,7 +5414,10 @@ export default function Canvas() {
     // name: the name to save under (the name box's, unless given).
     // simCfg: the Sim setting a new scenario is created with (this one's,
     // unless given — e.g. a timer just applied, not in state yet).
-    mutationFn: async (vars?: { name?: string; simCfg?: SimConfigOverride }) => {
+    // stationsOnly: the auto-save of a canvas that can't make a route yet
+    // (a box with no line, ...): only the station settings and the drawing
+    // are saved; the saved routes stay as they are.
+    mutationFn: async (vars?: { name?: string; simCfg?: SimConfigOverride; stationsOnly?: boolean }) => {
       const saveName = vars?.name ?? scenarioName
       // Each station's settings as saved right now (fetched fresh, so edits
       // made meanwhile in the Scenarios page are kept). Save starts from
@@ -5474,12 +5478,16 @@ export default function Canvas() {
         // Conveyor time is Length / Speed now; an older saved Transport Time
         // would only confuse whoever reads the scenario.
         if (n.data.conveyorSpeed !== undefined) delete saved['Transport Time']
+        // Failure Time 0 = never breaks down: no MTBF (the engine can't take 0).
+        if (n.data.failureTime !== undefined && !(n.data.failureTime > 0)) delete saved['MTBF']
         stationsData[base] = {
           // A brand-new station's defaults; a saved one keeps its own.
           'Failure rate': 0, 'PM Schedule': 'Monthly',
           'Material Shortage Probability (%)': 0, 'Rework Probability (%)': 0,
           shift1: '', shift2: '', shift3: '', STATION_DOWNTIME: 0,
           ...saved,
+          ...(n.data.failureTime === undefined ? {}
+            : n.data.failureTime > 0 ? { MTBF: n.data.failureTime } : { 'Failure rate': 0 }),
           capacity: capacityCount[base], shifts_per_day: n.data.shiftsPerDay ?? [1],
           operator_per_station: n.data.operators,
           ...(n.data.parallelGroup ? { 'Parallel Group': n.data.parallelGroup } : {}),
@@ -5523,7 +5531,7 @@ export default function Canvas() {
           ...(n.data.bufferY !== undefined ? { 'Buffer Y': n.data.bufferY } : {}),
           ...(n.data.bufferZ !== undefined ? { 'Buffer Z': n.data.bufferZ } : {}),
           ...(n.data.bufferOrder !== undefined ? { 'Buffer Discipline': n.data.bufferOrder } : {}),
-          'Repair Time': n.data.repairTime ?? 10,
+          'Repair Time': n.data.repairTime ?? 0,
           'Failure Policy': n.data.failurePolicy ?? 'resume',
         } as ScenarioCreate['stations_data'][string]
       })
@@ -5699,10 +5707,53 @@ export default function Canvas() {
         boxIdOf[n.id] = id
       }
       const nodeOf = new Map(nodes.map((n) => [n.id, n]))
+      // A first save with MU tables filled in on the Starts: their products,
+      // each with its Number and Interval, its route along the lines from the
+      // Start that releases it (not one default product of 200).
+      const firstSavePlan = (() => {
+        if (activeScenario) return null
+        const flowEdges = edges.filter((e) => isFlowEdge(e, nodeOf))
+        const isStart = (n: Node<StationNodeData>) => inferStationType(n.data.label, n.data.stationType) === 'Source'
+        const flow: ScenarioCreate['processflow_data'] = {}
+        const qty: Record<string, number> = {}
+        const intervals: Record<string, number> = {}
+        const linesOf: Record<string, string[]> = {}
+        for (const start of nodes.filter(isStart)) {
+          const rows = (start.data.muTable ?? []).filter((r) => r.mu.trim() && !(r.mu in flow))
+          if (rows.length === 0) continue
+          const reached = new Set([start.id])
+          const queue = [start.id]
+          while (queue.length > 0) {
+            const at = queue.shift()!
+            for (const e of flowEdges) {
+              if (e.source !== at || reached.has(e.target) || isStart(nodeOf.get(e.target)!)) continue
+              reached.add(e.target)
+              queue.push(e.target)
+            }
+          }
+          const lines = flowEdges.filter((e) => reached.has(e.source) && reached.has(e.target))
+          const ids = new Set([...reached, ...nodes.filter(isWiringNode).map((n) => n.id)])
+          const route = routeFromGraph(
+            nodes.filter((n) => ids.has(n.id)),
+            edges.filter((e) => ids.has(e.source) && ids.has(e.target) && (!isFlowEdge(e, nodeOf) || lines.includes(e))),
+            stepDuration,
+          )
+          for (const r of rows) {
+            flow[r.mu] = route
+            qty[r.mu] = r.number
+            if (r.interval != null && r.interval > 0) intervals[r.mu] = r.interval
+            for (const e of lines) (linesOf[e.id] ??= []).push(r.mu)
+          }
+        }
+        return Object.keys(flow).length > 0 ? { flow, qty, intervals, linesOf } : null
+      })()
+      if (firstSavePlan) savedVariantRef.current = Object.keys(firstSavePlan.flow)[0]
       const productsOf: Record<string, string[] | undefined> = {}
       for (const e of edges) {
         const ps = edgeProducts(e)
-        productsOf[e.id] = isFlowEdge(e, nodeOf) ? (ps !== undefined ? ps : [variant]) : undefined
+        productsOf[e.id] = !isFlowEdge(e, nodeOf) ? undefined
+          : firstSavePlan ? firstSavePlan.linesOf[e.id] ?? []
+          : ps !== undefined ? ps : [variant]
       }
       const layout: CanvasLayout = {
         version: 1,
@@ -5742,9 +5793,17 @@ export default function Canvas() {
           }
         }
         for (const [name, cfg] of Object.entries(savedStations)) {
-          if (!(name in stationsData) && !(name in renamed)) {
+          if (!(name in stationsData) && (!(name in renamed) || vars?.stationsOnly)) {
             stationsData[name] = cfg as ScenarioCreate['stations_data'][string]
           }
+        }
+        // Routes not saved: keep every station they use (a renamed one under
+        // its old name too) and the drawing's route marks as they were.
+        if (vars?.stationsOnly) {
+          return scenariosApi.update(activeScenario.id, {
+            stations_data: stationsData,
+            canvas_layout: { ...layout, routes: savedScenario.canvas_layout?.routes },
+          })
         }
         const followRenames = (otherSteps: ScenarioCreate['processflow_data'][string]) => {
           let nextBranch = Math.max(0, ...otherSteps.map((s) => s.branch ?? 0)) + 1
@@ -5795,12 +5854,13 @@ export default function Canvas() {
         })
       }
 
-      const processflow: ScenarioCreate['processflow_data'] = { [variant]: steps }
-      const variantQty: Record<string, number> = { [variant]: 200 }
-      layout.routes = { [variant]: routeSig(steps) }
+      const processflow: ScenarioCreate['processflow_data'] = firstSavePlan?.flow ?? { [variant]: steps }
+      const variantQty: Record<string, number> = firstSavePlan?.qty ?? { [variant]: 200 }
+      layout.routes = Object.fromEntries(Object.entries(processflow).map(([v, st]) => [v, routeSig(st)]))
       return scenariosApi.create({
         name: saveName, stations_data: stationsData, processflow_data: processflow,
         variant_quantities: variantQty,
+        ...(firstSavePlan && Object.keys(firstSavePlan.intervals).length > 0 ? { variant_intervals: firstSavePlan.intervals } : {}),
         canvas_layout: layout,
         operators_data: { Op1: { 'Skill Rating': 3, 'Availability (%)': 100 } },
         // Defaults, with what was set in Sim setting before this first save.
@@ -5813,9 +5873,12 @@ export default function Canvas() {
         } as ScenarioCreate['simulation_config'],
       })
     },
-    onSuccess: (scenario) => {
+    onSuccess: (scenario, vars) => {
       queryClient.invalidateQueries({ queryKey: ['scenarios'] })
       setActiveScenario(scenario)
+      // Station settings only: the canvas still counts as unsaved, so Run
+      // and Save Scenario save (and check) the whole thing.
+      if (vars?.stationsOnly) return
       setJustReset(false)
       // Each box is now saved under its own station name and id, and each
       // line with its products.
@@ -5846,29 +5909,24 @@ export default function Canvas() {
 
   // Validate before saving so users get a clear, friendly message instead of a
   // raw API error. navigateAfter=true (the top-bar "Save Scenario" button)
-  // treats this as finishing the whole scenario and jumps to Run; false (the
+  // just saves and stays on the Workspace (only Run runs); false (the
   // per-station panel's Save button) persists the same scenario but keeps
   // the user in Canvas so they can keep editing other stations.
   // onSaved: just save and then do this (switching product), instead of
   // going to Run / running.
   // name: save under this name instead of the name box's.
   // simCfg: the Sim setting to create a new scenario with (see saveMutation).
-  const handleSave = (navigateAfter: boolean, onSaved?: (scenario: Scenario) => void, name?: string, simCfg?: SimConfigOverride) => {
-    if (!(name ?? scenarioName).trim()) {
-      showToast('Please enter a scenario name before saving', 'error')
-      return
-    }
-    if (nodes.length === 0) {
-      showToast('Add at least one station before saving', 'error')
-      return
-    }
+  const autoScenarioName = () => {
+    const d = new Date()
+    const p2 = (x: number) => String(x).padStart(2, '0')
+    return `Scenario ${p2(d.getDate())}-${p2(d.getMonth() + 1)}-${d.getFullYear()} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`
+  }
+  // Why the canvas can't be saved as a route yet (Save shows it), or undefined.
+  const canvasProblem = (): string | undefined => {
     // No lines at all is fine for a Start alone; any other box without a
-    // line coming in is caught by lineProblem below.
+    // line coming in is caught by lineProblem.
     const notInLine = lineProblem(nodes, edges)
-    if (notInLine) {
-      showToast(notInLine, 'error')
-      return
-    }
+    if (notInLine) return notInLine
     // Every Assembly box (also one never opened: its defaults count too).
     // Assembly needs (Predecessors) too: a wrong No. or amount.
     const assemblyIssue = (n: Node<StationNodeData>) => {
@@ -5878,75 +5936,76 @@ export default function Canvas() {
       return assemblyProblem(assembly, incoming.length) ?? needsProblem(assembly, incoming)
     }
     const badAssembly = nodes.find((n) => assemblyIssue(n))
-    if (badAssembly) {
-      showToast(`${badAssembly.data.label}: ${assemblyIssue(badAssembly)}`, 'error')
-      return
-    }
+    if (badAssembly) return `${badAssembly.data.label}: ${assemblyIssue(badAssembly)}`
     const dismantleIssue = (n: Node<StationNodeData>) => inferStationType(n.data.label, n.data.stationType) === 'Dismantle'
       ? dismantleProblem(dismantleSettings(n.data.dismantle), outgoingStations(n.id, nodes, edges).length)
       : undefined
     const badDismantle = nodes.find((n) => dismantleIssue(n))
-    if (badDismantle) {
-      showToast(`${badDismantle.data.label}: ${dismantleIssue(badDismantle)}`, 'error')
-      return
-    }
+    if (badDismantle) return `${badDismantle.data.label}: ${dismantleIssue(badDismantle)}`
     // Every box needs its own name — the simulation finds stations by name.
     const named = nodes.filter((n) => !isWiringNode(n))
     const sameName = named.find((n, i) => named.findIndex((o) => o.data.label.trim() === n.data.label.trim()) !== i)
-    if (sameName) {
-      showToast(`Two boxes are named "${sameName.data.label}" — give each box its own name`, 'error')
-      return
-    }
+    if (sameName) return `Two boxes are named "${sameName.data.label}" — give each box its own name`
     const badPriorities = nodes.find((n) => {
       const successors = exitSuccessorLabels(n.id, nodes, productEdges)
       return n.data.exitStrategy === 'successor' && successors.length > 1
         && !exitPrioritiesAreValid(exitPriorityValues(n.data, successors))
     })
-    if (badPriorities) {
-      showToast(`${badPriorities.data.label}: Exit Controller priorities must use each number from 1 to ${exitSuccessorLabels(badPriorities.id, nodes, productEdges).length} once`, 'error')
-      return
-    }
+    if (badPriorities) return `${badPriorities.data.label}: Exit Controller priorities must use each number from 1 to ${exitSuccessorLabels(badPriorities.id, nodes, productEdges).length} once`
     const emptyConveyor = nodes.find((n) =>
       inferStationType(n.data.label, n.data.stationType) === 'Conveyor' && (n.data.conveyorCapacity ?? 1) < 1)
-    if (emptyConveyor) {
-      showToast(`${emptyConveyor.data.label}: Conveyor capacity must be 1 or more`, 'error')
-      return
-    }
+    if (emptyConveyor) return `${emptyConveyor.data.label}: Conveyor capacity must be 1 or more`
     const conveyors = nodes.filter((n) => inferStationType(n.data.label, n.data.stationType) === 'Conveyor')
     const noLength = conveyors.find((n) => !((n.data.conveyorLength ?? 0) > 0))
-    if (noLength) {
-      showToast(`${noLength.data.label}: Conveyor length must be more than 0`, 'error')
-      return
-    }
+    if (noLength) return `${noLength.data.label}: Conveyor length must be more than 0`
     const noSpeed = conveyors.find((n) => !((n.data.conveyorSpeed ?? 0) > 0))
-    if (noSpeed) {
-      showToast(`${noSpeed.data.label}: Conveyor speed must be more than 0`, 'error')
-      return
-    }
+    if (noSpeed) return `${noSpeed.data.label}: Conveyor speed must be more than 0`
     const badSensor = conveyors.find((n) => n.data.conveyorSensor && n.data.conveyorSensor.length > (n.data.conveyorLength ?? 0))
-    if (badSensor) {
-      showToast(`${badSensor.data.label}: sensor (${formatDecimal(badSensor.data.conveyorSensor!.length)} m) is longer than the conveyor (${formatDecimal(badSensor.data.conveyorLength ?? 0)} m)`, 'error')
-      return
-    }
+    if (badSensor) return `${badSensor.data.label}: sensor (${formatDecimal(badSensor.data.conveyorSensor!.length)} m) is longer than the conveyor (${formatDecimal(badSensor.data.conveyorLength ?? 0)} m)`
     const badSplit = canvasSplits(nodes, productEdges).find((s) => s.problem)
-    if (badSplit) {
-      showToast(`${badSplit.sourceLabel}: ${badSplit.problem}`, 'error')
-      return
-    }
+    if (badSplit) return `${badSplit.sourceLabel}: ${badSplit.problem}`
     // Route by product: every product needs at least one ticked station.
     for (const n of nodes) {
       if (!n.data.routeByProduct || variants.length < 2) continue
       const successors = exitSuccessorLabels(n.id, nodes, productEdges)
       if (successors.length < 2) continue
       const none = variants.find((p) => !(n.data.productRoutes?.[p] ?? []).some((s) => successors.includes(s)))
-      if (none) {
-        showToast(`${n.data.label}: Route based — tick at least one station for ${none}`, 'error')
-        return
-      }
+      if (none) return `${n.data.label}: Route based — tick at least one station for ${none}`
     }
-    const groupProblem = parallelGroupProblem(nodes, edges)
-    if (groupProblem) {
-      showToast(groupProblem, 'error')
+    return parallelGroupProblem(nodes, edges) ?? undefined
+  }
+
+  // Auto-save: while a scenario is open, a change on the canvas (a property
+  // panel value, a box, a line) is saved a moment later, so the Scenarios
+  // page always shows it. A canvas that can't make a route yet saves its
+  // station settings and drawing only (see saveMutation's stationsOnly).
+  useEffect(() => {
+    if (!activeScenario || !canvasDirty || nodes.length === 0) return
+    const t = window.setTimeout(() => {
+      if (saveMutation.isPending) return
+      saveMutation.mutate({
+        name: scenarioName.trim() || activeScenario.name,
+        stationsOnly: !!canvasProblem(),
+      })
+    }, 800)
+    return () => window.clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodes, edges, canvasDirty, activeScenario?.id])
+
+  const handleSave = (navigateAfter: boolean, onSaved?: (scenario: Scenario) => void, name?: string, simCfg?: SimConfigOverride) => {
+    if (nodes.length === 0) {
+      showToast('Add at least one station before saving', 'error')
+      return
+    }
+    // No name yet: name it after the date and time; it can be renamed in the
+    // name box and saved again.
+    if (!(name ?? scenarioName).trim()) {
+      name = autoScenarioName()
+      setScenarioName(name)
+    }
+    const problem = canvasProblem()
+    if (problem) {
+      showToast(problem, 'error')
       return
     }
     saveMutation.mutate({ name, simCfg }, {
@@ -5956,9 +6015,7 @@ export default function Canvas() {
           onSaved(scenario)
           return
         }
-        showToast(navigateAfter ? `"${scenario.name}" saved` : 'Station saved — running simulation…')
-        if (navigateAfter) navigate('/run')
-        else runAfterSave(scenario.id)
+        showToast(navigateAfter ? `"${scenario.name}" saved` : 'Station saved')
       },
     })
   }
@@ -5976,9 +6033,7 @@ export default function Canvas() {
     if (nodes.length === 0 || !(canvasDirty || renamed)) { then(activeScenario?.id); return }
     let name = scenarioName.trim()
     if (!name) {
-      const d = new Date()
-      const p2 = (x: number) => String(x).padStart(2, '0')
-      name = `Scenario ${p2(d.getDate())}-${p2(d.getMonth() + 1)}-${d.getFullYear()} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`
+      name = autoScenarioName()
       setScenarioName(name)
     }
     handleSave(false, (scenario) => then(scenario.id), name, simCfg)
@@ -6047,8 +6102,11 @@ export default function Canvas() {
   // A product's job colour set from the Start's properties: written into that
   // Start's own MU table (the product's row is added when it has none yet).
   const setProductColor = (id: string, mu: string, color: string) => {
-    const start = nodes.find((n) => n.id === id)
+    // The Start that releases it (its table lists it), else this one.
+    const start = startBoxes.find((st) => startTableOf(st).some((x) => x.mu === mu))
+      ?? nodes.find((n) => n.id === id)
     if (!start) return
+    id = start.id
     const table = startTableOf(start)
     const next = table.some((x) => x.mu === mu)
       ? table.map((x) => (x.mu === mu ? { ...x, color } : x))
@@ -6280,34 +6338,6 @@ export default function Canvas() {
       return
     }
     openProduct(v)
-  }
-
-  // The station panel's Save also re-runs the simulation with the settings
-  // just saved (the scenario's own Simulation Config, same replications as
-  // the run being shown), so Play always replays what was saved — e.g. an
-  // Exit Controller switched to Random plays as Random, not the old run.
-  const runPollRef = useRef(0)
-  useEffect(() => () => { runPollRef.current++ }, [])
-  const runAfterSave = async (scenarioId: number) => {
-    const token = ++runPollRef.current
-    try {
-      const run = await simulationsApi.triggerRun(scenarioId, { num_replications: activeRun?.num_replications ?? 1 })
-      for (;;) {
-        const detail = await simulationsApi.getRun(run.id)
-        if (token !== runPollRef.current) return // a newer Save took over, or Canvas closed
-        setActiveRun(detail) // pending/running hides the player until it's done
-        if (detail.status !== 'pending' && detail.status !== 'running') {
-          showToast(
-            detail.status === 'completed' ? `Run #${run.id} ready — press Play` : `Run #${run.id} ${detail.status}`,
-            detail.status === 'completed' ? 'success' : 'error',
-          )
-          return
-        }
-        await new Promise((r) => setTimeout(r, 1000))
-      }
-    } catch (err) {
-      if (token === runPollRef.current) showToast((err as Error).message, 'error')
-    }
   }
 
   const onBuild = mode === 'build'
@@ -6600,12 +6630,14 @@ export default function Canvas() {
         <div className="flex-1 flex min-h-0">
           <div className="relative flex-1 min-h-0" style={{ height: '100%' }}>
             {mode === 'view' && idleReplayBar && (
-              <div className="absolute bottom-4 left-1/2 z-10 w-[min(900px,calc(100%-28px))] -translate-x-1/2">{idleReplayBar}</div>
+              <div className="absolute bottom-4 left-1/2 z-10 w-[min(900px,calc(100%-28px))] -translate-x-1/2">
+                {/* 3D only replays: no Sim setting or Run here (they are in Build). */}
+                <IdleReplayBar startDate={sim.simCfg.SIMULATION_START_DATE} settings={null} />
+              </div>
             )}
             {mode === 'view' ? (
                 scene3D.machines.length > 0 ? (
                   <Scene
-                    runControls={runButtons}
                     machines={scene3D.machines}
                     operators={scene3D.operators}
                     connections={scene3D.connections}
@@ -6770,6 +6802,9 @@ export default function Canvas() {
                 products={variants}
                 startProducts={inferStationType(selectedNode.data.label, selectedNode.data.stationType) === 'Source'
                   ? muTableRows(selectedNode).filter((r) => r.start === stationKey(selectedNode)).map((r) => r.mu)
+                  : []}
+                allStartProducts={inferStationType(selectedNode.data.label, selectedNode.data.stationType) === 'Source'
+                  ? muTableRows(selectedNode).map((r) => r.mu)
                   : []}
                 onAddWorkplace={addWorkplaceFor}
                 onRemoveWorkplace={removeWorkplaceFor}

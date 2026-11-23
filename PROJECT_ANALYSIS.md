@@ -29,7 +29,7 @@ LinkSim is a **Manufacturing Discrete Event Simulation (DES)** tool. It lets man
 | **ASGI server** | Uvicorn 0.30.6 |
 | **Simulation engine** | SimPy 4.1.1 |
 | **ORM** | SQLAlchemy 2.0.35 |
-| **Database** | SQLite (dev) / PostgreSQL (prod) |
+| **Database** | PostgreSQL |
 | **Data processing** | Pandas 2.2.3, NumPy 1.26.4 |
 | **Statistics** | SciPy 1.14.1 |
 | **File parsing** | PyYAML 6.0.2, openpyxl 3.1.5 |
@@ -54,7 +54,6 @@ LinkSim-Main/
 ├── main.py                          # Backend entry point (FastAPI app)
 ├── requirements.txt                 # Python dependencies
 ├── tshirt_factory.yaml              # Example scenario (T-shirt manufacturing)
-├── linksim.db                       # SQLite database (runtime artifact)
 ├── linksim.log                      # Application log file
 │
 ├── backend/
@@ -174,7 +173,7 @@ Execution starts with `uvicorn main:app --reload --port 8000`.
                        |
 +----------------------+------------------------------+
 |               STORAGE LAYER                          |
-|  SQLAlchemy ORM -> SQLite/PostgreSQL                 |
+|  SQLAlchemy ORM -> PostgreSQL                        |
 +----------------------------------------------------+
 ```
 
@@ -305,7 +304,7 @@ Thread-safe in-memory store for SSE progress events. Simulation runs in a `Backg
 
 #### `database.py`
 
-Creates SQLAlchemy engine + session factory. Defaults to SQLite; override via `DATABASE_URL` env var. `get_db()` is a FastAPI dependency that yields and closes a session.
+Creates SQLAlchemy engine + session factory on PostgreSQL, from the `DATABASE_URL` env var (required — the backend stops with a message without it). `get_db()` is a FastAPI dependency that yields and closes a session.
 
 #### `models.py`
 
@@ -370,7 +369,7 @@ Displays AI insights in categorized sections with priority badges, confidence sc
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DATABASE_URL` | `sqlite:///./linksim.db` | Database connection string |
+| `DATABASE_URL` | *(required)* | PostgreSQL connection string, e.g. `postgresql+psycopg://linksim:<password>@127.0.0.1:5432/linksim` |
 | `LINKSIM_CORS_ORIGINS` | localhost:5173,3000,8000 | Allowed CORS origins |
 
 **Config files:**
@@ -560,7 +559,7 @@ In simple terms, the simulation works like this:
 3. SSE endpoint: polls progress_store every 250ms -> streams JSON events -> cleans up on "done"
 
 **During shutdown:**
-- FastAPI lifespan `yield` point is reached; no explicit cleanup (SQLite connections auto-close, SimPy is stateless)
+- FastAPI lifespan `yield` point is reached; no explicit cleanup (database connections are pooled by SQLAlchemy, SimPy is stateless)
 
 ---
 
@@ -570,7 +569,7 @@ In simple terms, the simulation works like this:
 |---|---|
 | **FastAPI** | Modern async Python web framework with automatic OpenAPI docs |
 | **SimPy** | Industry-standard discrete event simulation library |
-| **SQLAlchemy** | ORM for database abstraction (SQLite->PostgreSQL portability) |
+| **SQLAlchemy** | ORM over PostgreSQL (driver: psycopg 3) |
 | **Pandas** | Excel/CSV parsing (used by all parsers) |
 | **openpyxl** | Reads .xlsx files |
 | **PyYAML** | Reads YAML scenario files |
@@ -635,7 +634,7 @@ In simple terms, the simulation works like this:
 - **SQL injection:** Protected by SQLAlchemy ORM (parameterized queries)
 - **XSS:** React escapes by default; no dangerouslySetInnerHTML
 - **CORS:** Restricted to localhost origins by default; configurable via env var
-- **File storage:** Source files stored as `LargeBinary` in SQLite (not filesystem)
+- **File storage:** Source files stored as `LargeBinary` (bytea) in PostgreSQL (not filesystem)
 
 **Potential vulnerabilities:** No rate limiting, no CSRF protection, no auth, debug endpoints exposed in production.
 
@@ -646,7 +645,7 @@ In simple terms, the simulation works like this:
 - **Caching:** React Query has `staleTime: 10s` (brief cache)
 - **No lazy loading** — all pages eagerly loaded
 - **Pagination:** Scenario list supports `skip/limit` (default 50)
-- **Database:** SQLite for dev (fine for single-user); PostgreSQL recommended for production
+- **Database:** PostgreSQL everywhere (the desktop build runs its own private PostgreSQL)
 - **Simulation:** Runs synchronously in a background thread (not async). Large simulations (1 year, 200 jobs) complete in seconds. `MAX_SIM_TIME = 525,600` prevents runaway runs
 - **No background job queue** — single background task per run (FastAPI BackgroundTasks)
 - **SSE polling:** 250ms interval for progress events (efficient enough for the use case)
@@ -1009,8 +1008,8 @@ Running the same scenario N times with different random seeds. Results are avera
 **Q: Is there any authentication?**
 No. This is a single-user/team development tool.
 
-**Q: How do I switch to PostgreSQL?**
-Set the `DATABASE_URL` environment variable: `DATABASE_URL=postgresql://user:pass@localhost/linksim`
+**Q: Which database does it use?**
+PostgreSQL only. Set `DATABASE_URL=postgresql+psycopg://user:pass@localhost:5432/linksim` in `.env`.
 
 ---
 

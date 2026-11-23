@@ -52,7 +52,9 @@ Your scenarios and results are saved in this folder:
 (Press Win+R, type  %LOCALAPPDATA%\LinkSim  and press Enter to open it.)
 
 When you get a newer LinkSim version, your data stays there and the new
-version will use it.
+version will use it. (The first start of this version moves data from an
+older LinkSim version into its new database automatically; this takes a
+little longer once.)
 
 To start completely fresh: close LinkSim, then delete that folder.
 
@@ -60,5 +62,5 @@ To start completely fresh: close LinkSim, then delete that folder.
 REPORTING A PROBLEM
 Please send:
 1. What you did, and what went wrong (a screenshot helps).
-2. The file "linksim.log" from the %LOCALAPPDATA%\LinkSim folder.
+2. The files "linksim.log" and "postgres.log" from the %LOCALAPPDATA%\LinkSim folder.
 3. The input file (Excel / YAML) you used, if you can share it.

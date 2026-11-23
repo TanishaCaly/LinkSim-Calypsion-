@@ -94,12 +94,19 @@ def validate_scenario(scenario_id: int, db: Session = Depends(get_db), user_id: 
     for variant, steps in pf.items():
         for step in (steps or []):
             raw = step.get("resource", "")
-            if raw not in station_keys:
-                resolved = station_lower.get(raw.lower().strip())
+            # Older scenarios (saved while the Exit Controller existed) may hold
+            # {"mode", "options": [station, ...]} instead of one station name:
+            # each option is checked like a name.
+            names = (raw.get("options") or []) if isinstance(raw, dict) else [raw]
+            for name in names:
+                name = name if isinstance(name, str) else str(name or "")
+                if name in station_keys:
+                    continue
+                resolved = station_lower.get(name.lower().strip())
                 issues.append({
                     "variant": variant,
                     "operation": step.get("operation"),
-                    "resource": raw,
+                    "resource": name,
                     "resolved_to": resolved,
                     "type": "case_mismatch" if resolved else "missing",
                 })

@@ -1,6 +1,9 @@
 """
-Database engine + session factory.
-DATABASE_URL defaults to a local SQLite file; override via environment variable.
+Database engine + session factory. LinkSim runs on PostgreSQL only: the
+address comes from the DATABASE_URL environment variable (.env), e.g.
+postgresql+psycopg://linksim:<password>@127.0.0.1:5432/linksim
+The desktop build starts its own private PostgreSQL and sets it
+(packaging/desktop_launcher.py).
 """
 import os
 from sqlalchemy import create_engine, inspect, text
@@ -9,13 +12,15 @@ from typing import Generator
 
 from .models import Base
 
-_DEFAULT_DB = "sqlite:///./linksim.db"
-DATABASE_URL: str = os.getenv("DATABASE_URL", _DEFAULT_DB)
+DATABASE_URL: str = os.getenv("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set. Add your PostgreSQL address to .env, e.g. "
+                       "DATABASE_URL=postgresql+psycopg://linksim:<password>@127.0.0.1:5432/linksim")
+if not DATABASE_URL.startswith(("postgresql://", "postgresql+")):
+    raise RuntimeError("DATABASE_URL must be a PostgreSQL address (postgresql+psycopg://...). "
+                       "Fix it in .env.")
 
-# connect_args only needed for SQLite (disables same-thread check for FastAPI)
-_connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-
-engine = create_engine(DATABASE_URL, connect_args=_connect_args, echo=False)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, echo=False)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
@@ -28,8 +33,8 @@ def init_db():
 
 
 def _migrate_users_table():
-    """SQLite + SQLAlchemy's create_all doesn't add columns to an already-
-    existing table, so new User columns (added after the table was first
+    """SQLAlchemy's create_all doesn't add columns to an already-existing
+    table, so new User columns (added after the table was first
     created) need a one-time ALTER TABLE. Idempotent — checks first."""
     inspector = inspect(engine)
     if "users" not in inspector.get_table_names():
@@ -39,7 +44,7 @@ def _migrate_users_table():
     if "email" not in existing:
         statements.append("ALTER TABLE users ADD COLUMN email VARCHAR(255)")
     if "is_active" not in existing:
-        statements.append("ALTER TABLE users ADD COLUMN is_active BOOLEAN DEFAULT 1")
+        statements.append("ALTER TABLE users ADD COLUMN is_active BOOLEAN DEFAULT TRUE")
     if not statements:
         return
     with engine.begin() as conn:
@@ -48,7 +53,7 @@ def _migrate_users_table():
 
 
 def _migrate_station_stats_table():
-    """SQLite create_all doesn't add columns to an already-existing table —
+    """create_all doesn't add columns to an already-existing table —
     one-time ALTER TABLE for columns added after station_stats already
     existed in deployed DBs. Idempotent."""
     inspector = inspect(engine)

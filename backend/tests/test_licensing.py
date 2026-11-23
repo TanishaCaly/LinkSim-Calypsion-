@@ -249,17 +249,15 @@ def test_feature_checks(enabled):
 
 @pytest.fixture
 def web(monkeypatch, signer, tmp_path):
-    """User mode on a throwaway database, with a fake licensing server that
-    gives every key the features in `features`."""
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
+    """User mode on an emptied test database (linksim_test, see conftest.py),
+    with a fake licensing server that gives every key the features in
+    `features`."""
     from backend.storage import database
     from backend.storage.models import Base
 
-    engine = create_engine(f"sqlite:///{tmp_path / 'web.db'}", connect_args={"check_same_thread": False})
-    Base.metadata.create_all(engine)
-    monkeypatch.setattr(database, "engine", engine)
-    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine, autoflush=False))
+    database.engine.dispose()
+    Base.metadata.drop_all(database.engine)
+    Base.metadata.create_all(database.engine)
     monkeypatch.setattr(lic, "MODE", "user")
     monkeypatch.setattr(lic, "ENABLED", True)
     monkeypatch.setattr(lic, "_user_managers", {})

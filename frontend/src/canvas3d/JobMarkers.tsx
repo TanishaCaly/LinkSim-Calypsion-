@@ -66,6 +66,9 @@ interface JobMarkersProps {
   // Each product's colour (Build's Start table): product name -> colour.
   variantColors?: Record<string, string>
   timelineRefs: TimelineRefs
+  // How long the run was set to simulate (minutes): the replay plays to its end,
+  // even when the last job moved earlier.
+  runMinutes?: number
 }
 
 // A job's product and the colour its cube is tinted.
@@ -286,7 +289,7 @@ function glowTexture(): THREE.CanvasTexture {
   return new THREE.CanvasTexture(c)
 }
 
-export default function JobMarkers({ machines, startPos, endPos, completionLog, assemblies, dismantles, variantColors, timelineRefs }: JobMarkersProps) {
+export default function JobMarkers({ machines, startPos, endPos, completionLog, assemblies, dismantles, variantColors, timelineRefs, runMinutes }: JobMarkersProps) {
   // The soft glow is a point sprite, which WebGPU cannot size; it is left out there for now.
   const showGlow = !isWebGPU(useThree(s => s.gl))
   const gltf = useGLTF(MODEL)
@@ -477,11 +480,11 @@ export default function JobMarkers({ machines, startPos, endPos, completionLog, 
 
   // Timeline length: the 3D view's scrub bar and clock run off this.
   useEffect(() => {
-    const ms = tl ? tl.span || 1 : 1
+    const ms = tl ? Math.max(tl.span || 1, (runMinutes ?? 0) * 60000) : 1
     timelineRefs.totalMs.current = ms
     timelineRefs.setTotalMsUI(ms)
     timelineRefs.setZeroMsUI(tl ? tl.zeroAbs : 0)
-  }, [tl, timelineRefs])
+  }, [tl, timelineRefs, runMinutes])
 
   const hover = useRef(-1) // job under the cursor
   const tip = useRef<THREE.Group>(null)

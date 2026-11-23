@@ -527,6 +527,9 @@ export interface StationNodeData {
   // which meant a Canvas-built scenario always saved a hardcoded 10
   // regardless of what the user actually wanted.
   repairTime?: number
+  // Minutes this station runs before it breaks down (MTBF). Saves to the
+  // station's 'MTBF' field; 0 = never breaks down (no MTBF saved).
+  failureTime?: number
   // What happens to a part already in progress when this station's machine
   // fails mid-operation: 'resume' (continue the remaining time after
   // repair — the default), 'restart' (redo the full operation from

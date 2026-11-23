@@ -1,6 +1,6 @@
 """
 SQLAlchemy ORM models for LinkSim.
-SQLite in dev; switch DATABASE_URL to PostgreSQL for production.
+Stored in PostgreSQL (see database.py).
 """
 from datetime import datetime
 from typing import Optional

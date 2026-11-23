@@ -1489,6 +1489,31 @@ def test_assembly_flow_entity_main_line_too_big_stops_the_run():
         _run_sim(*_assembly_line(cfg))
 
 
+def test_assembly_after_a_split_takes_a_job_from_each_station():
+    # One product split over S1 / S2, both into ASM: a job's line is the
+    # station it actually leaves, so S1's and S2's jobs are joined in pairs
+    # (before, every job counted as S1's and the line jammed).
+    stations = {
+        "Start": {"Station Type": "Source", "MU Strategy": "cyclic", "MU Table": [{"mu": "p", "number": 6}]},
+        "S1": _station(operator_per_station=0),
+        "S2": _station(operator_per_station=0),
+        "ASM": _station(operator_per_station=0, **{"Station Type": "Assembly", "Assembly": {
+            "table": "none", "mainMuFromPredecessor": 1, "mainMuDefault": True,
+            "mode": "delete_mus", "exitingMu": "main_mu",
+            "lines": [{"from": "S1", "no": 1, "amount": 1}, {"from": "S2", "no": 2, "amount": 1}]}}),
+        "S3": _station(operator_per_station=0),
+    }
+    flow = {"p": [{"operation": "S1", "resource": "S1", "duration": 10.0, "branch": 1},
+                  {"operation": "S2", "resource": "S2", "duration": 10.0, "branch": 1},
+                  {"operation": "ASM", "resource": "ASM", "duration": 5.0},
+                  {"operation": "S3", "resource": "S3", "duration": 1.0}]}
+    result, _ = _run_sim(stations, flow, {"p": 6})
+    state = result["simulation_state"]
+    assert state["completed_jobs"] == 3
+    assert state["assembled_parts"] == 3
+    assert state["warnings"] == []
+
+
 def test_assembly_uneven_quantities_warn_and_extra_body_waits():
     # 3 bodies, 2 wheels: 2 cars; the 3rd body sits on ASM waiting forever.
     result, _ = _run_sim(*_assembly_line(_asm(), a=3, b=2))

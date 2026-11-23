@@ -253,10 +253,12 @@ export default function JobReplay({ completionLog, releaseTimes, finishTimes, as
   // Run (and Stop while running), at the right end of the replay bar next to Sim setting.
   runControls?: ReactNode
 }) {
-  const { jobs, t0, total } = useMemo(
+  const { jobs, t0, total: lastMove } = useMemo(
     () => parseLog(completionLog, releaseTimes ?? {}, finishTimes ?? {}, variantColors ?? {}, assemblies ?? {}, dismantles ?? {}),
     [completionLog, releaseTimes, finishTimes, variantColors, assemblies, dismantles],
   )
+  // The replay plays to the end of the run, even when the last job moved earlier.
+  const total = lastMove > 0 ? Math.max(lastMove, runMinutes ?? 0) : 0
 
   const [time, setTime] = useState(0)          // simulated minutes since t0
   const [playing, setPlaying] = useState(false)

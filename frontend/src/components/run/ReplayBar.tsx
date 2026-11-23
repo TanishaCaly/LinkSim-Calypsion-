@@ -27,7 +27,14 @@ const fmtDateTime = (ms: number) => {
   const time = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
   return `${date}, ${time}`
 }
-const fmtHours = (min: number) => (min < 120 ? `${Math.round(min)} min` : `${Math.round(min / 60)} h`)
+/** "45 min", "8 h", "7 h 30 min" — exact to the minute. */
+const fmtHours = (min: number) => {
+  const total = Math.round(min)
+  const h = Math.floor(total / 60)
+  const m = total % 60
+  if (h === 0) return `${m} min`
+  return m === 0 ? `${h} h` : `${h} h ${m} min`
+}
 const fmtRunFor = (min: number) => (min >= 1440 ? `${fmtHours(min)} (${+(min / 1440).toFixed(1)} days)` : fmtHours(min))
 
 export default function ReplayBar({ playing, onToggle, onRestart, speedId, onSpeed, pct, onScrub, clock, elapsedMin, startMs, runMin, settings, disabled }: {
